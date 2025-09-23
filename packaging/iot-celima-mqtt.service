@@ -1,0 +1,25 @@
+[Unit]
+Description=Celima MQTT Integration Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/default/iot-celima-mqtt
+ExecStart=/usr/local/bin/iot-celima-mqtt
+Restart=on-failure
+RestartSec=3
+
+# Hardening (loosen if needed)
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictRealtime=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
