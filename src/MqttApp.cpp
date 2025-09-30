@@ -40,7 +40,6 @@ void MqttApp::start() {
         std::cout << "[MQTT] Connecting to " << broker_ << " as " << client_id_ << "...\n";
         cli_.connect(connopts_)->wait();
         std::cout << "[MQTT] Connected.\n";
-        subscribe_topics();
     } catch (const mqtt::exception& e) {
         std::cerr << "[MQTT] Connect failed: " << e.what() << "\n";
         throw;
