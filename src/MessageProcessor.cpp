@@ -108,12 +108,10 @@ public:
         out["ts"]          = std::time(nullptr);
         out["shift"]       = cur_shift;          // 1,2,3
         out["lineID"]      = line_id;
-        out["accumulators"] = {
-            {"extra_c1", q1},
-            {"extra_c2", q2},
-            {"comercial", q6},
-            {"quebrados", disc}
-        };
+        out["extra_c1"]      = q1;
+        out["extra_c2"]      = q2;
+        out["comercial"]      = q6;
+        out["quebrados"]      = disc;
 
         // Publish to your ISA-95-ish topics (same payload in both for now)
 
