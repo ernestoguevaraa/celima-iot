@@ -3,14 +3,9 @@
 #include "Shift.hpp"
 #include <memory>
 #include <sstream>
+#include <mutex>
 using json = nlohmann::json;
 
-/**
- * Two ISA-95-style example topics. Adjust/extend later:
- *  1) <prefix>/production/line/quantity
- *  2) <prefix>/quality/alarms
- * Where <prefix> can be like: enterprise/site/area/line1
- */
 
 static Publication make_pub(const std::string &topic, const json &j)
 {
@@ -51,35 +46,90 @@ public:
     }
 };
 
-/** Example specialized processor: Calidad (deviceType 8) */
-class CalidadProcessor : public IMessageProcessor
-{
+/**
+ * CalidadShiftAccumulatorProcessor:
+ * - Maintains per-shift accumulators for qualities 1, 2, 6 and discarded ("quebrados").
+ * - Resets accumulators when the shift changes (S1->S2->S3->S1...).
+ * - Thread-safe via a static mutex (safe even if processor instances are recreated).
+ */
+class CalidadProcessor final : public IMessageProcessor {
+    // Static state shared across instances (simple + robust with current factory)
+    static std::mutex mtx_;
+    static int        current_shift_;     // 1,2,3
+    static uint64_t   acc_q1_;
+    static uint64_t   acc_q2_;
+    static uint64_t   acc_q6_;
+    static uint64_t   acc_discarded_;
+
+    static void ensure_shift_is_current_and_reset_if_needed(int new_shift) {
+        if (current_shift_ != new_shift) {
+            // Shift boundary: reset all accumulators.
+            current_shift_ = new_shift;
+            acc_q1_ = acc_q2_ = acc_q6_ = acc_discarded_ = 0;
+        }
+    }
+
 public:
-    std::vector<Publication> process(const json &msg, const std::string &isa95_prefix) override
-    {
-        // Interpret some likely quality-related signals
-        int alarms = jsonu::get_opt<int>(msg, "alarms").value_or(0);
-        int qty = jsonu::get_opt<int>(msg, "cantidad").value_or(0);
+    std::vector<Publication> process(const json& msg, const std::string& isa95_prefix) override {
+        const int shift_now = static_cast<int>(current_shift_localtime());
+        const int line_id   = msg.value("lineID", 0);
 
-        // Example outputs:
-        json qual;
-        qual["alarms"] = alarms;
-        if (auto defects = jsonu::get_opt<int>(msg, "defects"))
-            qual["defects"] = *defects;
-        qual["ts"] = std::time(nullptr);
+        // Read inputs (tolerate both "quebrados" and "quebrado")
+        const int cajaCalidad = msg.value("cajaCalidad", 0);  // valid: 1,2,6
+        const int quebrados   = msg.contains("quebrados")
+                                  ? msg.value("quebrados", 0)
+                                  : msg.value("quebrado", 0);
 
-        json prod;
-        prod["good_count"] = qty;
-        if (auto rejects = jsonu::get_opt<int>(msg, "rejects"))
-            prod["rejects"] = *rejects;
-        prod["ts"] = std::time(nullptr);
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            ensure_shift_is_current_and_reset_if_needed(shift_now);
 
-        auto t1 = isa95_prefix + "/quality/alarms";
-        auto t2 = isa95_prefix + "/production/line/quantity";
+            // Increment quality bucket by exactly 1 when cajaCalidad matches
+            if      (cajaCalidad == 1) ++acc_q1_;
+            else if (cajaCalidad == 2) ++acc_q2_;
+            else if (cajaCalidad == 6) ++acc_q6_;
+            // else: ignore unknown quality codes (0 or others)
 
-        return {make_pub(t1, qual), make_pub(t2, prod)};
+            // Add discarded count since last Calidad report
+            if (quebrados > 0) acc_discarded_ += static_cast<uint64_t>(quebrados);
+        }
+
+        // Snapshot for publishing (avoid holding the mutex while dumping JSON)
+        uint64_t q1, q2, q6, disc;
+        int cur_shift;
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            q1 = acc_q1_; q2 = acc_q2_; q6 = acc_q6_; disc = acc_discarded_;
+            cur_shift = current_shift_;
+        }
+
+        json out;
+        out["maquinda_id"] = 8;
+        out["ts"]          = std::time(nullptr);
+        out["shift"]       = cur_shift;          // 1,2,3
+        out["lineID"]      = line_id;
+        out["accumulators"] = {
+            {"extra_c1", q1},
+            {"extra_c2", q2},
+            {"comercial", q6},
+            {"quebrados", disc}
+        };
+
+        // Publish to your ISA-95-ish topics (same payload in both for now)
+
+        const auto t1 = isa95_prefix + "/calidad/production";
+
+        return { make_pub(t1, out) };
     }
 };
+
+// --- Static member definitions
+std::mutex  CalidadProcessor::mtx_;
+int         CalidadProcessor::current_shift_  = static_cast<int>(current_shift_localtime());
+uint64_t    CalidadProcessor::acc_q1_         = 0;
+uint64_t    CalidadProcessor::acc_q2_         = 0;
+uint64_t    CalidadProcessor::acc_q6_         = 0;
+uint64_t    CalidadProcessor::acc_discarded_  = 0;
 
 
 class PrensaHidraulica1Processor : public IMessageProcessor
@@ -105,6 +155,7 @@ public:
         qual["ts"] = std::time(nullptr);
 
         json prod;
+        prod["maquinda_id"] = 1;
         prod["cantidad_produccion"] = prod_q;
         prod["turno"] = shiftNum;
         prod["cantidad_paradas"] = stop_q;
@@ -141,6 +192,7 @@ public:
         qual["ts"] = std::time(nullptr);
 
         json prod;
+        prod["maquinda_id"] = 2;
         prod["cantidad_produccion"] = prod_q;
         prod["turno"] = shiftNum;
         prod["cantidad_paradas"] = stop_q;
@@ -175,6 +227,7 @@ public:
         qual["ts"] = std::time(nullptr);
 
         json prod;
+        prod["maquinda_id"] = 3;
         prod["cantidad_arranques"] = prod_s;
         prod["turno"] = shiftNum;
         prod["tiempo_operacion"] = prod_t;
@@ -210,6 +263,7 @@ public:
         qual["ts"] = std::time(nullptr);
 
         json prod;
+        prod["maquinda_id"] = 4;
         prod["cantidad_produccion"] = prod_q;
         prod["turno"] = shiftNum;
         prod["cantidad_paradas"] = stop_q;
@@ -246,6 +300,7 @@ public:
         qual["ts"] = std::time(nullptr);
 
         json prod;
+        prod["maquinda_id"] = 5;
         prod["cantidad_produccion"] = prod_q;
         prod["turno"] = shiftNum;
         prod["cantidad_paradas"] = stop_q;
@@ -284,6 +339,7 @@ public:
         qual["ts"] = std::time(nullptr);
 
         json prod;
+        prod["maquinda_id"] = 6;
         prod["cantidad_produccion"] = prod_q;
         prod["turno"] = shiftNum;
         prod["cantidad_paradas"] = stop_q;
@@ -321,6 +377,7 @@ public:
         qual["ts"] = std::time(nullptr);
 
         json prod;
+        prod["maquinda_id"] = 7;
         prod["cantidad_produccion"] = prod_q;
         prod["turno"] = shiftNum;
         prod["cantidad_total"] = prod_qtotal;
