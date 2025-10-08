@@ -19,7 +19,7 @@ int main(int argc, char** argv) {
     //Default values when no arguments 
     std::string broker = env_or("MQTT_BROKER", "tcp://localhost:1883");
     std::string client = env_or("MQTT_CLIENT_ID", "celima-integration");
-    std::string isa95  = env_or("ISA95_PREFIX", "celima/punta_hermosa/planta/linea");
+    std::string isa95  = env_or("ISA95_PREFIX", "celima/punta_hermosa/planta/linea/");
 
     if (argc > 1) broker = argv[1];
     if (argc > 2) client = argv[2];
