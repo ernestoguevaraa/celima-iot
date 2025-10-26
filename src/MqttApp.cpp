@@ -40,6 +40,7 @@ void MqttApp::start() {
         std::cout << "[MQTT] Connecting to " << broker_ << " as " << client_id_ << "...\n";
         cli_.connect(connopts_)->wait();
         std::cout << "[MQTT] Connected.\n";
+        subscribe_topics();
     } catch (const mqtt::exception& e) {
         std::cerr << "[MQTT] Connect failed: " << e.what() << "\n";
         throw;
@@ -58,7 +59,7 @@ void MqttApp::stop() {
         cli_.disconnect()->wait();
         std::cout << "[MQTT] Disconnected.\n";
     } catch (const mqtt::exception& e) {
-        std::cerr << "[MQTT] Stop error: " << e.what() << "\n";
+        std::cout << "[MQTT] Stop error: " << e.what() << "\n";
     }
 }
 
@@ -70,13 +71,13 @@ void MqttApp::subscribe_topics() {
         mqtt::iasync_client::qos_collection qos_vals(QOS.begin(), QOS.end());
         std::vector<mqtt::subscribe_options> sub_opts(TOPICS.size(), mqtt::subscribe_options());
 
-        cli_.subscribe(topic_filters, qos_vals, sub_opts)->wait();
+        cli_.subscribe(topic_filters, qos_vals, sub_opts);
 
-        std::cout << "[MQTT] Subscribed to topics (QoS1):";
+        std::cout << "[MQTT] Trying subscription to topics (QoS1):";
         for (auto& t : TOPICS) std::cout << " " << t;
         std::cout << "\n";
     } catch (const mqtt::exception& e) {
-        std::cerr << "[MQTT] Subscribe failed: " << e.what() << "\n";
+        std::cout << "[MQTT] Subscribe failed: " << e.what() << "\n";
     }
 }
 
@@ -86,7 +87,7 @@ void MqttApp::connected(const std::string& cause) {
 }
 
 void MqttApp::connection_lost(const std::string& cause) {
-    std::cerr << "[MQTT] Connection lost: " << cause << "\n";
+    std::cout << "[MQTT] Connection lost: " << cause << "\n";
 }
 
 void MqttApp::message_arrived(mqtt::const_message_ptr msg) {
@@ -95,6 +96,7 @@ void MqttApp::message_arrived(mqtt::const_message_ptr msg) {
         const auto& payload = msg->to_string();
 
         if (topic == "celima/data") {
+            std::cout << "[celima/data] " << payload << "\n";
             handle_celima_data(payload);
         } else if (topic == "celima/error") {
             std::cerr << "[celima/error] " << payload << "\n";
@@ -106,7 +108,7 @@ void MqttApp::message_arrived(mqtt::const_message_ptr msg) {
             std::cout << "[MQTT] Message on " << topic << " (ignored)\n";
         }
     } catch (const std::exception& e) {
-        std::cerr << "[MQTT] message_arrived error: " << e.what() << "\n";
+        std::cout << "[MQTT] message_arrived error: " << e.what() << "\n";
     }
 }
 
@@ -120,14 +122,14 @@ void MqttApp::on_success(const mqtt::token& tok) {
 }
 
 void MqttApp::on_failure(const mqtt::token& tok) {
-    std::cerr << "[MQTT] Action failed. Token: " << tok.get_message_id() << "\n";
+    std::cout << "[MQTT] Action failed. Token: " << tok.get_message_id() << "\n";
 }
 
 void MqttApp::handle_celima_data(const std::string& payload) {
     std::string err;
     auto jopt = jsonu::parse(payload, err);
     if (!jopt) {
-        std::cerr << "[celima/data] Invalid JSON: " << err << " | payload=" << payload << "\n";
+        std::cout << "[celima/data] Invalid JSON: " << err << " | payload=" << payload << "\n";
         return;
     }
     auto& j = *jopt;
@@ -150,6 +152,6 @@ void MqttApp::publish_qos1(const std::string& topic, const std::string& payload)
         // fire-and-forget; Paho retains the token internally with QoS1
         std::cout << "[PUB QoS1] " << topic << " <- " << payload << "\n";
     } catch (const mqtt::exception& e) {
-        std::cerr << "[MQTT] Publish failed: " << e.what() << "\n";
+        std::cout << "[MQTT] Publish failed: " << e.what() << "\n";
     }
 }

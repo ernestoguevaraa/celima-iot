@@ -1,6 +1,7 @@
 #include "MessageProcessor.hpp"
 #include "JsonUtils.hpp"
 #include "Shift.hpp"
+#include "TimeUtils.hpp"
 #include <memory>
 #include <sstream>
 #include <mutex>
@@ -104,8 +105,8 @@ public:
         }
 
         json out;
-        out["maquinda_id"] = 8;
-        out["ts"]          = std::time(nullptr);
+        out["maquina_id"] = 8;
+        out["timestamp_device"]  =  iso8601_utc_now();
         out["shift"]       = cur_shift;          // 1,2,3
         out["lineID"]      = line_id;
         out["extra_c1"]      = q1;
@@ -115,7 +116,7 @@ public:
 
         // Publish to your ISA-95-ish topics (same payload in both for now)
 
-        const auto t1 = isa95_prefix + "/calidad/production";
+        const auto t1 = isa95_prefix + std::to_string(line_id) + "/calidad/production";
 
         return { make_pub(t1, out) };
     }
@@ -150,7 +151,7 @@ public:
 
         json qual;
         qual["alarms"] = alarms;
-        qual["ts"] = std::time(nullptr);
+        qual["ts"] = iso8601_utc_now();
 
         json prod;
         prod["maquinda_id"] = 1;
@@ -187,7 +188,7 @@ public:
 
         json qual;
         qual["alarms"] = alarms;
-        qual["ts"] = std::time(nullptr);
+        qual["ts"] = iso8601_utc_now();
 
         json prod;
         prod["maquinda_id"] = 2;
@@ -222,7 +223,7 @@ public:
 
         json qual;
         qual["alarms"] = alarms;
-        qual["ts"] = std::time(nullptr);
+        qual["ts"] = iso8601_utc_now();
 
         json prod;
         prod["maquinda_id"] = 3;
@@ -266,7 +267,7 @@ public:
         prod["turno"] = shiftNum;
         prod["cantidad_paradas"] = stop_q;
         prod["tiempo_paradas"] = stop_t;
-        prod["ts"] = std::time(nullptr);
+        prod["ts"] = iso8601_utc_now();
 
         auto t1 = isa95_prefix + "/salida_secador/alarms";
         auto t2 = isa95_prefix + std::to_string(line) + "/salida_secador/production";
@@ -295,7 +296,7 @@ public:
 
         json qual;
         qual["alarms"] = alarms;
-        qual["ts"] = std::time(nullptr);
+        qual["ts"] = iso8601_utc_now();
 
         json prod;
         prod["maquinda_id"] = 5;
@@ -334,7 +335,7 @@ public:
 
         json qual;
         qual["alarms"] = alarms;
-        qual["ts"] = std::time(nullptr);
+        qual["ts"] = iso8601_utc_now();
 
         json prod;
         prod["maquinda_id"] = 6;
@@ -342,7 +343,7 @@ public:
         prod["turno"] = shiftNum;
         prod["cantidad_paradas"] = stop_q;
         prod["tiempo_paradas"] = stop_t;
-        prod["ts"] = std::time(nullptr);
+        prod["ts"] = iso8601_utc_now();
         prod["cantidad_fallas"] = falla_q;
         prod["tiempo_fallas"] = falla_t;
 
@@ -372,7 +373,7 @@ public:
 
         json qual;
         qual["alarms"] = alarms;
-        qual["ts"] = std::time(nullptr);
+        qual["ts"] = iso8601_utc_now();
 
         json prod;
         prod["maquinda_id"] = 7;
@@ -380,7 +381,7 @@ public:
         prod["turno"] = shiftNum;
         prod["cantidad_total"] = prod_qtotal;
 
-        prod["ts"] = std::time(nullptr);
+        prod["ts"] = iso8601_utc_now();
 
 
         auto t1 = isa95_prefix + "/salida_horno/alarms";
