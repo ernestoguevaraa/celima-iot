@@ -71,10 +71,10 @@ strip:
 	strip $(BIN_REL)
 
 run-release: release
-	MQTT_BROKER=tcp://localhost:1883 ISA95_PREFIX=enterprise/site/area/line1 ./$(BIN_REL)
+	MQTT_BROKER=tcp://localhost:1883 ./$(BIN_REL)
 
 run-debug: debug
-	MQTT_BROKER=tcp://localhost:1883 ISA95_PREFIX=enterprise/site/area/line1 ./$(BIN_DBG)
+	MQTT_BROKER=tcp://localhost:1883 ./$(BIN_DBG)
 
 format:
 	clang-format -i inc/*.hpp src/*.cpp || true

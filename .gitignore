@@ -37,6 +37,8 @@
 *.out
 *.app
 bin
+_pkg
 
 # debug information files
 *.dwo
+

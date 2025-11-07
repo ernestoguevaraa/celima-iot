@@ -6,10 +6,10 @@ VERSION=${1:-0.1.0}
 ARCH=$(dpkg --print-architecture)
 PKGDIR=./_pkg
 ROOT=$PKGDIR/${APP}_${VERSION}_${ARCH}
-BIN=bin/$APP
+BIN=bin/Release/$APP
 
 if [ ! -x "$BIN" ]; then
-  echo "Binary $BIN not found. Run 'make' first." >&2
+  echo "Binary $BIN not found. Run 'make release' first." >&2
   exit 1
 fi
 
@@ -28,7 +28,7 @@ Priority: optional
 Architecture: $ARCH
 Maintainer: Celima IoT <iot@example.com>
 Description: Celima MQTT Integration (Paho C++). Subscribes to celima/* and publishes ISA-95 topics.
-Depends: libpaho-mqttpp3 (>= 1.2), libpaho-mqtt3a (>= 1.3)
+Depends: libpaho-mqttpp3-1 (>= 1.2), libpaho-mqtt1.3 (>= 1.3)
 EOF
 
 # Postinst (enable + start)
