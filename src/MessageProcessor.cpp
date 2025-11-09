@@ -154,12 +154,12 @@ public:
         qual["ts"] = iso8601_utc_now();
 
         json prod;
-        prod["maquinda_id"] = 1;
-        prod["cantidad_produccion"] = prod_q;
+        prod["maquina_id"] = 1;
+        prod["cantidadProductos"] = prod_q;
         prod["turno"] = shiftNum;
-        prod["cantidad_paradas"] = stop_q;
-        prod["tiempo_paradas"] = stop_t;
-        prod["ts"] = iso8601_utc_now();
+        prod["paradas"] = stop_q;
+        prod["tiempoParadas_s"] = stop_t;
+        prod["timestamp_device"] = iso8601_utc_now();
 
         auto t1 = isa95_prefix + std::to_string(line) + "/prensa_hidraulica1/alarms";
         auto t2 = isa95_prefix + std::to_string(line) + "/prensa_hidraulica1/production";
@@ -191,12 +191,12 @@ public:
         qual["ts"] = iso8601_utc_now();
 
         json prod;
-        prod["maquinda_id"] = 2;
-        prod["cantidad_produccion"] = prod_q;
+        prod["maquina_id"] = 2;
+        prod["cantidadProductos"] = prod_q;
         prod["turno"] = shiftNum;
-        prod["cantidad_paradas"] = stop_q;
-        prod["tiempo_paradas"] = stop_t;
-        prod["ts"] = iso8601_utc_now();
+        prod["paradas"] = stop_q;
+        prod["tiempoParadas_s"] = stop_t;
+        prod["timestamp_device"] = iso8601_utc_now();
 
         auto t1 = isa95_prefix + std::to_string(line) + "/prensa_hidraulica2/alarms";
         auto t2 = isa95_prefix + std::to_string(line) + "/prensa_hidraulica2/production";
@@ -226,11 +226,11 @@ public:
         qual["ts"] = iso8601_utc_now();
 
         json prod;
-        prod["maquinda_id"] = 3;
+        prod["maquina_id"] = 3;
         prod["cantidad_arranques"] = prod_s;
         prod["turno"] = shiftNum;
         prod["tiempo_operacion"] = prod_t;
-        prod["ts"] = iso8601_utc_now();
+        prod["timestamp_device"] = iso8601_utc_now();
 
         auto t1 = isa95_prefix + std::to_string(line) + "/entrada_secador/alarms";
         auto t2 = isa95_prefix + std::to_string(line) + "/entrada_secador/production";
@@ -262,12 +262,12 @@ public:
         qual["ts"] = iso8601_utc_now();
 
         json prod;
-        prod["maquinda_id"] = 4;
+        prod["maquina_id"] = 4;
         prod["cantidad_produccion"] = prod_q;
         prod["turno"] = shiftNum;
         prod["cantidad_paradas"] = stop_q;
         prod["tiempo_paradas"] = stop_t;
-        prod["ts"] = iso8601_utc_now();
+        prod["timestamp_device"] = iso8601_utc_now();
 
         auto t1 = isa95_prefix + std::to_string(line) + "/salida_secador/alarms";
         auto t2 = isa95_prefix + std::to_string(line) + "/salida_secador/production";
@@ -299,12 +299,12 @@ public:
         qual["ts"] = iso8601_utc_now();
 
         json prod;
-        prod["maquinda_id"] = 5;
+        prod["maquina_id"] = 5;
         prod["cantidad_produccion"] = prod_q;
         prod["turno"] = shiftNum;
         prod["cantidad_paradas"] = stop_q;
         prod["tiempo_paradas"] = stop_t;
-        prod["ts"] = iso8601_utc_now();
+        prod["timestamp_device"] = iso8601_utc_now();
 
         auto t1 = isa95_prefix + std::to_string(line) + "/esmalte/alarms";
         auto t2 = isa95_prefix + std::to_string(line) + "/esmalte/production";
@@ -338,12 +338,12 @@ public:
         qual["ts"] = iso8601_utc_now();
 
         json prod;
-        prod["maquinda_id"] = 6;
+        prod["maquina_id"] = 6;
         prod["cantidad_produccion"] = prod_q;
         prod["turno"] = shiftNum;
         prod["cantidad_paradas"] = stop_q;
         prod["tiempo_paradas"] = stop_t;
-        prod["ts"] = iso8601_utc_now();
+        prod["timestamp_device"] = iso8601_utc_now();
         prod["cantidad_fallas"] = falla_q;
         prod["tiempo_fallas"] = falla_t;
 
@@ -376,12 +376,12 @@ public:
         qual["ts"] = iso8601_utc_now();
 
         json prod;
-        prod["maquinda_id"] = 7;
+        prod["maquina_id"] = 7;
         prod["cantidad_produccion"] = prod_q;
         prod["turno"] = shiftNum;
         prod["cantidad_total"] = prod_qtotal;
 
-        prod["ts"] = iso8601_utc_now();
+        prod["timestamp_device"] = iso8601_utc_now();
 
 
         auto t1 = isa95_prefix + std::to_string(line) + "/salida_horno/alarms";
