@@ -144,7 +144,7 @@ public:
         int alarms = jsonu::get_opt<int>(msg, "alarms").value_or(0);
         int prod_q = jsonu::get_opt<int>(msg, "cantidadProductos").value_or(0);
         //int prod_t = jsonu::get_opt<int>(msg, "tiempoProduccion_ds").value_or(0);
-        int line = jsonu::get_opt<int>(msg, "lineaID").value_or(0);
+        int line = jsonu::get_opt<int>(msg, "lineID").value_or(0);
         int stop_q = jsonu::get_opt<int>(msg, "paradas").value_or(0);
         int stop_t = jsonu::get_opt<int>(msg, "tiempoParadas_s").value_or(0);
 
@@ -181,7 +181,7 @@ public:
         int alarms = jsonu::get_opt<int>(msg, "alarms").value_or(0);
         int prod_q = jsonu::get_opt<int>(msg, "cantidadProductos").value_or(0);
         //int prod_t = jsonu::get_opt<int>(msg, "tiempoProduccion_ds").value_or(0);
-        int line = jsonu::get_opt<int>(msg, "lineaID").value_or(0);
+        int line = jsonu::get_opt<int>(msg, "lineID").value_or(0);
         int stop_q = jsonu::get_opt<int>(msg, "paradas").value_or(0);
         int stop_t = jsonu::get_opt<int>(msg, "tiempoParadas_s").value_or(0);
 
@@ -218,7 +218,7 @@ public:
         int alarms = jsonu::get_opt<int>(msg, "alarms").value_or(0);
         int prod_s = jsonu::get_opt<int>(msg, "arranques").value_or(0);
         int prod_t = jsonu::get_opt<int>(msg, "tiempoOperacion_s").value_or(0);
-        int line = jsonu::get_opt<int>(msg, "lineaID").value_or(0);
+        int line = jsonu::get_opt<int>(msg, "lineID").value_or(0);
 
 
         json qual;
@@ -252,7 +252,7 @@ public:
         int alarms = jsonu::get_opt<int>(msg, "alarms").value_or(0);
         int prod_q = jsonu::get_opt<int>(msg, "cantidadProductos").value_or(0);
         //int prod_t = jsonu::get_opt<int>(msg, "tiempoProduccion_ds").value_or(0);
-        int line = jsonu::get_opt<int>(msg, "lineaID").value_or(0);
+        int line = jsonu::get_opt<int>(msg, "lineID").value_or(0);
         int stop_q = jsonu::get_opt<int>(msg, "paradas").value_or(0);
         int stop_t = jsonu::get_opt<int>(msg, "tiempoParadas_s").value_or(0);
 
@@ -289,7 +289,7 @@ public:
         int alarms = jsonu::get_opt<int>(msg, "alarms").value_or(0);
         int prod_q = jsonu::get_opt<int>(msg, "cantidadProductos").value_or(0);
         //int prod_t = jsonu::get_opt<int>(msg, "tiempoProduccion_ds").value_or(0);
-        int line = jsonu::get_opt<int>(msg, "lineaID").value_or(0);
+        int line = jsonu::get_opt<int>(msg, "lineID").value_or(0);
         int stop_q = jsonu::get_opt<int>(msg, "paradas").value_or(0);
         int stop_t = jsonu::get_opt<int>(msg, "tiempoParadas_s").value_or(0);
 
@@ -326,7 +326,7 @@ public:
         int alarms = jsonu::get_opt<int>(msg, "alarms").value_or(0);
         int prod_q = jsonu::get_opt<int>(msg, "cantidad").value_or(0);
         //int prod_t = jsonu::get_opt<int>(msg, "tiempoProduccion_ds").value_or(0);
-        int line = jsonu::get_opt<int>(msg, "lineaID").value_or(0);
+        int line = jsonu::get_opt<int>(msg, "lineID").value_or(0);
         int stop_q = jsonu::get_opt<int>(msg, "paradas").value_or(0);
         int stop_t = jsonu::get_opt<int>(msg, "tiempoParadas_s").value_or(0);
         int falla_q = jsonu::get_opt<int>(msg, "fallaHorno").value_or(0);
@@ -368,7 +368,7 @@ public:
         int prod_q = jsonu::get_opt<int>(msg, "cantidad").value_or(0);
         int prod_qtotal = jsonu::get_opt<int>(msg, "cantidad_total").value_or(0);
         //int prod_t = jsonu::get_opt<int>(msg, "tiempoProduccion_ds").value_or(0);
-        int line = jsonu::get_opt<int>(msg, "lineaID").value_or(0);
+        int line = jsonu::get_opt<int>(msg, "lineID").value_or(0);
 
 
         json qual;
@@ -416,7 +416,6 @@ std::unique_ptr<IMessageProcessor> createProcessor(DeviceType dt)
         return std::make_unique<EntradaHornoProcessor>();
     case DeviceType::Salida_horno:
         return std::make_unique<SalidaHornoProcessor>();
-    // case DeviceType::PH_1: return std::make_unique<PH1Processor>();
     default:
         return std::make_unique<DefaultProcessor>();
     }
