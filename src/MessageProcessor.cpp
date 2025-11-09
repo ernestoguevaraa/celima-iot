@@ -159,9 +159,9 @@ public:
         prod["turno"] = shiftNum;
         prod["cantidad_paradas"] = stop_q;
         prod["tiempo_paradas"] = stop_t;
-        prod["ts"] = std::time(nullptr);
+        prod["ts"] = iso8601_utc_now();
 
-        auto t1 = isa95_prefix + "/prensa_hidraulica1/alarms";
+        auto t1 = isa95_prefix + std::to_string(line) + "/prensa_hidraulica1/alarms";
         auto t2 = isa95_prefix + std::to_string(line) + "/prensa_hidraulica1/production";
 
         return {make_pub(t1, qual), make_pub(t2, prod)};
@@ -196,9 +196,9 @@ public:
         prod["turno"] = shiftNum;
         prod["cantidad_paradas"] = stop_q;
         prod["tiempo_paradas"] = stop_t;
-        prod["ts"] = std::time(nullptr);
+        prod["ts"] = iso8601_utc_now();
 
-        auto t1 = isa95_prefix + "/prensa_hidraulica2/alarms";
+        auto t1 = isa95_prefix + std::to_string(line) + "/prensa_hidraulica2/alarms";
         auto t2 = isa95_prefix + std::to_string(line) + "/prensa_hidraulica2/production";
 
         return {make_pub(t1, qual), make_pub(t2, prod)};
@@ -230,9 +230,9 @@ public:
         prod["cantidad_arranques"] = prod_s;
         prod["turno"] = shiftNum;
         prod["tiempo_operacion"] = prod_t;
-        prod["ts"] = std::time(nullptr);
+        prod["ts"] = iso8601_utc_now();
 
-        auto t1 = isa95_prefix + "/entrada_secador/alarms";
+        auto t1 = isa95_prefix + std::to_string(line) + "/entrada_secador/alarms";
         auto t2 = isa95_prefix + std::to_string(line) + "/entrada_secador/production";
 
         return {make_pub(t1, qual), make_pub(t2, prod)};
@@ -259,7 +259,7 @@ public:
 
         json qual;
         qual["alarms"] = alarms;
-        qual["ts"] = std::time(nullptr);
+        qual["ts"] = iso8601_utc_now();
 
         json prod;
         prod["maquinda_id"] = 4;
@@ -269,7 +269,7 @@ public:
         prod["tiempo_paradas"] = stop_t;
         prod["ts"] = iso8601_utc_now();
 
-        auto t1 = isa95_prefix + "/salida_secador/alarms";
+        auto t1 = isa95_prefix + std::to_string(line) + "/salida_secador/alarms";
         auto t2 = isa95_prefix + std::to_string(line) + "/salida_secador/production";
 
         return {make_pub(t1, qual), make_pub(t2, prod)};
@@ -304,9 +304,9 @@ public:
         prod["turno"] = shiftNum;
         prod["cantidad_paradas"] = stop_q;
         prod["tiempo_paradas"] = stop_t;
-        prod["ts"] = std::time(nullptr);
+        prod["ts"] = iso8601_utc_now();
 
-        auto t1 = isa95_prefix + "/esmalte/alarms";
+        auto t1 = isa95_prefix + std::to_string(line) + "/esmalte/alarms";
         auto t2 = isa95_prefix + std::to_string(line) + "/esmalte/production";
 
         return {make_pub(t1, qual), make_pub(t2, prod)};
@@ -347,7 +347,7 @@ public:
         prod["cantidad_fallas"] = falla_q;
         prod["tiempo_fallas"] = falla_t;
 
-        auto t1 = isa95_prefix + "/entrada_horno/alarms";
+        auto t1 = isa95_prefix + std::to_string(line) + "/entrada_horno/alarms";
         auto t2 = isa95_prefix + std::to_string(line) + "/entrada_horno/production";
 
         return {make_pub(t1, qual), make_pub(t2, prod)};
@@ -384,7 +384,7 @@ public:
         prod["ts"] = iso8601_utc_now();
 
 
-        auto t1 = isa95_prefix + "/salida_horno/alarms";
+        auto t1 = isa95_prefix + std::to_string(line) + "/salida_horno/alarms";
         auto t2 = isa95_prefix + std::to_string(line) + "/salida_horno/production";
 
         return {make_pub(t1, qual), make_pub(t2, prod)};
