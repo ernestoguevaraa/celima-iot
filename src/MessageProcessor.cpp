@@ -227,7 +227,7 @@ public:
         // ---- NEW SHIFT-ACCUMULATED VALUES ----
         prod["cantidadPisadas"] = prod_count_shift;
         prod["cantidadProductos"] = prod_count_shift * PIEZAS_PISADA;
-        prod["tiempoProduccion_s"]      = production_time_s;
+        prod["tiempoProduccion_s"]      = (uint64_t)production_time_s;
 
         prod["timestamp_device"] = iso8601_utc_now();
 
@@ -345,7 +345,7 @@ public:
         // ---- NEW SHIFT-ACCUMULATED VALUES ----
         prod["cantidadPisadas"] = prod_count_shift;
         prod["cantidadProductos"] = prod_count_shift * PIEZAS_PISADA;
-        prod["tiempoProduccion_s"]      = production_time_s;
+        prod["tiempoProduccion_s"]      = (uint64_t)production_time_s;
 
         prod["timestamp_device"] = iso8601_utc_now();
 
