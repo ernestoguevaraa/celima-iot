@@ -133,34 +133,105 @@ uint64_t    CalidadProcessor::acc_discarded_  = 0;
 
 class PrensaHidraulica1Processor : public IMessageProcessor
 {
+    // ---- STATIC ACCUMULATORS (persist across messages) ----
+    static std::mutex mtx_;
+
+    static bool     initialized_;
+    static int      current_shift_;
+
+    // tiempoProduccion_ds accumulator
+    static uint16_t last_raw_ds_;
+    static double   accumulated_prod_time_s_;
+
+    // cantidadProductos accumulator (word overflow safe)
+    static uint16_t last_raw_count_;
+    static uint32_t accumulated_count_;   // grows per shift
+
 public:
     std::vector<Publication> process(const json &msg, const std::string &isa95_prefix) override
     {
-        // Interpret fields
-        auto s = current_shift_localtime();
-        int shiftNum = (s == Shift::S1 ? 1 : s == Shift::S2 ? 2
-                                                            : 3);
+        // Current shift
+        auto shift = current_shift_localtime();
+        int shiftNum = (shift == Shift::S1 ? 1 : shift == Shift::S2 ? 2 : 3);
 
-        int alarms = jsonu::get_opt<int>(msg, "alarms").value_or(0);
-        int prod_q = jsonu::get_opt<int>(msg, "cantidadProductos").value_or(0);
-        //int prod_t = jsonu::get_opt<int>(msg, "tiempoProduccion_ds").value_or(0);
-        int line = jsonu::get_opt<int>(msg, "lineID").value_or(0);
-        int stop_q = jsonu::get_opt<int>(msg, "paradas").value_or(0);
-        int stop_t = jsonu::get_opt<int>(msg, "tiempoParadas_s").value_or(0);
+        // --- INPUT FIELDS ---
+        int alarms          = jsonu::get_opt<int>(msg, "alarms").value_or(0);
+        int raw_count       = jsonu::get_opt<int>(msg, "cantidadProductos").value_or(0);      // WORD
+        int raw_prod_time   = jsonu::get_opt<int>(msg, "tiempoProduccion_ds").value_or(0);    // WORD (0.1s)
+        int stop_q          = jsonu::get_opt<int>(msg, "paradas").value_or(0);
+        int stop_t          = jsonu::get_opt<int>(msg, "tiempoParadas_s").value_or(0);
+        int line            = jsonu::get_opt<int>(msg, "lineID").value_or(0);
 
+        double production_time_s = 0.0;
+        uint32_t prod_count_shift = 0;
 
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+
+            uint16_t count_raw  = static_cast<uint16_t>(raw_count);
+            uint16_t time_raw   = static_cast<uint16_t>(raw_prod_time);
+
+            // ---- SHIFT CHANGE HANDLING ----
+            if (!initialized_ || shiftNum != current_shift_) {
+                initialized_ = true;
+                current_shift_ = shiftNum;
+
+                // reset per-shift accumulators
+                last_raw_ds_      = time_raw;
+                accumulated_prod_time_s_ = 0.0;
+
+                last_raw_count_   = count_raw;
+                accumulated_count_ = 0;
+            }
+            else {
+                // ---- 1) PRODUCTION TIME (WORD w/ overflow) ----
+                {
+                    uint16_t prev = last_raw_ds_;
+                    uint16_t diff = (time_raw >= prev)
+                        ? (time_raw - prev)
+                        : static_cast<uint16_t>(time_raw + (65536 - prev));
+
+                    accumulated_prod_time_s_ += diff * 0.1; // ds → seconds
+                    last_raw_ds_ = time_raw;
+                }
+
+                // ---- 2) PRODUCT COUNT (WORD w/ overflow) ----
+                {
+                    uint16_t prev = last_raw_count_;
+                    uint16_t diff = (count_raw >= prev)
+                        ? (count_raw - prev)
+                        : static_cast<uint16_t>(count_raw + (65536 - prev));
+
+                    accumulated_count_ += diff;
+                    last_raw_count_ = count_raw;
+                }
+            }
+
+            production_time_s = accumulated_prod_time_s_;
+            prod_count_shift  = accumulated_count_;
+        }
+
+        // ------------ BUILD PAYLOADS -------------
         json qual;
         qual["alarms"] = alarms;
-        qual["ts"] = iso8601_utc_now();
+        qual["timestamp_device"] = iso8601_utc_now();
 
         json prod;
         prod["maquina_id"] = 1;
-        prod["cantidadProductos"] = prod_q;
         prod["turno"] = shiftNum;
-        prod["paradas"] = stop_q;
-        prod["tiempoParadas_s"] = stop_t;
+
+        // original raw PLC values (optional, but you had them)
+        prod["tiempoParadas_s"]   = stop_t;
+        prod["paradas"]           = stop_q;
+
+        // ---- NEW SHIFT-ACCUMULATED VALUES ----
+        prod["cantidadPisadas"] = prod_count_shift;
+        prod["cantidadProductos"] = prod_count_shift * PIEZAS_PISADA;
+        prod["tiempoProduccion_s"]      = production_time_s;
+
         prod["timestamp_device"] = iso8601_utc_now();
 
+        // Topics
         auto t1 = isa95_prefix + std::to_string(line) + "/prensa_hidraulica1/alarms";
         auto t2 = isa95_prefix + std::to_string(line) + "/prensa_hidraulica1/production";
 
@@ -168,42 +239,133 @@ public:
     }
 };
 
+// ---- STATIC DEFINITIONS ----
+std::mutex PrensaHidraulica1Processor::mtx_;
+bool      PrensaHidraulica1Processor::initialized_            = false;
+int       PrensaHidraulica1Processor::current_shift_          = -1;
+uint16_t  PrensaHidraulica1Processor::last_raw_ds_            = 0;
+double    PrensaHidraulica1Processor::accumulated_prod_time_s_ = 0.0;
+uint16_t  PrensaHidraulica1Processor::last_raw_count_         = 0;
+uint32_t  PrensaHidraulica1Processor::accumulated_count_      = 0;
+
+
 class PrensaHidraulica2Processor : public IMessageProcessor
 {
+    // ---- STATIC ACCUMULATORS (persist across messages) ----
+    static std::mutex mtx_;
+
+    static bool     initialized_;
+    static int      current_shift_;
+
+    // tiempoProduccion_ds accumulator
+    static uint16_t last_raw_ds_;
+    static double   accumulated_prod_time_s_;
+
+    // cantidadProductos accumulator (word overflow safe)
+    static uint16_t last_raw_count_;
+    static uint32_t accumulated_count_;   // grows per shift
+
 public:
     std::vector<Publication> process(const json &msg, const std::string &isa95_prefix) override
     {
-        // Interpret fields
-        auto s = current_shift_localtime();
-        int shiftNum = (s == Shift::S1 ? 1 : s == Shift::S2 ? 2
-                                                            : 3);
+        // Current shift
+        auto shift = current_shift_localtime();
+        int shiftNum = (shift == Shift::S1 ? 1 : shift == Shift::S2 ? 2 : 3);
 
-        int alarms = jsonu::get_opt<int>(msg, "alarms").value_or(0);
-        int prod_q = jsonu::get_opt<int>(msg, "cantidadProductos").value_or(0);
-        //int prod_t = jsonu::get_opt<int>(msg, "tiempoProduccion_ds").value_or(0);
-        int line = jsonu::get_opt<int>(msg, "lineID").value_or(0);
-        int stop_q = jsonu::get_opt<int>(msg, "paradas").value_or(0);
-        int stop_t = jsonu::get_opt<int>(msg, "tiempoParadas_s").value_or(0);
+        // --- INPUT FIELDS ---
+        int alarms          = jsonu::get_opt<int>(msg, "alarms").value_or(0);
+        int raw_count       = jsonu::get_opt<int>(msg, "cantidadProductos").value_or(0);      // WORD
+        int raw_prod_time   = jsonu::get_opt<int>(msg, "tiempoProduccion_ds").value_or(0);    // WORD (0.1s)
+        int stop_q          = jsonu::get_opt<int>(msg, "paradas").value_or(0);
+        int stop_t          = jsonu::get_opt<int>(msg, "tiempoParadas_s").value_or(0);
+        int line            = jsonu::get_opt<int>(msg, "lineID").value_or(0);
 
+        double production_time_s = 0.0;
+        uint32_t prod_count_shift = 0;
 
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+
+            uint16_t count_raw  = static_cast<uint16_t>(raw_count);
+            uint16_t time_raw   = static_cast<uint16_t>(raw_prod_time);
+
+            // ---- SHIFT CHANGE HANDLING ----
+            if (!initialized_ || shiftNum != current_shift_) {
+                initialized_ = true;
+                current_shift_ = shiftNum;
+
+                // reset per-shift accumulators
+                last_raw_ds_      = time_raw;
+                accumulated_prod_time_s_ = 0.0;
+
+                last_raw_count_   = count_raw;
+                accumulated_count_ = 0;
+            }
+            else {
+                // ---- 1) PRODUCTION TIME (WORD w/ overflow) ----
+                {
+                    uint16_t prev = last_raw_ds_;
+                    uint16_t diff = (time_raw >= prev)
+                        ? (time_raw - prev)
+                        : static_cast<uint16_t>(time_raw + (65536 - prev));
+
+                    accumulated_prod_time_s_ += diff * 0.1; // ds → seconds
+                    last_raw_ds_ = time_raw;
+                }
+
+                // ---- 2) PRODUCT COUNT (WORD w/ overflow) ----
+                {
+                    uint16_t prev = last_raw_count_;
+                    uint16_t diff = (count_raw >= prev)
+                        ? (count_raw - prev)
+                        : static_cast<uint16_t>(count_raw + (65536 - prev));
+
+                    accumulated_count_ += diff;
+                    last_raw_count_ = count_raw;
+                }
+            }
+
+            production_time_s = accumulated_prod_time_s_;
+            prod_count_shift  = accumulated_count_;
+        }
+
+        // ------------ BUILD PAYLOADS -------------
         json qual;
         qual["alarms"] = alarms;
-        qual["ts"] = iso8601_utc_now();
+        qual["timestamp_device"] = iso8601_utc_now();
 
         json prod;
-        prod["maquina_id"] = 2;
-        prod["cantidadProductos"] = prod_q;
+        prod["maquina_id"] = 1;
         prod["turno"] = shiftNum;
-        prod["paradas"] = stop_q;
-        prod["tiempoParadas_s"] = stop_t;
+
+        // original raw PLC values (optional, but you had them)
+        prod["tiempoParadas_s"]   = stop_t;
+        prod["paradas"]           = stop_q;
+
+        // ---- NEW SHIFT-ACCUMULATED VALUES ----
+        prod["cantidadPisadas"] = prod_count_shift;
+        prod["cantidadProductos"] = prod_count_shift * PIEZAS_PISADA;
+        prod["tiempoProduccion_s"]      = production_time_s;
+
         prod["timestamp_device"] = iso8601_utc_now();
 
+        // Topics
         auto t1 = isa95_prefix + std::to_string(line) + "/prensa_hidraulica2/alarms";
         auto t2 = isa95_prefix + std::to_string(line) + "/prensa_hidraulica2/production";
 
         return {make_pub(t1, qual), make_pub(t2, prod)};
     }
 };
+
+// ---- STATIC DEFINITIONS ----
+std::mutex PrensaHidraulica2Processor::mtx_;
+bool      PrensaHidraulica2Processor::initialized_            = false;
+int       PrensaHidraulica2Processor::current_shift_          = -1;
+uint16_t  PrensaHidraulica2Processor::last_raw_ds_            = 0;
+double    PrensaHidraulica2Processor::accumulated_prod_time_s_ = 0.0;
+uint16_t  PrensaHidraulica2Processor::last_raw_count_         = 0;
+uint32_t  PrensaHidraulica2Processor::accumulated_count_      = 0;
+
 
 class EntradaSecadorProcessor : public IMessageProcessor
 {
