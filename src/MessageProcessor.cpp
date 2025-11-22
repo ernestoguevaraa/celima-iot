@@ -130,105 +130,119 @@ uint64_t    CalidadProcessor::acc_q2_         = 0;
 uint64_t    CalidadProcessor::acc_q6_         = 0;
 uint64_t    CalidadProcessor::acc_discarded_  = 0;
 
-
 class PrensaHidraulica1Processor : public IMessageProcessor
 {
-    // ---- STATIC ACCUMULATORS (persist across messages) ----
+    // --- Per-PLC state ---
+    struct PH1State {
+        bool initialized = false;
+        int shift = -1;
+
+        // Production time (WORD overflow-safe)
+        uint16_t last_raw_prod_time = 0;
+        double   acc_prod_time_s = 0.0;    // seconds
+
+        // Pisadas (WORD overflow-safe)
+        uint16_t last_raw_count = 0;
+        uint32_t acc_count = 0;
+    };
+
     static std::mutex mtx_;
-
-    static bool     initialized_;
-    static int      current_shift_;
-
-    // tiempoProduccion_ds accumulator
-    static uint16_t last_raw_ds_;
-    static double   accumulated_prod_time_s_;
-
-    // cantidadProductos accumulator (word overflow safe)
-    static uint16_t last_raw_count_;
-    static uint32_t accumulated_count_;   // grows per shift
+    static std::unordered_map<int, PH1State> states_;
 
 public:
     std::vector<Publication> process(const json &msg, const std::string &isa95_prefix) override
     {
-        // Current shift
-        auto shift = current_shift_localtime();
-        int shiftNum = (shift == Shift::S1 ? 1 : shift == Shift::S2 ? 2 : 3);
+        // -------- Current shift --------
+        auto sh = current_shift_localtime();
+        int shiftNum = (sh == Shift::S1 ? 1 : sh == Shift::S2 ? 2 : 3);
 
-        // --- INPUT FIELDS ---
+        // -------- Extract fields --------
+        int line            = jsonu::get_opt<int>(msg, "lineID").value_or(0);
         int alarms          = jsonu::get_opt<int>(msg, "alarms").value_or(0);
-        int raw_count       = jsonu::get_opt<int>(msg, "cantidadProductos").value_or(0);      // WORD
-        int raw_prod_time   = jsonu::get_opt<int>(msg, "tiempoProduccion_ds").value_or(0);    // WORD (0.1s)
+        int raw_count       = jsonu::get_opt<int>(msg, "cantidadProductos").value_or(0);
+        int raw_prod_time   = jsonu::get_opt<int>(msg, "tiempoProduccion_ds").value_or(0);  // tenths of sec
         int stop_q          = jsonu::get_opt<int>(msg, "paradas").value_or(0);
         int stop_t          = jsonu::get_opt<int>(msg, "tiempoParadas_s").value_or(0);
-        int line            = jsonu::get_opt<int>(msg, "lineID").value_or(0);
 
         double production_time_s = 0.0;
         uint32_t prod_count_shift = 0;
+        double pisadas_min = 0.0;
 
         {
             std::lock_guard<std::mutex> lock(mtx_);
 
-            uint16_t count_raw  = static_cast<uint16_t>(raw_count);
-            uint16_t time_raw   = static_cast<uint16_t>(raw_prod_time);
+            // Per-line state reference
+            PH1State &st = states_[line]; 
 
-            // ---- SHIFT CHANGE HANDLING ----
-            if (!initialized_ || shiftNum != current_shift_) {
-                initialized_ = true;
-                current_shift_ = shiftNum;
+            uint16_t time_raw  = static_cast<uint16_t>(raw_prod_time);
+            uint16_t count_raw = static_cast<uint16_t>(raw_count);
 
-                // reset per-shift accumulators
-                last_raw_ds_      = time_raw;
-                accumulated_prod_time_s_ = 0.0;
+            // -------- Shift change / first message --------
+            if (!st.initialized || st.shift != shiftNum) {
+                st.initialized = true;
+                st.shift = shiftNum;
 
-                last_raw_count_   = count_raw;
-                accumulated_count_ = 0;
+                st.last_raw_prod_time = time_raw;
+                st.acc_prod_time_s = 0.0;
+
+                st.last_raw_count = count_raw;
+                st.acc_count = 0;
             }
             else {
-                // ---- 1) PRODUCTION TIME (WORD w/ overflow) ----
-                {
-                    uint16_t prev = last_raw_ds_;
-                    uint16_t diff = (time_raw >= prev)
-                        ? (time_raw - prev)
-                        : static_cast<uint16_t>(time_raw + (65536 - prev));
+                // -------- Production time accumulator --------
+                uint16_t prev_t = st.last_raw_prod_time;
+                uint16_t diff_t = (time_raw >= prev_t)
+                    ? (time_raw - prev_t)
+                    : static_cast<uint16_t>(time_raw + (65536 - prev_t));
 
-                    accumulated_prod_time_s_ += diff * 0.1; // ds → seconds
-                    last_raw_ds_ = time_raw;
-                }
+                st.acc_prod_time_s += diff_t * 0.1;  // deciseconds → seconds
+                st.last_raw_prod_time = time_raw;
 
-                // ---- 2) PRODUCT COUNT (WORD w/ overflow) ----
-                {
-                    uint16_t prev = last_raw_count_;
-                    uint16_t diff = (count_raw >= prev)
-                        ? (count_raw - prev)
-                        : static_cast<uint16_t>(count_raw + (65536 - prev));
+                // -------- Pisadas accumulator (WORD overflow-safe) --------
+                uint16_t prev_c = st.last_raw_count;
+                uint16_t diff_c = (count_raw >= prev_c)
+                    ? (count_raw - prev_c)
+                    : static_cast<uint16_t>(count_raw + (65536 - prev_c));
 
-                    accumulated_count_ += diff;
-                    last_raw_count_ = count_raw;
-                }
+                st.acc_count += diff_c;
+                st.last_raw_count = count_raw;
             }
 
-            production_time_s = accumulated_prod_time_s_;
-            prod_count_shift  = accumulated_count_;
+            production_time_s = st.acc_prod_time_s;
+            prod_count_shift  = st.acc_count;
+
+            // -------- NEW: cantidadPisadas_min --------
+            if (production_time_s > 0.1) {
+                double minutes_prod = production_time_s / 60.0;
+                pisadas_min = prod_count_shift / minutes_prod;
+            }
+            else {
+                pisadas_min = 0.0;
+            }
         }
 
-        // ------------ BUILD PAYLOADS -------------
+        // -------- Build publications --------
         json qual;
         qual["alarms"] = alarms;
-        qual["timestamp_device"] = iso8601_utc_now();
+        qual["ts"] = iso8601_utc_now();
 
         json prod;
         prod["maquina_id"] = 1;
         prod["turno"] = shiftNum;
 
-        // original raw PLC values (optional, but you had them)
-        prod["tiempoParadas_s"]   = stop_t;
-        prod["paradas"]           = stop_q;
+        // Raw PLC values
+        prod["cantidadProductos_raw"] = raw_count;
+        prod["tiempoProduccion_ds_raw"] = raw_prod_time;
 
-        // ---- NEW SHIFT-ACCUMULATED VALUES ----
-        prod["cantidadPisadas"] = prod_count_shift;
-        prod["cantidadProductos"] = prod_count_shift * PIEZAS_PISADA;
-        prod["tiempoProduccion_s"]      = production_time_s;
+        // Shift accumulators
+        prod["cantidadProductos_shift"] = prod_count_shift;
+        prod["tiempoProduccion_s"] = production_time_s;
 
+        // NEW rate metric
+        prod["cantidadPisadas_min"] = pisadas_min;
+
+        prod["paradas"] = stop_q;
+        prod["tiempoParadas_s"] = stop_t;
         prod["timestamp_device"] = iso8601_utc_now();
 
         // Topics
@@ -241,112 +255,122 @@ public:
 
 // ---- STATIC DEFINITIONS ----
 std::mutex PrensaHidraulica1Processor::mtx_;
-bool      PrensaHidraulica1Processor::initialized_            = false;
-int       PrensaHidraulica1Processor::current_shift_          = -1;
-uint16_t  PrensaHidraulica1Processor::last_raw_ds_            = 0;
-double    PrensaHidraulica1Processor::accumulated_prod_time_s_ = 0.0;
-uint16_t  PrensaHidraulica1Processor::last_raw_count_         = 0;
-uint32_t  PrensaHidraulica1Processor::accumulated_count_      = 0;
-
+std::unordered_map<int, PrensaHidraulica1Processor::PH1State>
+    PrensaHidraulica1Processor::states_;
 
 class PrensaHidraulica2Processor : public IMessageProcessor
 {
-    // ---- STATIC ACCUMULATORS (persist across messages) ----
+    // --- Per-PLC state ---
+    struct PH2State {
+        bool initialized = false;
+        int shift = -1;
+
+        // Production time (WORD overflow-safe)
+        uint16_t last_raw_prod_time = 0;
+        double   acc_prod_time_s = 0.0;    // seconds
+
+        // Pisadas (WORD overflow-safe)
+        uint16_t last_raw_count = 0;
+        uint32_t acc_count = 0;
+    };
+
     static std::mutex mtx_;
-
-    static bool     initialized_;
-    static int      current_shift_;
-
-    // tiempoProduccion_ds accumulator
-    static uint16_t last_raw_ds_;
-    static double   accumulated_prod_time_s_;
-
-    // cantidadProductos accumulator (word overflow safe)
-    static uint16_t last_raw_count_;
-    static uint32_t accumulated_count_;   // grows per shift
+    static std::unordered_map<int, PH2State> states_;
 
 public:
     std::vector<Publication> process(const json &msg, const std::string &isa95_prefix) override
     {
-        // Current shift
-        auto shift = current_shift_localtime();
-        int shiftNum = (shift == Shift::S1 ? 1 : shift == Shift::S2 ? 2 : 3);
+        // -------- Current shift --------
+        auto sh = current_shift_localtime();
+        int shiftNum = (sh == Shift::S1 ? 1 : sh == Shift::S2 ? 2 : 3);
 
-        // --- INPUT FIELDS ---
+        // -------- Extract fields --------
+        int line            = jsonu::get_opt<int>(msg, "lineID").value_or(0);
         int alarms          = jsonu::get_opt<int>(msg, "alarms").value_or(0);
-        int raw_count       = jsonu::get_opt<int>(msg, "cantidadProductos").value_or(0);      // WORD
-        int raw_prod_time   = jsonu::get_opt<int>(msg, "tiempoProduccion_ds").value_or(0);    // WORD (0.1s)
+        int raw_count       = jsonu::get_opt<int>(msg, "cantidadProductos").value_or(0);
+        int raw_prod_time   = jsonu::get_opt<int>(msg, "tiempoProduccion_ds").value_or(0);  // tenths of sec
         int stop_q          = jsonu::get_opt<int>(msg, "paradas").value_or(0);
         int stop_t          = jsonu::get_opt<int>(msg, "tiempoParadas_s").value_or(0);
-        int line            = jsonu::get_opt<int>(msg, "lineID").value_or(0);
 
         double production_time_s = 0.0;
         uint32_t prod_count_shift = 0;
+        double pisadas_min = 0.0;
 
         {
             std::lock_guard<std::mutex> lock(mtx_);
 
-            uint16_t count_raw  = static_cast<uint16_t>(raw_count);
-            uint16_t time_raw   = static_cast<uint16_t>(raw_prod_time);
+            // Per-line state reference
+            PH2State &st = states_[line]; 
 
-            // ---- SHIFT CHANGE HANDLING ----
-            if (!initialized_ || shiftNum != current_shift_) {
-                initialized_ = true;
-                current_shift_ = shiftNum;
+            uint16_t time_raw  = static_cast<uint16_t>(raw_prod_time);
+            uint16_t count_raw = static_cast<uint16_t>(raw_count);
 
-                // reset per-shift accumulators
-                last_raw_ds_      = time_raw;
-                accumulated_prod_time_s_ = 0.0;
+            // -------- Shift change / first message --------
+            if (!st.initialized || st.shift != shiftNum) {
+                st.initialized = true;
+                st.shift = shiftNum;
 
-                last_raw_count_   = count_raw;
-                accumulated_count_ = 0;
+                st.last_raw_prod_time = time_raw;
+                st.acc_prod_time_s = 0.0;
+
+                st.last_raw_count = count_raw;
+                st.acc_count = 0;
             }
             else {
-                // ---- 1) PRODUCTION TIME (WORD w/ overflow) ----
-                {
-                    uint16_t prev = last_raw_ds_;
-                    uint16_t diff = (time_raw >= prev)
-                        ? (time_raw - prev)
-                        : static_cast<uint16_t>(time_raw + (65536 - prev));
+                // -------- Production time accumulator --------
+                uint16_t prev_t = st.last_raw_prod_time;
+                uint16_t diff_t = (time_raw >= prev_t)
+                    ? (time_raw - prev_t)
+                    : static_cast<uint16_t>(time_raw + (65536 - prev_t));
 
-                    accumulated_prod_time_s_ += diff * 0.1; // ds → seconds
-                    last_raw_ds_ = time_raw;
-                }
+                st.acc_prod_time_s += diff_t * 0.1;  // deciseconds → seconds
+                st.last_raw_prod_time = time_raw;
 
-                // ---- 2) PRODUCT COUNT (WORD w/ overflow) ----
-                {
-                    uint16_t prev = last_raw_count_;
-                    uint16_t diff = (count_raw >= prev)
-                        ? (count_raw - prev)
-                        : static_cast<uint16_t>(count_raw + (65536 - prev));
+                // -------- Pisadas accumulator (WORD overflow-safe) --------
+                uint16_t prev_c = st.last_raw_count;
+                uint16_t diff_c = (count_raw >= prev_c)
+                    ? (count_raw - prev_c)
+                    : static_cast<uint16_t>(count_raw + (65536 - prev_c));
 
-                    accumulated_count_ += diff;
-                    last_raw_count_ = count_raw;
-                }
+                st.acc_count += diff_c;
+                st.last_raw_count = count_raw;
             }
 
-            production_time_s = accumulated_prod_time_s_;
-            prod_count_shift  = accumulated_count_;
+            production_time_s = st.acc_prod_time_s;
+            prod_count_shift  = st.acc_count;
+
+            // -------- NEW: cantidadPisadas_min --------
+            if (production_time_s > 0.1) {
+                double minutes_prod = production_time_s / 60.0;
+                pisadas_min = prod_count_shift / minutes_prod;
+            }
+            else {
+                pisadas_min = 0.0;
+            }
         }
 
-        // ------------ BUILD PAYLOADS -------------
+        // -------- Build publications --------
         json qual;
         qual["alarms"] = alarms;
-        qual["timestamp_device"] = iso8601_utc_now();
+        qual["ts"] = iso8601_utc_now();
 
         json prod;
         prod["maquina_id"] = 1;
         prod["turno"] = shiftNum;
 
-        // original raw PLC values (optional, but you had them)
-        prod["tiempoParadas_s"]   = stop_t;
-        prod["paradas"]           = stop_q;
+        // Raw PLC values
+        prod["cantidadProductos_raw"] = raw_count;
+        prod["tiempoProduccion_ds_raw"] = raw_prod_time;
 
-        // ---- NEW SHIFT-ACCUMULATED VALUES ----
-        prod["cantidadPisadas"] = prod_count_shift;
-        prod["cantidadProductos"] = prod_count_shift * PIEZAS_PISADA;
-        prod["tiempoProduccion_s"]      = production_time_s;
+        // Shift accumulators
+        prod["cantidadProductos_shift"] = prod_count_shift;
+        prod["tiempoProduccion_s"] = production_time_s;
 
+        // NEW rate metric
+        prod["cantidadPisadas_min"] = pisadas_min;
+
+        prod["paradas"] = stop_q;
+        prod["tiempoParadas_s"] = stop_t;
         prod["timestamp_device"] = iso8601_utc_now();
 
         // Topics
@@ -359,13 +383,8 @@ public:
 
 // ---- STATIC DEFINITIONS ----
 std::mutex PrensaHidraulica2Processor::mtx_;
-bool      PrensaHidraulica2Processor::initialized_            = false;
-int       PrensaHidraulica2Processor::current_shift_          = -1;
-uint16_t  PrensaHidraulica2Processor::last_raw_ds_            = 0;
-double    PrensaHidraulica2Processor::accumulated_prod_time_s_ = 0.0;
-uint16_t  PrensaHidraulica2Processor::last_raw_count_         = 0;
-uint32_t  PrensaHidraulica2Processor::accumulated_count_      = 0;
-
+std::unordered_map<int, PrensaHidraulica2Processor::PH2State>
+    PrensaHidraulica2Processor::states_;
 
 class EntradaSecadorProcessor : public IMessageProcessor
 {
