@@ -231,8 +231,9 @@ public:
         prod["turno"] = shiftNum;
 
         // Shift accumulators
-        prod["cantidadProductos"] = prod_count_shift;
-        prod["tiempoProduccion_s"] = production_time_s;
+        prod["cantidadProductos"] = prod_count_shift * PIEZAS_PISADA;
+        prod["cantidadPisadas"] = prod_count_shift;
+        prod["tiempoProduccion_s"] = (uint32_t)production_time_s;
 
         // NEW rate metric
         prod["cantidadPisadas_min"] = pisadas_min;
@@ -355,8 +356,9 @@ public:
         prod["turno"] = shiftNum;
 
         // Shift accumulators
-        prod["cantidadProductos"] = prod_count_shift;
-        prod["tiempoProduccion_s"] = production_time_s;
+        prod["cantidadProductos"] = prod_count_shift * PIEZAS_PISADA;
+        prod["cantidadPisadas"] = prod_count_shift;
+        prod["tiempoProduccion_s"] = (uint32_t)production_time_s;
 
         // NEW rate metric
         prod["cantidadPisadas_min"] = pisadas_min;
@@ -618,7 +620,7 @@ public:
 
         // shift accumulated values
         prod["cantidad_produccion"] = prod_q_shift;
-        prod["tiempo_produccion"] = prod_t_shift_s;
+        prod["tiempo_produccion"] = (uint32_t)prod_t_shift_s;
         prod["cantidad_paradas"] = stop_q_shift;
         prod["tiempo_paradas"] = stop_t_shift_s;
 
@@ -751,7 +753,7 @@ public:
 
         // Shift-accumulated values
         prod["cantidad_produccion"] = prod_q_shift;
-        prod["tiempo_produccion"] = prod_t_shift_s;
+        prod["tiempo_produccion"] = (uint32_t)prod_t_shift_s;
         prod["cantidadd_paradas"] = stop_q_shift;
         prod["tiempo_paradas"] = stop_t_shift_s;
 
@@ -916,7 +918,7 @@ public:
         prod["cantidad_paradas"] = stop_q_shift;
         prod["cantidad_fallas"] = falla_q_shift;
 
-        prod["tiempo_produccion"] = prod_t_shift_s;
+        prod["tiempo_produccion"] = (uint32_t)prod_t_shift_s;
         prod["tiempo_paradas"] = stop_t_shift_s;
         prod["tiempo_fallas"] = falla_t_shift_s;
 
@@ -1032,7 +1034,7 @@ public:
         // Shift-accumulated values
         prod["cantidad_produccion"] = prod_q_shift;
         prod["cantidad_total"] = prod_qtotal_shift;
-        prod["tiempoProduccion_s"] = prod_t_shift_s;
+        prod["tiempoProduccion_s"] = (uint32_t)prod_t_shift_s;
 
         prod["timestamp_device"] = iso8601_utc_now();
 
