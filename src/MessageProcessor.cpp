@@ -130,20 +130,22 @@ uint64_t    CalidadProcessor::acc_q2_         = 0;
 uint64_t    CalidadProcessor::acc_q6_         = 0;
 uint64_t    CalidadProcessor::acc_discarded_  = 0;
 
+constexpr uint16_t PH1_COUNTER_MASK = 0x7FFF;  // keep lower 15 bits
+constexpr uint16_t PH1_COUNTER_MOD  = 0x8000;  // 2^15
+
 class PrensaHidraulica1Processor : public IMessageProcessor
 {
-    // --- Per-PLC state ---
     struct PH1State {
         bool initialized = false;
         int shift = -1;
 
-        // Production time (WORD overflow-safe)
+        // Production time (WORD overflow-safe, normal 16-bit)
         uint16_t last_raw_prod_time = 0;
-        double   acc_prod_time_s = 0.0;    // seconds
+        double   acc_prod_time_s = 0.0;
 
-        // Pisadas (WORD overflow-safe)
-        uint16_t last_raw_count = 0;
-        uint32_t acc_count = 0;
+        // Pisadas counter: true counter is 15 bits, MSB is a flag
+        uint16_t last_counter15 = 0;  // last *masked* 15-bit value
+        uint32_t acc_count = 0;       // accumulated pisadas in current shift
     };
 
     static std::mutex mtx_;
@@ -152,105 +154,101 @@ class PrensaHidraulica1Processor : public IMessageProcessor
 public:
     std::vector<Publication> process(const json &msg, const std::string &isa95_prefix) override
     {
-        // -------- Current shift --------
         auto sh = current_shift_localtime();
         int shiftNum = (sh == Shift::S1 ? 1 : sh == Shift::S2 ? 2 : 3);
 
-        // -------- Extract fields --------
-        int line            = jsonu::get_opt<int>(msg, "lineID").value_or(0);
-        int alarms          = jsonu::get_opt<int>(msg, "alarms").value_or(0);
-        int raw_count       = jsonu::get_opt<int>(msg, "cantidadProductos").value_or(0);
-        int raw_prod_time   = jsonu::get_opt<int>(msg, "tiempoProduccion_ds").value_or(0);  // tenths of sec
-        int stop_q          = jsonu::get_opt<int>(msg, "paradas").value_or(0);
-        int stop_t          = jsonu::get_opt<int>(msg, "tiempoParadas_s").value_or(0);
+        int line          = jsonu::get_opt<int>(msg, "lineID").value_or(0);
+        int alarms        = jsonu::get_opt<int>(msg, "alarms").value_or(0);
+        int raw_count     = jsonu::get_opt<int>(msg, "cantidadProductos").value_or(0);
+        int raw_prod_time = jsonu::get_opt<int>(msg, "tiempoProduccion_ds").value_or(0);
+        int stop_q        = jsonu::get_opt<int>(msg, "paradas").value_or(0);
+        int stop_t        = jsonu::get_opt<int>(msg, "tiempoParadas_s").value_or(0);
 
-        double production_time_s = 0.0;
-        uint32_t prod_count_shift = 0;
-        double pisadas_min = 0.0;
+        double   production_time_s = 0.0;
+        uint32_t prod_count_shift  = 0;
+        double   pisadas_min       = 0.0;
 
         {
             std::lock_guard<std::mutex> lock(mtx_);
+            PH1State &st = states_[line];
 
-            // Per-line state reference
-            PH1State &st = states_[line]; 
+            // Time: normal 16-bit word, no special flag
+            uint16_t time_raw = static_cast<uint16_t>(raw_prod_time);
 
-            uint16_t time_raw  = static_cast<uint16_t>(raw_prod_time);
-            uint16_t count_raw = static_cast<uint16_t>(raw_count);
+            // Counter: mask off MSB; treat it as a 15-bit modulo counter
+            uint16_t count_word   = static_cast<uint16_t>(raw_count);
+            uint16_t count_15bit  = static_cast<uint16_t>(count_word & PH1_COUNTER_MASK);
 
-            // -------- Shift change / first message --------
             if (!st.initialized || st.shift != shiftNum) {
                 st.initialized = true;
                 st.shift = shiftNum;
 
                 st.last_raw_prod_time = time_raw;
-                st.acc_prod_time_s = 0.0;
+                st.acc_prod_time_s    = 0.0;
 
-                st.last_raw_count = count_raw;
-                st.acc_count = 0;
+                st.last_counter15 = count_15bit;
+                st.acc_count      = 0;
             }
             else {
-                // -------- Production time accumulator --------
+                // --- Production time accumulator (normal 16-bit modulo 65536) ---
                 uint16_t prev_t = st.last_raw_prod_time;
                 uint16_t diff_t = (time_raw >= prev_t)
-                    ? (time_raw - prev_t)
-                    : static_cast<uint16_t>(time_raw + (65536 - prev_t));
+                    ? static_cast<uint16_t>(time_raw - prev_t)
+                    : static_cast<uint16_t>(time_raw + (uint16_t(65536) - prev_t));
 
                 st.acc_prod_time_s += diff_t * 0.1;  // deciseconds → seconds
                 st.last_raw_prod_time = time_raw;
 
-                // -------- Pisadas accumulator (WORD overflow-safe) --------
-                uint16_t prev_c = st.last_raw_count;
-                uint16_t diff_c = (count_raw >= prev_c)
-                    ? (count_raw - prev_c)
-                    : static_cast<uint16_t>(count_raw + (65536 - prev_c));
+                // --- Pisadas accumulator: 15-bit modulo counter (0..32767) ---
+                uint16_t prev_c = st.last_counter15;
+                uint16_t curr_c = count_15bit;
 
-                st.acc_count += diff_c;
-                st.last_raw_count = count_raw;
+                uint16_t diff_c;
+                if (curr_c >= prev_c) {
+                    diff_c = static_cast<uint16_t>(curr_c - prev_c);
+                } else {
+                    // wrap in 15 bits
+                    diff_c = static_cast<uint16_t>(PH1_COUNTER_MOD + curr_c - prev_c);
+                }
+
+                st.acc_count      += diff_c;
+                st.last_counter15  = curr_c;
             }
 
             production_time_s = st.acc_prod_time_s;
             prod_count_shift  = st.acc_count;
 
-            // -------- NEW: cantidadPisadas_min --------
             if (production_time_s > 0.1) {
                 double minutes_prod = production_time_s / 60.0;
                 pisadas_min = prod_count_shift / minutes_prod;
-            }
-            else {
+            } else {
                 pisadas_min = 0.0;
             }
         }
 
-        // -------- Build publications --------
         json qual;
-        qual["alarms"] = alarms;
+        qual["alarms"]           = alarms;
         qual["timestamp_device"] = iso8601_utc_now();
 
         json prod;
-        prod["maquina_id"] = 1;
-        prod["turno"] = shiftNum;
+        prod["maquina_id"]          = 1;
+        prod["turno"]               = shiftNum;
+        prod["cantidadProductos"]   = prod_count_shift * PIEZAS_PISADA;
+        prod["cantidadPisadas"]     = prod_count_shift;
+        prod["tiempoProduccion_s"]  = static_cast<uint32_t>(production_time_s);
+        prod["cantidadPisadas_min"] = static_cast<uint32_t>(pisadas_min);
+        prod["paradas"]             = stop_q;
+        prod["tiempoParadas_s"]     = stop_t;
+        prod["timestamp_device"]    = iso8601_utc_now();
 
-        // Shift accumulators
-        prod["cantidadProductos"] = prod_count_shift * PIEZAS_PISADA;
-        prod["cantidadPisadas"] = prod_count_shift;
-        prod["tiempoProduccion_s"] = (uint32_t)production_time_s;
-
-        // NEW rate metric
-        prod["cantidadPisadas_min"] = (uint32_t)pisadas_min;
-
-        prod["paradas"] = stop_q;
-        prod["tiempoParadas_s"] = stop_t;
-        prod["timestamp_device"] = iso8601_utc_now();
-
-        // Topics
         auto t1 = isa95_prefix + std::to_string(line) + "/prensa_hidraulica1/alarms";
         auto t2 = isa95_prefix + std::to_string(line) + "/prensa_hidraulica1/production";
 
-        return {make_pub(t1, qual), make_pub(t2, prod)};
+        return { make_pub(t1, qual), make_pub(t2, prod) };
     }
 };
 
-// ---- STATIC DEFINITIONS ----
+// ===== STATIC DEFINITIONS FOR PrensaHidraulica1Processor =====
 std::mutex PrensaHidraulica1Processor::mtx_;
 std::unordered_map<int, PrensaHidraulica1Processor::PH1State>
     PrensaHidraulica1Processor::states_;
@@ -260,84 +258,95 @@ class PrensaHidraulica2Processor : public IMessageProcessor
     // --- Per-PLC state ---
     struct PH2State {
         bool initialized = false;
-        int shift = -1;
+        int  shift       = -1;
 
-        // Production time (WORD overflow-safe)
+        // Production time (normal 16-bit word)
         uint16_t last_raw_prod_time = 0;
-        double   acc_prod_time_s = 0.0;    // seconds
+        double   acc_prod_time_s    = 0.0;     // seconds
 
-        // Pisadas (WORD overflow-safe)
-        uint16_t last_raw_count = 0;
-        uint32_t acc_count = 0;
+        // Pisadas counter (MSB = flag → use only low 15 bits)
+        uint16_t last_counter15     = 0;       // masked 15-bit counter
+        uint32_t acc_count          = 0;       // accumulated pisadas
     };
 
     static std::mutex mtx_;
     static std::unordered_map<int, PH2State> states_;
 
+    // Mask and modulo for 15-bit counter
+    static constexpr uint16_t COUNTER_MASK = 0x7FFF;
+    static constexpr uint16_t COUNTER_MOD  = 0x8000;
+
 public:
     std::vector<Publication> process(const json &msg, const std::string &isa95_prefix) override
     {
-        // -------- Current shift --------
+        // ---- Current shift ----
         auto sh = current_shift_localtime();
-        int shiftNum = (sh == Shift::S1 ? 1 : sh == Shift::S2 ? 2 : 3);
+        int shiftNum = (sh == Shift::S1 ? 1 : (sh == Shift::S2 ? 2 : 3));
 
-        // -------- Extract fields --------
-        int line            = jsonu::get_opt<int>(msg, "lineID").value_or(0);
-        int alarms          = jsonu::get_opt<int>(msg, "alarms").value_or(0);
-        int raw_count       = jsonu::get_opt<int>(msg, "cantidadProductos").value_or(0);
-        int raw_prod_time   = jsonu::get_opt<int>(msg, "tiempoProduccion_ds").value_or(0);  // tenths of sec
-        int stop_q          = jsonu::get_opt<int>(msg, "paradas").value_or(0);
-        int stop_t          = jsonu::get_opt<int>(msg, "tiempoParadas_s").value_or(0);
+        // ---- Extract fields ----
+        int line          = jsonu::get_opt<int>(msg, "lineID").value_or(0);
+        int alarms        = jsonu::get_opt<int>(msg, "alarms").value_or(0);
+        int raw_count_i   = jsonu::get_opt<int>(msg, "cantidadProductos").value_or(0);
+        int raw_time_i    = jsonu::get_opt<int>(msg, "tiempoProduccion_ds").value_or(0);
+        int stop_q        = jsonu::get_opt<int>(msg, "paradas").value_or(0);
+        int stop_t        = jsonu::get_opt<int>(msg, "tiempoParadas_s").value_or(0);
 
-        double production_time_s = 0.0;
-        uint32_t prod_count_shift = 0;
-        double pisadas_min = 0.0;
+        double   production_time_s = 0.0;
+        uint32_t prod_count_shift  = 0;
+        double   pisadas_min       = 0.0;
 
         {
             std::lock_guard<std::mutex> lock(mtx_);
 
-            // Per-line state reference
-            PH2State &st = states_[line]; 
+            PH2State &st = states_[line];
 
-            uint16_t time_raw  = static_cast<uint16_t>(raw_prod_time);
-            uint16_t count_raw = static_cast<uint16_t>(raw_count);
+            uint16_t time_raw = static_cast<uint16_t>(raw_time_i);
 
-            // -------- Shift change / first message --------
+            // --- Mask off flag bit (MSB) from counter ---
+            uint16_t count_word   = static_cast<uint16_t>(raw_count_i);
+            uint16_t count_15bit  = static_cast<uint16_t>(count_word & COUNTER_MASK);
+
+            // ---- First message of shift ----
             if (!st.initialized || st.shift != shiftNum) {
                 st.initialized = true;
-                st.shift = shiftNum;
+                st.shift       = shiftNum;
 
                 st.last_raw_prod_time = time_raw;
-                st.acc_prod_time_s = 0.0;
+                st.acc_prod_time_s    = 0.0;
 
-                st.last_raw_count = count_raw;
-                st.acc_count = 0;
+                st.last_counter15     = count_15bit;
+                st.acc_count          = 0;
             }
             else {
-                // -------- Production time accumulator --------
+                // --- Production time accumulator (16-bit modulo) ---
                 uint16_t prev_t = st.last_raw_prod_time;
-                uint16_t diff_t = (time_raw >= prev_t)
-                    ? (time_raw - prev_t)
+                uint16_t diff_t =
+                    (time_raw >= prev_t)
+                    ? static_cast<uint16_t>(time_raw - prev_t)
                     : static_cast<uint16_t>(time_raw + (65536 - prev_t));
 
-                st.acc_prod_time_s += diff_t * 0.1;  // deciseconds → seconds
+                st.acc_prod_time_s += diff_t * 0.1;   // ds → s
                 st.last_raw_prod_time = time_raw;
 
-                // -------- Pisadas accumulator (WORD overflow-safe) --------
-                uint16_t prev_c = st.last_raw_count;
-                uint16_t diff_c = (count_raw >= prev_c)
-                    ? (count_raw - prev_c)
-                    : static_cast<uint16_t>(count_raw + (65536 - prev_c));
+                // --- Pisadas accumulator using 15-bit modulo ---
+                uint16_t prev_c = st.last_counter15;
+                uint16_t curr_c = count_15bit;
 
-                st.acc_count += diff_c;
-                st.last_raw_count = count_raw;
+                uint16_t diff_c;
+                if (curr_c >= prev_c)
+                    diff_c = static_cast<uint16_t>(curr_c - prev_c);
+                else
+                    diff_c = static_cast<uint16_t>(COUNTER_MOD + curr_c - prev_c);
+
+                st.acc_count      += diff_c;
+                st.last_counter15  = curr_c;
             }
 
             production_time_s = st.acc_prod_time_s;
             prod_count_shift  = st.acc_count;
 
-            // -------- NEW: cantidadPisadas_min --------
-            if (production_time_s > 0.1) {
+            // ---- Pisadas per minute (based on production time only) ----
+            if (production_time_s > 1.0) {
                 double minutes_prod = production_time_s / 60.0;
                 pisadas_min = prod_count_shift / minutes_prod;
             }
@@ -346,34 +355,31 @@ public:
             }
         }
 
-        // -------- Build publications --------
+        // ---- Build publications ----
         json qual;
-        qual["alarms"] = alarms;
+        qual["alarms"]           = alarms;
         qual["timestamp_device"] = iso8601_utc_now();
 
         json prod;
-        prod["maquina_id"] = 1;
-        prod["turno"] = shiftNum;
+        prod["maquina_id"]          = 1;
+        prod["turno"]               = shiftNum;
 
-        // Shift accumulators
-        prod["cantidadProductos"] = prod_count_shift * PIEZAS_PISADA;
-        prod["cantidadPisadas"] = prod_count_shift;
-        prod["tiempoProduccion_s"] = (uint32_t)production_time_s;
+        prod["cantidadPisadas"]     = prod_count_shift;
+        prod["cantidadPisadas_min"] = static_cast<uint32_t>(pisadas_min);
+        prod["cantidadProductos"]   = prod_count_shift * PIEZAS_PISADA;
+        prod["tiempoProduccion_s"]  = static_cast<uint32_t>(production_time_s);
 
-        // NEW rate metric
-        prod["cantidadPisadas_min"] = (uint32_t)pisadas_min;
+        prod["paradas"]             = stop_q;
+        prod["tiempoParadas_s"]     = stop_t;
+        prod["timestamp_device"]    = iso8601_utc_now();
 
-        prod["paradas"] = stop_q;
-        prod["tiempoParadas_s"] = stop_t;
-        prod["timestamp_device"] = iso8601_utc_now();
-
-        // Topics
         auto t1 = isa95_prefix + std::to_string(line) + "/prensa_hidraulica2/alarms";
         auto t2 = isa95_prefix + std::to_string(line) + "/prensa_hidraulica2/production";
 
-        return {make_pub(t1, qual), make_pub(t2, prod)};
+        return { make_pub(t1, qual), make_pub(t2, prod) };
     }
 };
+
 
 // ---- STATIC DEFINITIONS ----
 std::mutex PrensaHidraulica2Processor::mtx_;
@@ -382,110 +388,108 @@ std::unordered_map<int, PrensaHidraulica2Processor::PH2State>
 
 class EntradaSecadorProcessor : public IMessageProcessor
 {
-    // Per-PLC state
-    struct State {
+    struct ESState {
         bool initialized = false;
-        int shift = -1;
+        int  shift       = -1;
 
-        // Event counter (arranques): WORD overflow-safe
-        uint16_t last_raw_arr = 0;
+        // Operation time (15-bit seconds, MSB is a flag)
+        uint16_t last_time15   = 0;
+        double   acc_time_s    = 0.0;
+
+        // Arranques (15-bit counter, MSB is a flag)
+        uint16_t last_count15  = 0;
         uint32_t acc_arranques = 0;
-
-        // Operation time: WORD overflow-safe (seconds)
-        uint16_t last_raw_oper = 0;
-        uint32_t acc_oper_s = 0;
     };
 
     static std::mutex mtx_;
-    static std::unordered_map<int, State> states_;
+    static std::unordered_map<int, ESState> states_;
+
+    static constexpr uint16_t MASK_15 = 0x7FFF;  // bits 0-14
+    static constexpr uint16_t MOD_15  = 0x8000;  // 2^15
 
 public:
     std::vector<Publication> process(const json &msg, const std::string &isa95_prefix) override
     {
-        // ---- Current shift ----
         auto sh = current_shift_localtime();
-        int shiftNum = (sh == Shift::S1 ? 1 : sh == Shift::S2 ? 2 : 3);
+        int  shiftNum = (sh == Shift::S1 ? 1 : (sh == Shift::S2 ? 2 : 3));
 
-        // ---- Read PLC fields ----
-        int line   = jsonu::get_opt<int>(msg, "lineID").value_or(0);
-        int alarms = jsonu::get_opt<int>(msg, "alarms").value_or(0);
+        int line       = jsonu::get_opt<int>(msg, "lineID").value_or(0);
+        int alarms     = jsonu::get_opt<int>(msg, "alarms").value_or(0);
+        int raw_arr    = jsonu::get_opt<int>(msg, "arranques").value_or(0);
+        int raw_time_s = jsonu::get_opt<int>(msg, "tiempoOperacion_s").value_or(0);
 
-        int raw_arr = jsonu::get_opt<int>(msg, "arranques").value_or(0);              // WORD counter
-        int raw_op  = jsonu::get_opt<int>(msg, "tiempoOperacion_s").value_or(0);      // WORD seconds
-
-        uint32_t arranques_shift = 0;
-        uint32_t tiempo_oper_s   = 0;
+        double   acc_time_out   = 0.0;
+        uint32_t arranques_out  = 0;
 
         {
             std::lock_guard<std::mutex> lock(mtx_);
+            ESState &st = states_[line];
 
-            State &st = states_[line];
+            // Mask MSB off both counters (15-bit true values)
+            uint16_t time15  = static_cast<uint16_t>(raw_time_s) & MASK_15;
+            uint16_t count15 = static_cast<uint16_t>(raw_arr)    & MASK_15;
 
-            uint16_t arr_raw = static_cast<uint16_t>(raw_arr);
-            uint16_t op_raw  = static_cast<uint16_t>(raw_op);
-
-            // ---- Shift reset or first message ----
             if (!st.initialized || st.shift != shiftNum) {
-                st.initialized = true;
-                st.shift = shiftNum;
+                // New shift or first sample
+                st.initialized   = true;
+                st.shift         = shiftNum;
 
-                st.last_raw_arr = arr_raw;
+                st.last_time15   = time15;
+                st.acc_time_s    = 0.0;
+
+                st.last_count15  = count15;
                 st.acc_arranques = 0;
-
-                st.last_raw_oper = op_raw;
-                st.acc_oper_s = 0;
             }
             else {
-                // ---- Overflow-safe arranques increment ----
-                uint16_t prev_a = st.last_raw_arr;
-                uint16_t diff_a =
-                    (arr_raw >= prev_a) ? (arr_raw - prev_a)
-                                        : static_cast<uint16_t>(arr_raw + (65536 - prev_a));
+                // --- Time delta, modulo 15 bits ---
+                uint16_t prev_t = st.last_time15;
+                uint16_t dt;
+                if (time15 >= prev_t)
+                    dt = static_cast<uint16_t>(time15 - prev_t);
+                else
+                    dt = static_cast<uint16_t>(MOD_15 + time15 - prev_t);
 
-                st.acc_arranques += diff_a;
-                st.last_raw_arr = arr_raw;
+                st.acc_time_s += dt;       // already in seconds
+                st.last_time15 = time15;
 
-                // ---- Overflow-safe operation time increment ----
-                uint16_t prev_o = st.last_raw_oper;
-                uint16_t diff_o =
-                    (op_raw >= prev_o) ? (op_raw - prev_o)
-                                       : static_cast<uint16_t>(op_raw + (65536 - prev_o));
+                // --- Arranques delta, modulo 15 bits ---
+                uint16_t prev_c = st.last_count15;
+                uint16_t dc;
+                if (count15 >= prev_c)
+                    dc = static_cast<uint16_t>(count15 - prev_c);
+                else
+                    dc = static_cast<uint16_t>(MOD_15 + count15 - prev_c);
 
-                st.acc_oper_s += diff_o;
-                st.last_raw_oper = op_raw;
+                st.acc_arranques += dc;
+                st.last_count15   = count15;
             }
 
-            arranques_shift = st.acc_arranques;
-            tiempo_oper_s   = st.acc_oper_s;
+            acc_time_out  = st.acc_time_s;
+            arranques_out = st.acc_arranques;
         }
 
-        // ---- Build output JSON ----
+        // --- Build publications ---
         json qual;
         qual["alarms"] = alarms;
-        qual["ts"] = iso8601_utc_now();
+        qual["ts"]     = iso8601_utc_now();
 
         json prod;
-        prod["maquina_id"] = 3;
-        prod["turno"] = shiftNum;
+        prod["maquina_id"]        = 3;
+        prod["turno"]             = shiftNum;
+        prod["cantidad_arranques"] = arranques_out;
+        prod["tiempo_operacion"]   = static_cast<uint32_t>(acc_time_out);
+        prod["timestamp_device"]   = iso8601_utc_now();
 
-
-        // shift-accumulated values
-        prod["arranques_shift"] = arranques_shift;
-        prod["tiempoOperacion_shift_s"] = tiempo_oper_s;
-
-        prod["timestamp_device"] = iso8601_utc_now();
-
-        // ---- Topics ----
         auto t1 = isa95_prefix + std::to_string(line) + "/entrada_secador/alarms";
         auto t2 = isa95_prefix + std::to_string(line) + "/entrada_secador/production";
 
-        return {make_pub(t1, qual), make_pub(t2, prod)};
+        return { make_pub(t1, qual), make_pub(t2, prod) };
     }
 };
 
-// ---- STATIC DEFINITIONS ----
+// In MessageProcessor.cpp (once, not in header)
 std::mutex EntradaSecadorProcessor::mtx_;
-std::unordered_map<int, EntradaSecadorProcessor::State>
+std::unordered_map<int, EntradaSecadorProcessor::ESState>
     EntradaSecadorProcessor::states_;
 
 
@@ -493,43 +497,46 @@ class SalidaSecadorProcessor : public IMessageProcessor
 {
     struct State {
         bool initialized = false;
-        int shift = -1;
+        int  shift       = -1;
 
-        // cantidadProductos (WORD counter)
-        uint16_t last_raw_prod_q = 0;
-        uint32_t acc_prod_q = 0;
+        // cantidadProductos (15-bit counter, MSB is flag)
+        uint16_t last_prod_q15   = 0;
+        uint32_t acc_prod_q      = 0;
 
-        // paradas (WORD counter)
-        uint16_t last_raw_stop_q = 0;
-        uint32_t acc_stop_q = 0;
+        // paradas (15-bit counter, MSB is flag)
+        uint16_t last_stop_q15   = 0;
+        uint32_t acc_stop_q      = 0;
 
-        // tiempoProduccion_ds (WORD, deciseconds)
+        // tiempoProduccion_ds (16-bit, deciseconds, clean)
         uint16_t last_raw_prod_t = 0;
-        double   acc_prod_t_s = 0.0;
+        double   acc_prod_t_s    = 0.0;
 
-        // tiempoParadas_s (WORD, seconds)
-        uint16_t last_raw_stop_t = 0;
-        uint32_t acc_stop_t_s = 0;
+        // tiempoParadas_s (15-bit, MSB is flag)
+        uint16_t last_stop_t15   = 0;
+        uint32_t acc_stop_t_s    = 0;
     };
 
     static std::mutex mtx_;
     static std::unordered_map<int, State> states_;
+
+    static constexpr uint16_t MASK_15 = 0x7FFF;  // bits 0..14
+    static constexpr uint16_t MOD_15  = 0x8000;  // 2^15
 
 public:
     std::vector<Publication> process(const json &msg,
                                      const std::string &isa95_prefix) override
     {
         // ---- Current shift ----
-        auto sh = current_shift_localtime();
-        int shiftNum    = (sh == Shift::S1 ? 1 : sh == Shift::S2 ? 2 : 3);
+        auto sh      = current_shift_localtime();
+        int  shiftNum = (sh == Shift::S1 ? 1 : (sh == Shift::S2 ? 2 : 3));
 
         // ---- Read fields ----
-        int alarms   = jsonu::get_opt<int>(msg, "alarms").value_or(0);
-        int prod_q   = jsonu::get_opt<int>(msg, "cantidadProductos").value_or(0);
-        int prod_t   = jsonu::get_opt<int>(msg, "tiempoProduccion_ds").value_or(0);
-        int line     = jsonu::get_opt<int>(msg, "lineID").value_or(0);
-        int stop_q   = jsonu::get_opt<int>(msg, "paradas").value_or(0);
-        int stop_t   = jsonu::get_opt<int>(msg, "tiempoParadas_s").value_or(0);
+        int alarms = jsonu::get_opt<int>(msg, "alarms").value_or(0);
+        int prod_q = jsonu::get_opt<int>(msg, "cantidadProductos").value_or(0);
+        int prod_t = jsonu::get_opt<int>(msg, "tiempoProduccion_ds").value_or(0);
+        int line   = jsonu::get_opt<int>(msg, "lineID").value_or(0);
+        int stop_q = jsonu::get_opt<int>(msg, "paradas").value_or(0);
+        int stop_t = jsonu::get_opt<int>(msg, "tiempoParadas_s").value_or(0);
 
         // Outputs
         uint32_t prod_q_shift   = 0;
@@ -542,64 +549,81 @@ public:
 
             State &st = states_[line];
 
-            uint16_t raw_prod_q = static_cast<uint16_t>(prod_q);
-            uint16_t raw_stop_q = static_cast<uint16_t>(stop_q);
-            uint16_t raw_prod_t = static_cast<uint16_t>(prod_t);
-            uint16_t raw_stop_t = static_cast<uint16_t>(stop_t);
+            // Mask MSB for counters that use 15-bit + flag
+            uint16_t prod_q15  = static_cast<uint16_t>(prod_q) & MASK_15;
+            uint16_t stop_q15  = static_cast<uint16_t>(stop_q) & MASK_15;
+            uint16_t prod_t16  = static_cast<uint16_t>(prod_t);            // full 16 bits
+            uint16_t stop_t15  = static_cast<uint16_t>(stop_t) & MASK_15;
 
             // ---- Initialize or shift change ----
             if (!st.initialized || st.shift != shiftNum) {
                 st.initialized = true;
-                st.shift = shiftNum;
+                st.shift       = shiftNum;
 
-                st.last_raw_prod_q = raw_prod_q;
-                st.acc_prod_q = 0;
+                st.last_prod_q15   = prod_q15;
+                st.acc_prod_q      = 0;
 
-                st.last_raw_stop_q = raw_stop_q;
-                st.acc_stop_q = 0;
+                st.last_stop_q15   = stop_q15;
+                st.acc_stop_q      = 0;
 
-                st.last_raw_prod_t = raw_prod_t;
-                st.acc_prod_t_s = 0.0;
+                st.last_raw_prod_t = prod_t16;
+                st.acc_prod_t_s    = 0.0;
 
-                st.last_raw_stop_t = raw_stop_t;
-                st.acc_stop_t_s = 0;
+                st.last_stop_t15   = stop_t15;
+                st.acc_stop_t_s    = 0;
             }
             else {
-                // ---- cantidadProductos overflow-safe counter ----
-                uint16_t prev_pq = st.last_raw_prod_q;
-                uint16_t diff_pq = (raw_prod_q >= prev_pq)
-                    ? (raw_prod_q - prev_pq)
-                    : static_cast<uint16_t>(raw_prod_q + (65536 - prev_pq));
+                // ---- cantidadProductos (15-bit modulo) ----
+                {
+                    uint16_t prev = st.last_prod_q15;
+                    uint16_t curr = prod_q15;
+                    uint16_t diff =
+                        (curr >= prev)
+                            ? static_cast<uint16_t>(curr - prev)
+                            : static_cast<uint16_t>(MOD_15 + curr - prev);
 
-                st.acc_prod_q += diff_pq;
-                st.last_raw_prod_q = raw_prod_q;
+                    st.acc_prod_q   += diff;
+                    st.last_prod_q15 = curr;
+                }
 
-                // ---- paradas overflow-safe counter ----
-                uint16_t prev_sq = st.last_raw_stop_q;
-                uint16_t diff_sq = (raw_stop_q >= prev_sq)
-                    ? (raw_stop_q - prev_sq)
-                    : static_cast<uint16_t>(raw_stop_q + (65536 - prev_sq));
+                // ---- paradas (15-bit modulo) ----
+                {
+                    uint16_t prev = st.last_stop_q15;
+                    uint16_t curr = stop_q15;
+                    uint16_t diff =
+                        (curr >= prev)
+                            ? static_cast<uint16_t>(curr - prev)
+                            : static_cast<uint16_t>(MOD_15 + curr - prev);
 
-                st.acc_stop_q += diff_sq;
-                st.last_raw_stop_q = raw_stop_q;
+                    st.acc_stop_q   += diff;
+                    st.last_stop_q15 = curr;
+                }
 
-                // ---- tiempoProduccion_ds overflow-safe ----
-                uint16_t prev_pt = st.last_raw_prod_t;
-                uint16_t diff_pt = (raw_prod_t >= prev_pt)
-                    ? (raw_prod_t - prev_pt)
-                    : static_cast<uint16_t>(raw_prod_t + (65536 - prev_pt));
+                // ---- tiempoProduccion_ds (16-bit modulo, ds → s) ----
+                {
+                    uint16_t prev = st.last_raw_prod_t;
+                    uint16_t curr = prod_t16;
+                    uint16_t diff =
+                        (curr >= prev)
+                            ? static_cast<uint16_t>(curr - prev)
+                            : static_cast<uint16_t>(curr + (uint16_t)(65536 - prev));
 
-                st.acc_prod_t_s += diff_pt * 0.1;  // ds → seconds
-                st.last_raw_prod_t = raw_prod_t;
+                    st.acc_prod_t_s += diff * 0.1; // deciseconds → seconds
+                    st.last_raw_prod_t = curr;
+                }
 
-                // ---- tiempoParadas_s overflow-safe ----
-                uint16_t prev_st = st.last_raw_stop_t;
-                uint16_t diff_st = (raw_stop_t >= prev_st)
-                    ? (raw_stop_t - prev_st)
-                    : static_cast<uint16_t>(raw_stop_t + (65536 - prev_st));
+                // ---- tiempoParadas_s (15-bit modulo) ----
+                {
+                    uint16_t prev = st.last_stop_t15;
+                    uint16_t curr = stop_t15;
+                    uint16_t diff =
+                        (curr >= prev)
+                            ? static_cast<uint16_t>(curr - prev)
+                            : static_cast<uint16_t>(MOD_15 + curr - prev);
 
-                st.acc_stop_t_s += diff_st;
-                st.last_raw_stop_t = raw_stop_t;
+                    st.acc_stop_t_s += diff;
+                    st.last_stop_t15 = curr;
+                }
             }
 
             // ---- Final accumulated values ----
@@ -609,28 +633,26 @@ public:
             stop_t_shift_s = st.acc_stop_t_s;
         }
 
-        // ---- Build MQ payloads ----
+        // ---- Build MQTT payloads ----
         json qual;
-        qual["alarms"] = alarms;
+        qual["alarms"]           = alarms;
         qual["timestamp_device"] = iso8601_utc_now();
 
         json prod;
-        prod["maquina_id"] = 4;
-        prod["turno"] = shiftNum;
+        prod["maquina_id"]        = 4;
+        prod["turno"]             = shiftNum;
 
-        // shift accumulated values
         prod["cantidad_produccion"] = prod_q_shift;
-        prod["tiempo_produccion"] = (uint32_t)prod_t_shift_s;
-        prod["cantidad_paradas"] = stop_q_shift;
-        prod["tiempo_paradas"] = stop_t_shift_s;
+        prod["tiempo_produccion"]   = static_cast<uint32_t>(prod_t_shift_s);
+        prod["cantidad_paradas"]    = stop_q_shift;
+        prod["tiempo_paradas"]      = stop_t_shift_s;
 
-        prod["timestamp_device"] = iso8601_utc_now();
+        prod["timestamp_device"]    = iso8601_utc_now();
 
-        // Topics
         auto t1 = isa95_prefix + std::to_string(line) + "/salida_secador/alarms";
         auto t2 = isa95_prefix + std::to_string(line) + "/salida_secador/production";
 
-        return {make_pub(t1, qual), make_pub(t2, prod)};
+        return { make_pub(t1, qual), make_pub(t2, prod) };
     }
 };
 
@@ -646,25 +668,26 @@ class EsmalteProcessor : public IMessageProcessor
         bool initialized = false;
         int shift = -1;
 
-        // cantidadProductos (WORD event counter)
-        uint16_t last_raw_prod_q = 0;
+        uint16_t last_raw_prod_q = 0;   // 15-bit masked value
         uint32_t acc_prod_q = 0;
 
-        // paradas (WORD event counter)
         uint16_t last_raw_stop_q = 0;
         uint32_t acc_stop_q = 0;
 
-        // tiempoProduccion_ds (WORD, tenths of seconds)
-        uint16_t last_raw_prod_t = 0;
+        uint16_t last_raw_prod_t = 0;   // tiempoProduccion_ds
         double   acc_prod_t_s = 0.0;
 
-        // tiempoParadas_s (WORD, seconds)
-        uint16_t last_raw_stop_t = 0;
+        uint16_t last_raw_stop_t = 0;   // tiempoParadas_s
         uint32_t acc_stop_t_s = 0;
     };
 
     static std::mutex mtx_;
     static std::unordered_map<int, State> states_;
+
+    // ---- Corrected overflow-safe diff with MSB masking ----
+    static uint16_t clean15(int x) {
+        return static_cast<uint16_t>(x) & 0x7FFF;   // remove MSB bank flag
+    }
 
     static uint16_t diff16(uint16_t curr, uint16_t prev) {
         return (curr >= prev)
@@ -680,7 +703,7 @@ public:
         auto sh = current_shift_localtime();
         int shiftNum = (sh == Shift::S1 ? 1 : sh == Shift::S2 ? 2 : 3);
 
-        // ---- Extract PLC fields ----
+        // ---- Extract PLC 16-bit fields ----
         int alarms   = jsonu::get_opt<int>(msg, "alarms").value_or(0);
         int prod_q   = jsonu::get_opt<int>(msg, "cantidadProductos").value_or(0);
         int prod_t   = jsonu::get_opt<int>(msg, "tiempoProduccion_ds").value_or(0);
@@ -691,7 +714,6 @@ public:
         // ---- Final accumulated outputs ----
         uint32_t prod_q_shift = 0;
         uint32_t stop_q_shift = 0;
-
         double   prod_t_shift_s = 0.0;
         uint32_t stop_t_shift_s = 0;
 
@@ -699,15 +721,15 @@ public:
             std::lock_guard<std::mutex> lock(mtx_);
             State &st = states_[line];
 
-            uint16_t raw_prod_q = static_cast<uint16_t>(prod_q);
-            uint16_t raw_stop_q = static_cast<uint16_t>(stop_q);
+            // ---- Mask MSB and keep only 15 real bits ----
+            uint16_t raw_prod_q = clean15(prod_q);
+            uint16_t raw_stop_q = clean15(stop_q);
+            uint16_t raw_prod_t = clean15(prod_t);
+            uint16_t raw_stop_t = clean15(stop_t);
 
-            uint16_t raw_prod_t = static_cast<uint16_t>(prod_t);
-            uint16_t raw_stop_t = static_cast<uint16_t>(stop_t);
-
-            // ---- First message for this shift OR shift changed ----
+            // ---- First message / new shift ----
             if (!st.initialized || st.shift != shiftNum) {
-                st = State();  // reset structure
+                st = State();  
                 st.initialized = true;
                 st.shift = shiftNum;
 
@@ -725,7 +747,7 @@ public:
                 st.acc_stop_q += diff16(raw_stop_q, st.last_raw_stop_q);
                 st.last_raw_stop_q = raw_stop_q;
 
-                // ---- tiempoProduccion_ds → seconds ----
+                // ---- tiempoProduccion_ds (×0.1 seconds) ----
                 st.acc_prod_t_s += diff16(raw_prod_t, st.last_raw_prod_t) * 0.1;
                 st.last_raw_prod_t = raw_prod_t;
 
@@ -734,15 +756,14 @@ public:
                 st.last_raw_stop_t = raw_stop_t;
             }
 
-            // Copy accumulated values
+            // ---- Copy results ----
             prod_q_shift = st.acc_prod_q;
             stop_q_shift = st.acc_stop_q;
-
             prod_t_shift_s = st.acc_prod_t_s;
             stop_t_shift_s = st.acc_stop_t_s;
         }
 
-        // ---- Build JSON ----
+        // ---- Build JSON payloads ----
         json qual;
         qual["alarms"] = alarms;
         qual["timestamp_device"] = iso8601_utc_now();
@@ -750,16 +771,12 @@ public:
         json prod;
         prod["maquina_id"] = 5;
         prod["turno"] = shiftNum;
-
-        // Shift-accumulated values
         prod["cantidad_produccion"] = prod_q_shift;
         prod["tiempo_produccion"] = (uint32_t)prod_t_shift_s;
-        prod["cantidadd_paradas"] = stop_q_shift;
+        prod["cantidad_paradas"] = stop_q_shift;
         prod["tiempo_paradas"] = stop_t_shift_s;
-
         prod["timestamp_device"] = iso8601_utc_now();
 
-        // ---- Topics ----
         auto t1 = isa95_prefix + std::to_string(line) + "/esmalte/alarms";
         auto t2 = isa95_prefix + std::to_string(line) + "/esmalte/production";
 
@@ -779,7 +796,7 @@ class EntradaHornoProcessor : public IMessageProcessor
         bool initialized = false;
         int shift = -1;
 
-        // cantidad (WORD counter)
+        // cantidad (WORD counter, 15-bit value with MSB as bank flag)
         uint16_t last_raw_prod_q = 0;
         uint32_t acc_prod_q = 0;
 
@@ -807,9 +824,14 @@ class EntradaHornoProcessor : public IMessageProcessor
     static std::mutex mtx_;
     static std::unordered_map<int, State> states_;
 
+    // Remove MSB "bank" bit, keep only 15 real bits
+    static uint16_t clean15(int x) {
+        return static_cast<uint16_t>(x) & 0x7FFF;
+    }
+
     static uint16_t diff16(uint16_t curr, uint16_t prev) {
         return (curr >= prev)
-            ? (curr - prev)
+            ? static_cast<uint16_t>(curr - prev)
             : static_cast<uint16_t>(curr + (65536 - prev));
     }
 
@@ -821,7 +843,7 @@ public:
         auto sh = current_shift_localtime();
         int shiftNum = (sh == Shift::S1 ? 1 : sh == Shift::S2 ? 2 : 3);
 
-        // ---- Read PLC fields ----
+        // ---- Read PLC fields (raw 16-bit words) ----
         int alarms  = jsonu::get_opt<int>(msg, "alarms").value_or(0);
         int prod_q  = jsonu::get_opt<int>(msg, "cantidad").value_or(0);
         int prod_t  = jsonu::get_opt<int>(msg, "tiempoProduccion_ds").value_or(0);
@@ -834,9 +856,9 @@ public:
         int falla_t = jsonu::get_opt<int>(msg, "tiempoFalla_s").value_or(0);
 
         // ---- Output accumulators ----
-        uint32_t prod_q_shift = 0;
-        uint32_t stop_q_shift = 0;
-        uint32_t falla_q_shift = 0;
+        uint32_t prod_q_shift   = 0;
+        uint32_t stop_q_shift   = 0;
+        uint32_t falla_q_shift  = 0;
 
         double   prod_t_shift_s = 0.0;
         uint32_t stop_t_shift_s = 0;
@@ -846,13 +868,14 @@ public:
             std::lock_guard<std::mutex> lock(mtx_);
             State &st = states_[line];
 
-            uint16_t raw_prod_q  = static_cast<uint16_t>(prod_q);
-            uint16_t raw_stop_q  = static_cast<uint16_t>(stop_q);
-            uint16_t raw_falla_q = static_cast<uint16_t>(falla_q);
+            // Mask MSB (bank bit) → use only 0..32767 as real value
+            uint16_t raw_prod_q  = clean15(prod_q);
+            uint16_t raw_stop_q  = clean15(stop_q);
+            uint16_t raw_falla_q = clean15(falla_q);
 
-            uint16_t raw_prod_t  = static_cast<uint16_t>(prod_t);
-            uint16_t raw_stop_t  = static_cast<uint16_t>(stop_t);
-            uint16_t raw_falla_t = static_cast<uint16_t>(falla_t);
+            uint16_t raw_prod_t  = clean15(prod_t);
+            uint16_t raw_stop_t  = clean15(stop_t);
+            uint16_t raw_falla_t = clean15(falla_t);
 
             // ---- First message or shift change ----
             if (!st.initialized || st.shift != shiftNum) {
@@ -860,12 +883,12 @@ public:
                 st.initialized = true;
                 st.shift = shiftNum;
 
-                st.last_raw_prod_q = raw_prod_q;
-                st.last_raw_stop_q = raw_stop_q;
+                st.last_raw_prod_q  = raw_prod_q;
+                st.last_raw_stop_q  = raw_stop_q;
                 st.last_raw_falla_q = raw_falla_q;
 
-                st.last_raw_prod_t = raw_prod_t;
-                st.last_raw_stop_t = raw_stop_t;
+                st.last_raw_prod_t  = raw_prod_t;
+                st.last_raw_stop_t  = raw_stop_t;
                 st.last_raw_falla_t = raw_falla_t;
             }
             else {
@@ -895,9 +918,9 @@ public:
             }
 
             // Copy accumulated results
-            prod_q_shift  = st.acc_prod_q;
-            stop_q_shift  = st.acc_stop_q;
-            falla_q_shift = st.acc_falla_q;
+            prod_q_shift   = st.acc_prod_q;
+            stop_q_shift   = st.acc_stop_q;
+            falla_q_shift  = st.acc_falla_q;
 
             prod_t_shift_s  = st.acc_prod_t_s;
             stop_t_shift_s  = st.acc_stop_t_s;
@@ -915,12 +938,12 @@ public:
 
         // Shift accumulated
         prod["cantidad_produccion"] = prod_q_shift;
-        prod["cantidad_paradas"] = stop_q_shift;
-        prod["cantidad_fallas"] = falla_q_shift;
+        prod["cantidad_paradas"]    = stop_q_shift;
+        prod["cantidad_fallas"]     = falla_q_shift;
 
-        prod["tiempo_produccion"] = (uint32_t)prod_t_shift_s;
-        prod["tiempo_paradas"] = stop_t_shift_s;
-        prod["tiempo_fallas"] = falla_t_shift_s;
+        prod["tiempo_produccion"] = static_cast<uint32_t>(prod_t_shift_s);
+        prod["tiempo_paradas"]    = stop_t_shift_s;
+        prod["tiempo_fallas"]     = falla_t_shift_s;
 
         prod["timestamp_device"] = iso8601_utc_now();
 
@@ -935,6 +958,7 @@ public:
 std::mutex EntradaHornoProcessor::mtx_;
 std::unordered_map<int, EntradaHornoProcessor::State>
     EntradaHornoProcessor::states_;
+
 
 class SalidaHornoProcessor : public IMessageProcessor
 {
@@ -958,6 +982,11 @@ class SalidaHornoProcessor : public IMessageProcessor
     static std::mutex mtx_;
     static std::unordered_map<int, State> states_;
 
+    // MSB mask (fix for bank toggle issue)
+    static inline uint16_t clean15(int x) {
+        return static_cast<uint16_t>(x) & 0x7FFF;
+    }
+
     static uint16_t diff16(uint16_t curr, uint16_t prev) {
         return (curr >= prev)
             ? (curr - prev)
@@ -974,12 +1003,17 @@ public:
 
         // ---- Read PLC values ----
         int alarms       = jsonu::get_opt<int>(msg, "alarms").value_or(0);
-        int prod_q       = jsonu::get_opt<int>(msg, "cantidad").value_or(0);
-        int prod_qtotal  = jsonu::get_opt<int>(msg, "cantidad_total").value_or(0);
-        int prod_t       = jsonu::get_opt<int>(msg, "tiempoProduccion_ds").value_or(0);
+        int prod_q_in    = jsonu::get_opt<int>(msg, "cantidad").value_or(0);
+        int prod_qt_in   = jsonu::get_opt<int>(msg, "cantidad_total").value_or(0);
+        int prod_t_in    = jsonu::get_opt<int>(msg, "tiempoProduccion_ds").value_or(0);
         int line         = jsonu::get_opt<int>(msg, "lineID").value_or(0);
 
-        // ---- Accumulated outputs ----
+        // ---- Clean MSB bank bit (mask 0x8000) ----
+        uint16_t raw_prod_q      = clean15(prod_q_in);
+        uint16_t raw_prod_qtotal = clean15(prod_qt_in);
+        uint16_t raw_prod_t      = clean15(prod_t_in);
+
+        // ---- Outputs ----
         uint32_t prod_q_shift      = 0;
         uint32_t prod_qtotal_shift = 0;
         double   prod_t_shift_s    = 0.0;
@@ -987,10 +1021,6 @@ public:
         {
             std::lock_guard<std::mutex> lock(mtx_);
             State &st = states_[line];
-
-            uint16_t raw_prod_q      = static_cast<uint16_t>(prod_q);
-            uint16_t raw_prod_qtotal = static_cast<uint16_t>(prod_qtotal);
-            uint16_t raw_prod_t      = static_cast<uint16_t>(prod_t);
 
             // ---- First message or shift change ----
             if (!st.initialized || st.shift != shiftNum) {
@@ -1031,10 +1061,10 @@ public:
         prod["maquina_id"] = 7;
         prod["turno"] = shiftNum;
 
-        // Shift-accumulated values
+        // Shift accumulated values
         prod["cantidad_produccion"] = prod_q_shift;
         prod["cantidad_total"] = prod_qtotal_shift;
-        prod["tiempoProduccion_s"] = (uint32_t)prod_t_shift_s;
+        prod["tiempoProduccion_s"] = static_cast<uint32_t>(prod_t_shift_s);
 
         prod["timestamp_device"] = iso8601_utc_now();
 
