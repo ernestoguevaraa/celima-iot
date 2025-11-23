@@ -236,7 +236,7 @@ public:
         prod["tiempoProduccion_s"] = (uint32_t)production_time_s;
 
         // NEW rate metric
-        prod["cantidadPisadas_min"] = pisadas_min;
+        prod["cantidadPisadas_min"] = (uint32_t)pisadas_min;
 
         prod["paradas"] = stop_q;
         prod["tiempoParadas_s"] = stop_t;
@@ -361,7 +361,7 @@ public:
         prod["tiempoProduccion_s"] = (uint32_t)production_time_s;
 
         // NEW rate metric
-        prod["cantidadPisadas_min"] = pisadas_min;
+        prod["cantidadPisadas_min"] = (uint32_t)pisadas_min;
 
         prod["paradas"] = stop_q;
         prod["tiempoParadas_s"] = stop_t;
