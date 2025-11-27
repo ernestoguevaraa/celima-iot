@@ -7,6 +7,7 @@
 #include <chrono>
 #include <mqtt/async_client.h>
 #include <vector>
+#include <Shift.hpp>
 
 
 using namespace std::chrono_literals;
@@ -138,6 +139,15 @@ void MqttApp::handle_celima_data(const std::string& payload) {
     auto dt = deviceTypeFromInt(devTypeInt);
     std::unique_ptr<IMessageProcessor> proc = dt ? createProcessor(*dt)
                                                  : createDefaultProcessor();
+
+    Shift sh  = current_shift_localtime();
+    int shiftNum = static_cast<int>(sh);
+
+    if (detect_global_shift_change(shiftNum)) {
+        std::cout << "[SHIFT] Cambio de turno detectado. Reset global." << std::endl;
+        reset_all_processor_states();
+    }
+
     auto pubs = proc->process(j, isa95_prefix_);
     for (auto& p : pubs) {
         publish_qos1(p.topic, p.payload);

@@ -33,3 +33,6 @@ std::unique_ptr<IMessageProcessor> createProcessor(DeviceType dt);
  * Default processor for unknown/unspecified device types.
  */
 std::unique_ptr<IMessageProcessor> createDefaultProcessor();
+
+bool detect_global_shift_change(int currentShift);
+void reset_all_processor_states();

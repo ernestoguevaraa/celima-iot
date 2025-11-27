@@ -5,7 +5,22 @@
 #include <memory>
 #include <sstream>
 #include <mutex>
+#include <atomic>
 using json = nlohmann::json;
+
+static std::atomic<int> g_last_global_shift { -1 };
+
+bool detect_global_shift_change(int currentShift)
+{
+    int prev = g_last_global_shift.load(std::memory_order_relaxed);
+    if (prev == currentShift)
+        return false;
+
+    // First run or shift change
+    g_last_global_shift.store(currentShift, std::memory_order_relaxed);
+    return true;
+}
+
 
 
 static Publication make_pub(const std::string &topic, const json &j)
@@ -54,82 +69,84 @@ public:
  * - Thread-safe via a static mutex (safe even if processor instances are recreated).
  */
 class CalidadProcessor final : public IMessageProcessor {
-    // Static state shared across instances (simple + robust with current factory)
-    static std::mutex mtx_;
-    static int        current_shift_;     // 1,2,3
-    static uint64_t   acc_q1_;
-    static uint64_t   acc_q2_;
-    static uint64_t   acc_q6_;
-    static uint64_t   acc_discarded_;
+    struct LineState {
+        uint64_t acc_q1  = 0;
+        uint64_t acc_q2  = 0;
+        uint64_t acc_q6  = 0;
+        uint64_t acc_discarded = 0;
+        int shift = -1;
+        bool initialized = false;
+    };
 
-    static void ensure_shift_is_current_and_reset_if_needed(int new_shift) {
-        if (current_shift_ != new_shift) {
-            // Shift boundary: reset all accumulators.
-            current_shift_ = new_shift;
-            acc_q1_ = acc_q2_ = acc_q6_ = acc_discarded_ = 0;
-        }
-    }
+    static std::mutex mtx_;
+    static std::unordered_map<int, LineState> states_;
 
 public:
-    std::vector<Publication> process(const json& msg, const std::string& isa95_prefix) override {
+    static void reset_states();
+
+    std::vector<Publication> process(const json& msg,
+                                     const std::string& isa95_prefix) override {
         const int shift_now = static_cast<int>(current_shift_localtime());
         const int line_id   = msg.value("lineID", 0);
 
-        // Read inputs (tolerate both "quebrados" and "quebrado")
-        const int cajaCalidad = msg.value("cajaCalidad", 0);  // valid: 1,2,6
+        const int cajaCalidad = msg.value("cajaCalidad", 0); // 1,2,6
         const int quebrados   = msg.contains("quebrados")
                                   ? msg.value("quebrados", 0)
                                   : msg.value("quebrado", 0);
 
-        {
-            std::lock_guard<std::mutex> lock(mtx_);
-            ensure_shift_is_current_and_reset_if_needed(shift_now);
-
-            // Increment quality bucket by exactly 1 when cajaCalidad matches
-            if      (cajaCalidad == 1) ++acc_q1_;
-            else if (cajaCalidad == 2) ++acc_q2_;
-            else if (cajaCalidad == 6) ++acc_q6_;
-            // else: ignore unknown quality codes (0 or others)
-
-            // Add discarded count since last Calidad report
-            if (quebrados > 0) acc_discarded_ += static_cast<uint64_t>(quebrados);
-        }
-
-        // Snapshot for publishing (avoid holding the mutex while dumping JSON)
         uint64_t q1, q2, q6, disc;
-        int cur_shift;
+
         {
             std::lock_guard<std::mutex> lock(mtx_);
-            q1 = acc_q1_; q2 = acc_q2_; q6 = acc_q6_; disc = acc_discarded_;
-            cur_shift = current_shift_;
+            auto& st = states_[line_id];
+
+            // First time or shift changed
+            if (!st.initialized || st.shift != shift_now) {
+                st = LineState();      // reset for this line
+                st.initialized = true;
+                st.shift = shift_now;
+            }
+
+            // Count exactly one for each cajaCalidad message
+            if      (cajaCalidad == 1) ++st.acc_q1;
+            else if (cajaCalidad == 2) ++st.acc_q2;
+            else if (cajaCalidad == 6) ++st.acc_q6;
+
+            // quebrados is a delta
+            if (quebrados > 0)
+                st.acc_discarded += static_cast<uint64_t>(quebrados);
+
+            // snapshot
+            q1 = st.acc_q1;
+            q2 = st.acc_q2;
+            q6 = st.acc_q6;
+            disc = st.acc_discarded;
         }
 
         json out;
-        out["maquina_id"] = 8;
-        out["timestamp_device"]  =  iso8601_utc_now();
-        out["shift"]       = cur_shift;          // 1,2,3
-        out["lineID"]      = line_id;
-        out["extra_c1"]      = q1;
-        out["extra_c2"]      = q2;
-        out["comercial"]      = q6;
-        out["quebrados"]      = disc;
+        out["maquina_id"]       = 8;
+        out["timestamp_device"] = iso8601_utc_now();
+        out["shift"]            = shift_now;
+        out["lineID"]           = line_id;
 
-        // Publish to your ISA-95-ish topics (same payload in both for now)
+        out["extra_c1"]   = q1;
+        out["extra_c2"]   = q2;
+        out["comercial"]  = q6;
+        out["quebrados"]  = disc;
 
         const auto t1 = isa95_prefix + std::to_string(line_id) + "/calidad/production";
-
         return { make_pub(t1, out) };
     }
 };
 
-// --- Static member definitions
-std::mutex  CalidadProcessor::mtx_;
-int         CalidadProcessor::current_shift_  = static_cast<int>(current_shift_localtime());
-uint64_t    CalidadProcessor::acc_q1_         = 0;
-uint64_t    CalidadProcessor::acc_q2_         = 0;
-uint64_t    CalidadProcessor::acc_q6_         = 0;
-uint64_t    CalidadProcessor::acc_discarded_  = 0;
+// static definitions
+std::mutex CalidadProcessor::mtx_;
+std::unordered_map<int, CalidadProcessor::LineState> CalidadProcessor::states_;
 
+void CalidadProcessor::reset_states() {
+    std::lock_guard<std::mutex> lock(mtx_);
+    states_.clear();
+}
 
 class PrensaHidraulica1Processor : public IMessageProcessor
 {
@@ -151,6 +168,7 @@ class PrensaHidraulica1Processor : public IMessageProcessor
     static constexpr uint16_t COUNTER_MOD  = 0x8000; // overflow at 32768
 
 public:
+ static void reset_states();
     std::vector<Publication> process(const json &msg,
                                      const std::string &isa95_prefix) override
     {
@@ -255,6 +273,11 @@ std::mutex PrensaHidraulica1Processor::mtx_;
 std::unordered_map<int, PrensaHidraulica1Processor::PH1State>
     PrensaHidraulica1Processor::states_;
 
+void PrensaHidraulica1Processor::reset_states()
+{
+    std::lock_guard<std::mutex> lk(mtx_);
+    states_.clear();
+}
 
 class PrensaHidraulica2Processor : public IMessageProcessor
 {
@@ -280,6 +303,7 @@ class PrensaHidraulica2Processor : public IMessageProcessor
     static constexpr uint16_t COUNTER_MOD  = 0x8000;
 
 public:
+static void reset_states();
     std::vector<Publication> process(const json &msg, const std::string &isa95_prefix) override
     {
         // ---- Current shift ----
@@ -388,7 +412,11 @@ public:
 std::mutex PrensaHidraulica2Processor::mtx_;
 std::unordered_map<int, PrensaHidraulica2Processor::PH2State>
     PrensaHidraulica2Processor::states_;
-
+void PrensaHidraulica2Processor::reset_states()
+{
+    std::lock_guard<std::mutex> lk(mtx_);
+    states_.clear();
+}
 class EntradaSecadorProcessor : public IMessageProcessor
 {
     struct ESState {
@@ -412,6 +440,7 @@ class EntradaSecadorProcessor : public IMessageProcessor
     static constexpr uint16_t MOD_15  = 0x8000;
 
 public:
+static void reset_states();
     std::vector<Publication> process(const json &msg, const std::string &isa95_prefix) override
     {
         // ---- Turno actual ----
@@ -494,6 +523,12 @@ std::mutex EntradaSecadorProcessor::mtx_;
 std::unordered_map<int, EntradaSecadorProcessor::ESState>
     EntradaSecadorProcessor::states_;
 
+void EntradaSecadorProcessor::reset_states()
+{
+    std::lock_guard<std::mutex> lk(mtx_);
+    states_.clear();
+}
+
 class SalidaSecadorProcessor : public IMessageProcessor
 {
     struct State {
@@ -524,6 +559,7 @@ class SalidaSecadorProcessor : public IMessageProcessor
     static constexpr uint16_t MOD_15  = 0x8000;  // 2^15
 
 public:
+static void reset_states();
     std::vector<Publication> process(const json &msg,
                                      const std::string &isa95_prefix) override
     {
@@ -661,6 +697,12 @@ std::mutex SalidaSecadorProcessor::mtx_;
 std::unordered_map<int, SalidaSecadorProcessor::State>
     SalidaSecadorProcessor::states_;
 
+void SalidaSecadorProcessor::reset_states()
+{
+    std::lock_guard<std::mutex> lk(mtx_);
+    states_.clear();
+}
+
 
 class EsmalteProcessor : public IMessageProcessor
 {
@@ -703,6 +745,7 @@ class EsmalteProcessor : public IMessageProcessor
     }
 
 public:
+static void reset_states();
     std::vector<Publication> process(const json &msg,
                                      const std::string &isa95_prefix) override
     {
@@ -826,6 +869,12 @@ std::mutex EsmalteProcessor::mtx_;
 std::unordered_map<int, EsmalteProcessor::State>
     EsmalteProcessor::states_;
 
+void EsmalteProcessor::reset_states()
+{
+    std::lock_guard<std::mutex> lk(mtx_);
+    states_.clear();
+}
+
 
 class EntradaHornoProcessor : public IMessageProcessor
 {
@@ -872,6 +921,7 @@ class EntradaHornoProcessor : public IMessageProcessor
     }
 
 public:
+static void reset_states();
     std::vector<Publication> process(const json &msg,
                                      const std::string &isa95_prefix) override
     {
@@ -993,6 +1043,12 @@ std::mutex EntradaHornoProcessor::mtx_;
 std::unordered_map<int, EntradaHornoProcessor::State>
     EntradaHornoProcessor::states_;
 
+void EntradaHornoProcessor::reset_states()
+{
+    std::lock_guard<std::mutex> lk(mtx_);
+    states_.clear();
+}
+
 class SalidaHornoProcessor : public IMessageProcessor
 {
     struct State {
@@ -1027,6 +1083,7 @@ class SalidaHornoProcessor : public IMessageProcessor
     }
 
 public:
+static void reset_states();
     std::vector<Publication> process(const json &msg,
                                      const std::string &isa95_prefix) override
     {
@@ -1109,6 +1166,13 @@ std::mutex SalidaHornoProcessor::mtx_;
 std::unordered_map<int, SalidaHornoProcessor::State>
     SalidaHornoProcessor::states_;
 
+void SalidaHornoProcessor::reset_states()
+{
+    std::lock_guard<std::mutex> lk(mtx_);
+    states_.clear();
+}
+
+
 
 std::unique_ptr<IMessageProcessor> createDefaultProcessor()
 {
@@ -1138,4 +1202,16 @@ std::unique_ptr<IMessageProcessor> createProcessor(DeviceType dt)
     default:
         return std::make_unique<DefaultProcessor>();
     }
+}
+
+void reset_all_processor_states()
+{
+    PrensaHidraulica1Processor::reset_states();
+    PrensaHidraulica2Processor::reset_states();
+    SalidaSecadorProcessor::reset_states();
+    EntradaSecadorProcessor::reset_states();
+    EsmalteProcessor::reset_states();
+    EntradaHornoProcessor::reset_states();
+    SalidaHornoProcessor::reset_states();
+    CalidadProcessor::reset_states();   // si lo tienes
 }
