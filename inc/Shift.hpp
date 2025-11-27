@@ -15,11 +15,11 @@ inline Shift current_shift_localtime() {
     int h = lt.tm_hour; // 0–23
 
     // Shift 1: 07:00–14:59
-    if (h >= 7 && h < 15)
+    if (h >= 6 && h < 14)
         return Shift::S1;
 
     // Shift 2: 15:00–22:59
-    if (h >= 15 && h < 23)
+    if (h >= 14 && h < 22)
         return Shift::S2;
 
     // Shift 3: 23:00–06:59
