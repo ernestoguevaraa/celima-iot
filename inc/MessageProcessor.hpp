@@ -36,3 +36,24 @@ std::unique_ptr<IMessageProcessor> createDefaultProcessor();
 
 bool detect_global_shift_change(int currentShift);
 void reset_all_processor_states();
+
+// Delta seguro para contadores de 16 bits provenientes de PLCs
+// Evita saltos absurdos (> max_reasonable), corrige rollover, descarta ruido.
+inline uint32_t safe_delta_u16(uint16_t prev, uint16_t curr, int max_reasonable = 200)
+{
+    int delta = static_cast<int>(curr) - static_cast<int>(prev);
+
+    // Caso normal pequeño
+    if (delta >= 0 && delta <= max_reasonable)
+        return static_cast<uint32_t>(delta);
+
+    // Caso rollover
+    if (delta < 0) {
+        int rolled = delta + 65536;
+        if (rolled >= 0 && rolled <= max_reasonable)
+            return static_cast<uint32_t>(rolled);
+    }
+
+    // Salto anómalo → ruido → ignorar
+    return 0;
+}
