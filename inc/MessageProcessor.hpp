@@ -6,7 +6,11 @@
 #include <nlohmann/json.hpp>
 #include "DeviceTypes.hpp"
 
-const int PIEZAS_PISADA = 6;
+const int L1_PIEZAS_PISADA = 3;
+const int L2_PIEZAS_PISADA = 3;
+const int L3_PIEZAS_PISADA = 2;
+const int L4_PIEZAS_PISADA = 4;
+const int L5_PIEZAS_PISADA = 2;
 /**
  * Each processor returns a set of (topic, payload) publications.
  * All publications are QoS 1 (the app enforces it).

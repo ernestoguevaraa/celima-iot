@@ -2,7 +2,7 @@
 set -euo pipefail
 
 APP=iot-celima-mqtt
-VERSION=${1:-0.7.0}
+VERSION=${1:-0.11.0}
 ARCH=$(dpkg --print-architecture)
 PKGDIR=./_pkg
 ROOT=$PKGDIR/${APP}_${VERSION}_${ARCH}
