@@ -556,6 +556,29 @@ public:
         }
 
         // Build output JSON
+               //Calcular facto de pisadas
+        int factor_pisadas;
+        switch (line) {
+            case 1:
+                factor_pisadas = L1_PIEZAS_PISADA;
+                break;
+            case 2:
+                factor_pisadas = L2_PIEZAS_PISADA;
+                break;
+            case 3:
+                factor_pisadas = L3_PIEZAS_PISADA;
+                break;
+            case 4:
+                factor_pisadas = L4_PIEZAS_PISADA;
+                break;
+            case 5:
+                factor_pisadas = L5_PIEZAS_PISADA;
+                break;
+            default:
+                factor_pisadas = 3; // Valor por defecto si la línea no es reconocida
+                break;
+        }
+
         json qual;
         qual["alarms"] = alarms;
         qual["timestamp_device"] = iso8601_utc_now();
@@ -571,7 +594,7 @@ public:
         
         prod["cantidadPisadas_turno"] = acc_pisadas_out;
         prod["cantidadPisadas_min"] = static_cast<uint32_t>(pisadas_min);
-        prod["cantidadProductos_turno"] = acc_pisadas_out * PIEZAS_PISADA;  // 6 pieces per pisada
+        prod["cantidadProductos_turno"] = acc_pisadas_out * factor_pisadas;  
 
         // Production time
         prod["tiempoProduccion_ds_instantaneo"] = time_clean;
