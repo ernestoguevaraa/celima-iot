@@ -6,6 +6,7 @@
 #include <sstream>
 #include <mutex>
 #include <atomic>
+#include <iostream>
 using json = nlohmann::json;
 
 static std::atomic<int> g_last_global_shift { -1 };
@@ -1058,6 +1059,9 @@ void EsmalteProcessor::reset_states()
     states_.clear();
 }
 
+// EntradaHornoProcessor - CORRECTED VERSION
+// Matches decoder_corrected.js field names
+// Device Type: 6 (Entrada Horno)
 
 class EntradaHornoProcessor : public IMessageProcessor
 {
@@ -1065,164 +1069,307 @@ class EntradaHornoProcessor : public IMessageProcessor
         bool initialized = false;
         int  shift = -1;
 
-        uint16_t last_raw_prod_q = 0;
-        uint32_t acc_prod_q = 0;
+        // Production: Número de Grades (CICLO)
+        uint16_t last_raw_grades = 0;
+        uint32_t acc_grades = 0;
 
-        uint16_t last_raw_stop_q = 0;
-        uint32_t acc_stop_q = 0;
+        // Stops: Paradas MCF
+        uint16_t last_raw_stops_q = 0;
+        uint32_t acc_stops_q = 0;
 
-        uint16_t last_raw_falla_q = 0;
-        uint32_t acc_falla_q = 0;
+        uint16_t last_raw_stops_t = 0;
+        uint32_t acc_stops_t_s = 0;
 
-        uint16_t last_raw_prod_t = 0;
-        double   acc_prod_t_s = 0.0;
+        // Faults: Falha Forno
+        uint16_t last_raw_faults_q = 0;
+        uint32_t acc_faults_q = 0;
 
-        uint16_t last_raw_stop_t = 0;
-        uint32_t acc_stop_t_s = 0;
+        uint16_t last_raw_faults_t = 0;
+        uint32_t acc_faults_t_s = 0;
 
-        uint16_t last_raw_falla_t = 0;
-        uint32_t acc_falla_t_s = 0;
+        // Optional: MCF Metrics for validation
+        uint16_t last_raw_mcf_metric = 0;
+        double   acc_mcf_metric_s = 0.0;
+
+        // Optional: FORMADOR Metrics for validation
+        uint16_t last_raw_for_metric = 0;
+        double   acc_for_metric_s = 0.0;
     };
 
     static std::mutex mtx_;
     static std::unordered_map<int, State> states_;
 
-    static inline uint16_t clean15(int x) {
-        return static_cast<uint16_t>(x) & 0x7FFF;
+    // Clean BCD-converted value (D29007 has max 9999 from BCD origin)
+    static inline uint16_t cleanBCD(int x) {
+        uint16_t val = static_cast<uint16_t>(x);
+        // Cap at BCD maximum value
+        return (val > 9999) ? 9999 : val;
     }
 
+    // Standard 16-bit cleanup (for non-BCD fields)
+    static inline uint16_t clean16(int x) {
+        return static_cast<uint16_t>(x) & 0xFFFF;
+    }
+
+    // Calculate delta with wraparound handling
     static uint16_t diff16(uint16_t curr, uint16_t prev) {
         return (curr >= prev)
              ? (curr - prev)
              : static_cast<uint16_t>(curr + (65536 - prev));
     }
 
+    // Safe delta with maximum reasonable value check
     static uint16_t safe_delta_u16(uint16_t prev, uint16_t curr, uint16_t max_reasonable)
     {
         const uint16_t d = diff16(curr, prev);
         if (d == 0) return 0;
-        if (d > max_reasonable) return 0;
+        if (d > max_reasonable) return 0;  // Reject unreasonable jumps
         return d;
     }
 
 public:
-static void reset_states();
+    static void reset_states();
+    
     std::vector<Publication> process(const json &msg,
                                      const std::string &isa95_prefix) override
     {
         auto sh = current_shift_localtime();
         int shiftNum = (sh == Shift::S1 ? 1 : sh == Shift::S2 ? 2 : 3);
 
-        int alarms   = msg.value("alarms", 0);
+        // ========== HEADER FIELDS ==========
         int line     = msg.value("lineID", 0);
+        int devType  = msg.value("deviceType", 0);
 
-        int prod_q   = msg.value("cantidad", 0);
-        int prod_t   = msg.value("tiempoProd_ds", 0);
+        // Validate device type
+        if (devType != 6) {
+            // Log warning: wrong device type for this processor
+            std::cerr << "[EntradaHorno] WARNING: Wrong deviceType " 
+                      << devType << " (expected 6)" << std::endl;
+        }
 
-        int stop_q   = msg.value("paradas", 0);
-        int stop_t   = msg.value("tiempoParadas_s", 0);
+        // ========== STATUS & DIAGNOSTICS ==========
+        int status   = msg.value("status", 0);       // D29002 - Status Lento
+        int timer    = msg.value("timer1Hz", 0);     // D29001 - 1Hz Timer
 
-        int falla_q  = msg.value("fallaHorno", 0);
-        int falla_t  = msg.value("tiempoFalla_s", 0);
+        // ========== PRODUCTION FIELDS (CRITICAL) ==========
+        // D29007 - Número de Grades (CICLO) - The actual production count!
+        int grades   = msg.value("cantidadGrades", 0);
 
-        uint32_t out_prod_q = 0;
-        uint32_t out_stop_q = 0;
-        uint32_t out_falla_q = 0;
+        // ========== STOP FIELDS ==========
+        // D29003 - Parada MCF Quantidade
+        int stops_q  = msg.value("paradas", 0);
+        
+        // D29004 - Parada MCF Tempo (seconds)
+        int stops_t  = msg.value("tiempoParadas_s", 0);
 
-        double   out_prod_t_s = 0;
-        uint32_t out_stop_t_s = 0;
-        uint32_t out_falla_t_s = 0;
+        // ========== FAULT FIELDS ==========
+        // D29013 - Falha Forno Quantidade
+        int faults_q = msg.value("fallaHorno", 0);
+        
+        // D29014 - Falha Forno Tempo (seconds)
+        int faults_t = msg.value("tiempoFalla_s", 0);
 
-        uint16_t raw_prod_q  = clean15(prod_q);
-        uint16_t raw_stop_q  = clean15(stop_q);
-        uint16_t raw_falla_q = clean15(falla_q);
+        // ========== OPTIONAL: METRIC FIELDS (for validation) ==========
+        // D29005 - Métrica MCF (deciseconds)
+        int mcf_metric = msg.value("metricaMCF", 0);
+        
+        // D29006 - Métrica MCF Acumulador
+        int mcf_acum = msg.value("metricaMCF_acum", 0);
+        
+        // D29008 - Métrica FORMADOR (deciseconds)
+        int for_metric = msg.value("metricaFOR", 0);
+        
+        // D29009 - Métrica FORMADOR Acumulador
+        int for_acum = msg.value("metricaFOR_acum", 0);
 
-        uint16_t raw_prod_t  = clean15(prod_t);
-        uint16_t raw_stop_t  = clean15(stop_t);
-        uint16_t raw_falla_t = clean15(falla_t);
+        // ========== OUTPUT ACCUMULATORS ==========
+        uint32_t out_grades = 0;
+        uint32_t out_stops_q = 0;
+        uint32_t out_faults_q = 0;
 
+        uint32_t out_stops_t_s = 0;
+        uint32_t out_faults_t_s = 0;
+        
+        double   out_mcf_metric_s = 0.0;
+        double   out_for_metric_s = 0.0;
+
+        // ========== CLEAN RAW VALUES ==========
+        // D29007 uses BCD-converted format (max 9999)
+        uint16_t raw_grades  = cleanBCD(grades);
+        
+        // Other fields are standard 16-bit
+        uint16_t raw_stops_q  = clean16(stops_q);
+        uint16_t raw_stops_t  = clean16(stops_t);
+        
+        uint16_t raw_faults_q = clean16(faults_q);
+        uint16_t raw_faults_t = clean16(faults_t);
+        
+        uint16_t raw_mcf_metric = clean16(mcf_metric);
+        uint16_t raw_for_metric = clean16(for_metric);
+
+        // ========== BCD OVERFLOW WARNING ==========
+        if (raw_grades > 9900) {
+            std::cerr << "[EntradaHorno] WARNING: Grade counter approaching BCD limit: " 
+                      << raw_grades << " (max 9999)" << std::endl;
+        }
+
+        // ========== STATE MANAGEMENT & ACCUMULATION ==========
         {
             std::lock_guard<std::mutex> lock(mtx_);
             State &st = states_[line];
 
+            // Initialize or reset on shift change
             if (!st.initialized || st.shift != shiftNum) {
                 st = State();
                 st.initialized = true;
                 st.shift = shiftNum;
 
-                st.last_raw_prod_q  = raw_prod_q;
-                st.last_raw_stop_q  = raw_stop_q;
-                st.last_raw_falla_q = raw_falla_q;
+                // Store initial values (no accumulation on first message)
+                st.last_raw_grades     = raw_grades;
+                st.last_raw_stops_q    = raw_stops_q;
+                st.last_raw_stops_t    = raw_stops_t;
+                st.last_raw_faults_q   = raw_faults_q;
+                st.last_raw_faults_t   = raw_faults_t;
+                st.last_raw_mcf_metric = raw_mcf_metric;
+                st.last_raw_for_metric = raw_for_metric;
 
-                st.last_raw_prod_t  = raw_prod_t;
-                st.last_raw_stop_t  = raw_stop_t;
-                st.last_raw_falla_t = raw_falla_t;
+                std::cout << "[EntradaHorno] Line " << line 
+                          << " - Shift " << shiftNum 
+                          << " initialized (grades=" << raw_grades << ")" << std::endl;
             }
             else {
-                st.acc_prod_q += safe_delta_u16(st.last_raw_prod_q,
-                                                raw_prod_q,
-                                                200);   // productos/30s
-                st.last_raw_prod_q = raw_prod_q;
+                // Accumulate deltas
+                
+                // Grades: Production count (CICLO)
+                // Max reasonable: ~150 grades in 30s at high production
+                uint16_t delta_grades = safe_delta_u16(st.last_raw_grades,
+                                                       raw_grades,
+                                                       150);
+                st.acc_grades += delta_grades;
+                st.last_raw_grades = raw_grades;
 
-                st.acc_stop_q += safe_delta_u16(st.last_raw_stop_q,
-                                                raw_stop_q,
-                                                50);
-                st.last_raw_stop_q = raw_stop_q;
+                // Stops: Quantity
+                // Max reasonable: 50 stops in 30s (unlikely but possible)
+                st.acc_stops_q += safe_delta_u16(st.last_raw_stops_q,
+                                                 raw_stops_q,
+                                                 50);
+                st.last_raw_stops_q = raw_stops_q;
 
-                st.acc_falla_q += safe_delta_u16(st.last_raw_falla_q,
-                                                 raw_falla_q,
-                                                 20);
-                st.last_raw_falla_q = raw_falla_q;
-
-                st.acc_prod_t_s += safe_delta_u16(st.last_raw_prod_t,
-                                                  raw_prod_t,
-                                                  250) * 0.1;
-                st.last_raw_prod_t = raw_prod_t;
-
-                st.acc_stop_t_s += safe_delta_u16(st.last_raw_stop_t,
-                                                  raw_stop_t,
-                                                  30);
-                st.last_raw_stop_t = raw_stop_t;
-
-                st.acc_falla_t_s += safe_delta_u16(st.last_raw_falla_t,
-                                                   raw_falla_t,
+                // Stops: Time (seconds)
+                // Max reasonable: 30s of stop time in 30s window
+                st.acc_stops_t_s += safe_delta_u16(st.last_raw_stops_t,
+                                                   raw_stops_t,
                                                    30);
-                st.last_raw_falla_t = raw_falla_t;
+                st.last_raw_stops_t = raw_stops_t;
+
+                // Faults: Quantity
+                // Max reasonable: 20 faults in 30s (unlikely but possible)
+                st.acc_faults_q += safe_delta_u16(st.last_raw_faults_q,
+                                                  raw_faults_q,
+                                                  20);
+                st.last_raw_faults_q = raw_faults_q;
+
+                // Faults: Time (seconds)
+                // Max reasonable: 30s of fault time in 30s window
+                st.acc_faults_t_s += safe_delta_u16(st.last_raw_faults_t,
+                                                    raw_faults_t,
+                                                    30);
+                st.last_raw_faults_t = raw_faults_t;
+
+                // MCF Metric: Time in deciseconds (0.1s)
+                // Max reasonable: 300 deciseconds = 30s in 30s window
+                st.acc_mcf_metric_s += safe_delta_u16(st.last_raw_mcf_metric,
+                                                      raw_mcf_metric,
+                                                      300) * 0.1;
+                st.last_raw_mcf_metric = raw_mcf_metric;
+
+                // FORMADOR Metric: Time in deciseconds (0.1s)
+                // Max reasonable: 300 deciseconds = 30s in 30s window
+                st.acc_for_metric_s += safe_delta_u16(st.last_raw_for_metric,
+                                                      raw_for_metric,
+                                                      300) * 0.1;
+                st.last_raw_for_metric = raw_for_metric;
+
+                // Debug: Log significant production changes
+                if (delta_grades > 0) {
+                    std::cout << "[EntradaHorno] Line " << line 
+                              << " - Produced " << delta_grades 
+                              << " grades (total: " << st.acc_grades << ")" << std::endl;
+                }
             }
 
-            out_prod_q  = st.acc_prod_q;
-            out_stop_q  = st.acc_stop_q;
-            out_falla_q = st.acc_falla_q;
-
-            out_prod_t_s  = st.acc_prod_t_s;
-            out_stop_t_s  = st.acc_stop_t_s;
-            out_falla_t_s = st.acc_falla_t_s;
+            // Copy accumulated values for output
+            out_grades       = st.acc_grades;
+            out_stops_q      = st.acc_stops_q;
+            out_faults_q     = st.acc_faults_q;
+            out_stops_t_s    = st.acc_stops_t_s;
+            out_faults_t_s   = st.acc_faults_t_s;
+            out_mcf_metric_s = st.acc_mcf_metric_s;
+            out_for_metric_s = st.acc_for_metric_s;
         }
 
-        json j_alarm;
-        j_alarm["alarms"] = alarms;
-        j_alarm["ts"]     = iso8601_utc_now();
+        // ========== CALCULATE VACIO HORNO (EMPTY FURNACE TIME) ==========
+        // Formula: vacio = total_time - production_time - stops_time - failures_time
+        // timer = D29001 (total shift time in seconds)
+        // out_mcf_metric_s = accumulated production time (D29006 in deciseconds → seconds)
+        // out_stops_t_s = accumulated stop time (D29004 in seconds)
+        // out_faults_t_s = accumulated failure time (D29014 in seconds)
+        
+        double vacio_horno_sec = static_cast<double>(timer) 
+                                 - out_mcf_metric_s 
+                                 - static_cast<double>(out_stops_t_s) 
+                                 - static_cast<double>(out_faults_t_s);
+        
+        // Convert to minutes and ensure non-negative
+        double vacio_horno_min = (vacio_horno_sec > 0) ? (vacio_horno_sec / 60.0) : 0.0;
 
-        json prod;
-        prod["maquina_id"] = 6;
-        prod["turno"]      = shiftNum;
+        // ========== BUILD PUBLICATIONS ==========
+        
+        // Publication 1: Status & Alarms
+        json j_status;
+        j_status["status"]    = status;       // Status word from D29002
+        j_status["timer"]     = timer;        // 1Hz timer from D29001
+        j_status["raw_grades"] = raw_grades;  // Current raw value
+        j_status["ts"]        = iso8601_utc_now();
 
-        prod["cantidad_produccion"] = out_prod_q;
-        prod["cantidad_paradas"]    = out_stop_q;
-        prod["cantidad_fallas"]     = out_falla_q;
+        // Publication 2: Production Data
+        json j_prod;
+        j_prod["maquina_id"] = 6;  // Device type (Entrada Horno)
+        j_prod["turno"]      = shiftNum;
 
-        prod["tiempo_produccion"] = (uint32_t)out_prod_t_s;
-        prod["tiempo_paradas"]    = out_stop_t_s;
-        prod["tiempo_fallas"]     = out_falla_t_s;
+        // CRITICAL: Production count (grades/racks)
+        j_prod["cantidad_produccion"] = out_grades;
+        
+        // Stops
+        j_prod["cantidad_paradas"]    = out_stops_q;
+        j_prod["tiempo_paradas"]      = out_stops_t_s;
+        
+        // Faults
+        j_prod["cantidad_fallas"]     = out_faults_q;
+        j_prod["tiempo_fallas"]       = out_faults_t_s;
 
-        prod["timestamp_device"] = iso8601_utc_now();
+        // Optional: Metrics (for advanced analytics)
+        j_prod["tiempo_metrica_mcf"]  = (uint32_t)out_mcf_metric_s;
+        j_prod["tiempo_metrica_for"]  = (uint32_t)out_for_metric_s;
 
-        auto t1 = isa95_prefix + std::to_string(line) + "/entrada_horno/alarms";
-        auto t2 = isa95_prefix + std::to_string(line) + "/entrada_horno/production";
-        return { make_pub(t1, j_alarm), make_pub(t2, prod) };
+        // NEW: Empty furnace time in minutes
+        j_prod["vacio_horno_min"]     = vacio_horno_min;
+
+        // Metadata
+        j_prod["timestamp_device"]    = iso8601_utc_now();
+
+        // Build topic paths
+        auto topic_status = isa95_prefix + std::to_string(line) + "/entrada_horno/status";
+        auto topic_prod   = isa95_prefix + std::to_string(line) + "/entrada_horno/production";
+
+        return { 
+            make_pub(topic_status, j_status), 
+            make_pub(topic_prod, j_prod) 
+        };
     }
 };
 
+// Static member initialization
 std::mutex EntradaHornoProcessor::mtx_;
 std::unordered_map<int, EntradaHornoProcessor::State>
     EntradaHornoProcessor::states_;
@@ -1231,6 +1378,7 @@ void EntradaHornoProcessor::reset_states()
 {
     std::lock_guard<std::mutex> lk(mtx_);
     states_.clear();
+    std::cout << "[EntradaHornoProcessor] All states reset" << std::endl;
 }
 
 // ============================================================================
