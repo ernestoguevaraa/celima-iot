@@ -22,6 +22,78 @@ bool detect_global_shift_change(int currentShift)
     return true;
 }
 
+/**
+ * Calculate counter delta with PLC bit-15 glitch handling.
+ *
+ * The PLC has a bug where it alternates between two counter banks
+ * that differ by exactly 32768. This function detects and handles
+ * those glitches while preserving real counter increments.
+ *
+ * Messages arrive every ~3 minutes.
+ * Expected increment: 0-20,000 units per 3 minutes
+ *
+ * @param curr Current counter value (full 16-bit)
+ * @param prev Previous counter value (full 16-bit, from ~3 minutes ago)
+ * @return Delta to accumulate (0 if pure glitch detected)
+ */
+static uint16_t diff_counter_robust(uint16_t curr, uint16_t prev) {
+    int raw_diff = static_cast<int>(curr) - static_cast<int>(prev);
+
+    // Detect ±32768 glitch with tolerance for simultaneous real increment
+    // Glitch is almost exactly ±32768, allow ±100 variance
+    int deviation_plus = abs(raw_diff - 32768);
+    int deviation_minus = abs(raw_diff + 32768);
+
+    // Case 1: +32768 glitch detected
+    if (deviation_plus < 100) {
+        // Extract the small real increment during the glitch
+        int real_increment = raw_diff - 32768;
+        if (real_increment >= 0 && real_increment <= 20000) {
+            return static_cast<uint16_t>(real_increment);
+        }
+        return 0;
+    }
+
+    // Case 2: -32768 glitch detected
+    if (deviation_minus < 100) {
+        // Extract the small real increment during the glitch
+        int real_increment = raw_diff + 32768;
+        if (real_increment >= 0 && real_increment <= 20000) {
+            return static_cast<uint16_t>(real_increment);
+        }
+        return 0;
+    }
+
+    // Case 3: Normal forward increment (0 to 20,000 units in 3 minutes)
+    if (raw_diff >= 0 && raw_diff <= 20000) {
+        return static_cast<uint16_t>(raw_diff);
+    }
+
+    // Case 4: Counter rollover at 65536
+    // Valid only if resulting delta is reasonable
+    if (raw_diff < -45000) {
+        uint16_t rollover_delta = static_cast<uint16_t>(65536 + raw_diff);
+        if (rollover_delta <= 20000) {
+            return rollover_delta;
+        }
+    }
+
+    // Case 5: Large unexpected jump - likely corruption or reset
+    // Conservative: ignore and log for debugging
+    return 0;
+}
+
+/**
+ * Timer delta calculation (for fields without glitch issue)
+ */
+static uint16_t diff_timer(uint16_t curr, uint16_t prev) {
+    if (curr >= prev) {
+        return curr - prev;
+    } else {
+        return static_cast<uint16_t>(65536 - prev + curr);
+    }
+}
+
 
 
 static Publication make_pub(const std::string &topic, const json &j)
@@ -202,53 +274,22 @@ class PrensaHidraulica1Processor : public IMessageProcessor
         bool initialized = false;
         int  shift       = -1;
 
-        // cantidadProductos (15-bit counter, MSB = bank flag)
-        uint16_t last_contador15 = 0;
+        // All counters are 16-bit (no masking)
+        uint16_t last_contador = 0;
         uint32_t acc_pisadas = 0;
 
-        // tiempoProduccion_ds (16-bit, no MSB flag)
         uint16_t last_raw_prod_time = 0;
         double   acc_prod_time_s = 0.0;
 
-        // paradas (15-bit counter)
-        uint16_t last_paradas15 = 0;
+        uint16_t last_paradas = 0;
         uint32_t acc_paradas = 0;
 
-        // tiempoParadas_s (15-bit counter)
-        uint16_t last_tiempo_paradas15 = 0;
+        uint16_t last_tiempo_paradas = 0;
         uint32_t acc_tiempo_paradas_s = 0;
     };
 
     static std::mutex mtx_;
     static std::unordered_map<int, PH1State> states_;
-
-    // 15-bit counter: MSB is a bank flag
-    static constexpr uint16_t COUNTER_MASK = 0x7FFF;
-    static constexpr uint16_t COUNTER_MOD  = 0x8000;
-
-    static inline uint16_t clean15(int x) {
-        return static_cast<uint16_t>(x) & COUNTER_MASK;
-    }
-
-    static inline bool is_corrupted(int x) {
-        return (x & 0x8000) != 0;
-    }
-
-    static uint16_t diff15(uint16_t curr, uint16_t prev) {
-        if (curr >= prev) {
-            return curr - prev;
-        } else {
-            return static_cast<uint16_t>(COUNTER_MOD + curr - prev);
-        }
-    }
-
-    static uint16_t diff16(uint16_t curr, uint16_t prev) {
-        if (curr >= prev) {
-            return curr - prev;
-        } else {
-            return static_cast<uint16_t>(65536 - prev + curr);
-        }
-    }
 
 public:
     /**
@@ -266,24 +307,19 @@ public:
         auto sh = current_shift_localtime();
         int shiftNum = (sh == Shift::S1 ? 1 : (sh == Shift::S2 ? 2 : 3));
 
-        // Read inputs
+        // Read inputs - NO MASKING
         int line          = jsonu::get_opt<int>(msg, "lineID").value_or(0);
         int alarms        = jsonu::get_opt<int>(msg, "alarms").value_or(0);
-        int raw_count_i   = jsonu::get_opt<int>(msg, "cantidadProductos").value_or(0);
-        int raw_time_i    = jsonu::get_opt<int>(msg, "tiempoProduccion_ds").value_or(0);
-        int paradas_raw   = jsonu::get_opt<int>(msg, "paradas").value_or(0);
-        int tiempo_paradas_raw = jsonu::get_opt<int>(msg, "tiempoParadas_s").value_or(0);
+        int raw_count     = jsonu::get_opt<int>(msg, "cantidadProductos").value_or(0);
+        int raw_time      = jsonu::get_opt<int>(msg, "tiempoProduccion_ds").value_or(0);
+        int raw_paradas   = jsonu::get_opt<int>(msg, "paradas").value_or(0);
+        int raw_tiempo_paradas = jsonu::get_opt<int>(msg, "tiempoParadas_s").value_or(0);
 
-        // Detect corruption
-        bool corr_contador = is_corrupted(raw_count_i);
-        bool corr_paradas = is_corrupted(paradas_raw);
-        bool corr_tiempo_paradas = is_corrupted(tiempo_paradas_raw);
-
-        // Clean values (remove MSB)
-        uint16_t contador_clean = clean15(raw_count_i);
-        uint16_t time_clean = static_cast<uint16_t>(raw_time_i);  // 16-bit, no corruption
-        uint16_t paradas_clean = clean15(paradas_raw);
-        uint16_t tiempo_paradas_clean = clean15(tiempo_paradas_raw);
+        // Cast to uint16_t (full 16-bit, no masking)
+        uint16_t contador = static_cast<uint16_t>(raw_count);
+        uint16_t time_val = static_cast<uint16_t>(raw_time);
+        uint16_t paradas = static_cast<uint16_t>(raw_paradas);
+        uint16_t tiempo_paradas = static_cast<uint16_t>(raw_tiempo_paradas);
 
         // Output accumulators
         uint32_t acc_pisadas_out = 0;
@@ -297,33 +333,37 @@ public:
             PH1State &st = states_[line];
 
             if (!st.initialized || st.shift != shiftNum) {
-                // New shift - reset all accumulators
+                // New shift - initialize
                 st = PH1State();
                 st.initialized = true;
                 st.shift = shiftNum;
-
-                st.last_contador15 = contador_clean;
-                st.last_raw_prod_time = time_clean;
-                st.last_paradas15 = paradas_clean;
-                st.last_tiempo_paradas15 = tiempo_paradas_clean;
+                st.last_contador = contador;
+                st.last_raw_prod_time = time_val;
+                st.last_paradas = paradas;
+                st.last_tiempo_paradas = tiempo_paradas;
             }
             else {
-                // Accumulate pisadas (15-bit counter)
-                st.acc_pisadas += diff15(contador_clean, st.last_contador15);
-                st.last_contador15 = contador_clean;
+                // Accumulate deltas
 
-                // Accumulate production time (16-bit, deciseconds -> seconds)
-                uint16_t delta_time = diff16(time_clean, st.last_raw_prod_time);
+                // Counters (use robust glitch detection)
+                uint16_t delta_count = diff_counter_robust(contador, st.last_contador);
+                st.acc_pisadas += delta_count;
+                st.last_contador = contador;
+
+                // Timer (no glitch, use normal diff)
+                uint16_t delta_time = diff_timer(time_val, st.last_raw_prod_time);
                 st.acc_prod_time_s += delta_time * 0.1;
-                st.last_raw_prod_time = time_clean;
+                st.last_raw_prod_time = time_val;
 
-                // Accumulate paradas (15-bit counter)
-                st.acc_paradas += diff15(paradas_clean, st.last_paradas15);
-                st.last_paradas15 = paradas_clean;
+                // Counters (use robust glitch detection)
+                uint16_t delta_paradas = diff_counter_robust(paradas, st.last_paradas);
+                st.acc_paradas += delta_paradas;
+                st.last_paradas = paradas;
 
-                // Accumulate tiempo paradas (15-bit counter, already in seconds)
-                st.acc_tiempo_paradas_s += diff15(tiempo_paradas_clean, st.last_tiempo_paradas15);
-                st.last_tiempo_paradas15 = tiempo_paradas_clean;
+                // Counters (use robust glitch detection)
+                uint16_t delta_tiempo = diff_counter_robust(tiempo_paradas, st.last_tiempo_paradas);
+                st.acc_tiempo_paradas_s += delta_tiempo;
+                st.last_tiempo_paradas = tiempo_paradas;
             }
 
             // Copy out accumulated values
@@ -372,29 +412,26 @@ public:
         prod["turno"] = shiftNum;
 
         // Pisadas (primary counter)
-        prod["cantidadProductos_raw"] = raw_count_i;
-        prod["cantidadProductos_instantaneo"] = contador_clean;
-        prod["bit15_corruption_cantidadProductos"] = corr_contador;
-        
+        prod["cantidadProductos_raw"] = raw_count;
+        prod["cantidadProductos_instantaneo"] = contador;
+
         prod["cantidadPisadas_turno"] = acc_pisadas_out;
         prod["cantidadPisadas_min"] = static_cast<uint32_t>(pisadas_min);
         prod["cantidadProductos_turno"] = acc_pisadas_out * factor_pisadas;
 
         // Production time
-        prod["tiempoProduccion_ds_instantaneo"] = time_clean;
+        prod["tiempoProduccion_ds_instantaneo"] = time_val;
         prod["tiempoProduccion_turno_s"] = static_cast<uint32_t>(acc_prod_time_s_out);
 
         // Paradas (stops)
-        prod["paradas_raw"] = paradas_raw;
-        prod["paradas_instantaneo"] = paradas_clean;
+        prod["paradas_raw"] = raw_paradas;
+        prod["paradas_instantaneo"] = paradas;
         prod["paradas_turno"] = acc_paradas_out;
-        prod["bit15_corruption_paradas"] = corr_paradas;
 
         // Tiempo paradas (stop time)
-        prod["tiempoParadas_raw"] = tiempo_paradas_raw;
-        prod["tiempoParadas_instantaneo"] = tiempo_paradas_clean;
+        prod["tiempoParadas_raw"] = raw_tiempo_paradas;
+        prod["tiempoParadas_instantaneo"] = tiempo_paradas;
         prod["tiempoParadas_turno_s"] = acc_tiempo_paradas_s_out;
-        prod["bit15_corruption_tiempoParadas"] = corr_tiempo_paradas;
 
         prod["timestamp_device"] = iso8601_utc_now();
 
@@ -420,53 +457,22 @@ class PrensaHidraulica2Processor : public IMessageProcessor
         bool initialized = false;
         int  shift       = -1;
 
-        // cantidadProductos (15-bit counter, MSB = bank flag)
-        uint16_t last_contador15 = 0;
+        // All counters are 16-bit (no masking)
+        uint16_t last_contador = 0;
         uint32_t acc_pisadas = 0;
 
-        // tiempoProduccion_ds (16-bit, no MSB flag)
         uint16_t last_raw_prod_time = 0;
         double   acc_prod_time_s = 0.0;
 
-        // paradas (15-bit counter)
-        uint16_t last_paradas15 = 0;
+        uint16_t last_paradas = 0;
         uint32_t acc_paradas = 0;
 
-        // tiempoParadas_s (15-bit counter)
-        uint16_t last_tiempo_paradas15 = 0;
+        uint16_t last_tiempo_paradas = 0;
         uint32_t acc_tiempo_paradas_s = 0;
     };
 
     static std::mutex mtx_;
     static std::unordered_map<int, PH2State> states_;
-
-    // 15-bit counter: MSB is a bank flag
-    static constexpr uint16_t COUNTER_MASK = 0x7FFF;
-    static constexpr uint16_t COUNTER_MOD  = 0x8000;
-
-    static inline uint16_t clean15(int x) {
-        return static_cast<uint16_t>(x) & COUNTER_MASK;
-    }
-
-    static inline bool is_corrupted(int x) {
-        return (x & 0x8000) != 0;
-    }
-
-    static uint16_t diff15(uint16_t curr, uint16_t prev) {
-        if (curr >= prev) {
-            return curr - prev;
-        } else {
-            return static_cast<uint16_t>(COUNTER_MOD + curr - prev);
-        }
-    }
-
-    static uint16_t diff16(uint16_t curr, uint16_t prev) {
-        if (curr >= prev) {
-            return curr - prev;
-        } else {
-            return static_cast<uint16_t>(65536 - prev + curr);
-        }
-    }
 
 public:
     /**
@@ -484,24 +490,19 @@ public:
         auto sh = current_shift_localtime();
         int shiftNum = (sh == Shift::S1 ? 1 : (sh == Shift::S2 ? 2 : 3));
 
-        // Read inputs
+        // Read inputs - NO MASKING
         int line          = jsonu::get_opt<int>(msg, "lineID").value_or(0);
         int alarms        = jsonu::get_opt<int>(msg, "alarms").value_or(0);
-        int raw_count_i   = jsonu::get_opt<int>(msg, "cantidadProductos").value_or(0);
-        int raw_time_i    = jsonu::get_opt<int>(msg, "tiempoProduccion_ds").value_or(0);
-        int paradas_raw   = jsonu::get_opt<int>(msg, "paradas").value_or(0);
-        int tiempo_paradas_raw = jsonu::get_opt<int>(msg, "tiempoParadas_s").value_or(0);
+        int raw_count     = jsonu::get_opt<int>(msg, "cantidadProductos").value_or(0);
+        int raw_time      = jsonu::get_opt<int>(msg, "tiempoProduccion_ds").value_or(0);
+        int raw_paradas   = jsonu::get_opt<int>(msg, "paradas").value_or(0);
+        int raw_tiempo_paradas = jsonu::get_opt<int>(msg, "tiempoParadas_s").value_or(0);
 
-        // Detect corruption
-        bool corr_contador = is_corrupted(raw_count_i);
-        bool corr_paradas = is_corrupted(paradas_raw);
-        bool corr_tiempo_paradas = is_corrupted(tiempo_paradas_raw);
-
-        // Clean values (remove MSB)
-        uint16_t contador_clean = clean15(raw_count_i);
-        uint16_t time_clean = static_cast<uint16_t>(raw_time_i);  // 16-bit, no corruption
-        uint16_t paradas_clean = clean15(paradas_raw);
-        uint16_t tiempo_paradas_clean = clean15(tiempo_paradas_raw);
+        // Cast to uint16_t (full 16-bit, no masking)
+        uint16_t contador = static_cast<uint16_t>(raw_count);
+        uint16_t time_val = static_cast<uint16_t>(raw_time);
+        uint16_t paradas = static_cast<uint16_t>(raw_paradas);
+        uint16_t tiempo_paradas = static_cast<uint16_t>(raw_tiempo_paradas);
 
         // Output accumulators
         uint32_t acc_pisadas_out = 0;
@@ -515,33 +516,37 @@ public:
             PH2State &st = states_[line];
 
             if (!st.initialized || st.shift != shiftNum) {
-                // New shift - reset all accumulators
+                // New shift - initialize
                 st = PH2State();
                 st.initialized = true;
                 st.shift = shiftNum;
-
-                st.last_contador15 = contador_clean;
-                st.last_raw_prod_time = time_clean;
-                st.last_paradas15 = paradas_clean;
-                st.last_tiempo_paradas15 = tiempo_paradas_clean;
+                st.last_contador = contador;
+                st.last_raw_prod_time = time_val;
+                st.last_paradas = paradas;
+                st.last_tiempo_paradas = tiempo_paradas;
             }
             else {
-                // Accumulate pisadas (15-bit counter)
-                st.acc_pisadas += diff15(contador_clean, st.last_contador15);
-                st.last_contador15 = contador_clean;
+                // Accumulate deltas
 
-                // Accumulate production time (16-bit, deciseconds -> seconds)
-                uint16_t delta_time = diff16(time_clean, st.last_raw_prod_time);
+                // Counters (use robust glitch detection)
+                uint16_t delta_count = diff_counter_robust(contador, st.last_contador);
+                st.acc_pisadas += delta_count;
+                st.last_contador = contador;
+
+                // Timer (no glitch, use normal diff)
+                uint16_t delta_time = diff_timer(time_val, st.last_raw_prod_time);
                 st.acc_prod_time_s += delta_time * 0.1;
-                st.last_raw_prod_time = time_clean;
+                st.last_raw_prod_time = time_val;
 
-                // Accumulate paradas (15-bit counter)
-                st.acc_paradas += diff15(paradas_clean, st.last_paradas15);
-                st.last_paradas15 = paradas_clean;
+                // Counters (use robust glitch detection)
+                uint16_t delta_paradas = diff_counter_robust(paradas, st.last_paradas);
+                st.acc_paradas += delta_paradas;
+                st.last_paradas = paradas;
 
-                // Accumulate tiempo paradas (15-bit counter, already in seconds)
-                st.acc_tiempo_paradas_s += diff15(tiempo_paradas_clean, st.last_tiempo_paradas15);
-                st.last_tiempo_paradas15 = tiempo_paradas_clean;
+                // Counters (use robust glitch detection)
+                uint16_t delta_tiempo = diff_counter_robust(tiempo_paradas, st.last_tiempo_paradas);
+                st.acc_tiempo_paradas_s += delta_tiempo;
+                st.last_tiempo_paradas = tiempo_paradas;
             }
 
             // Copy out accumulated values
@@ -589,29 +594,26 @@ public:
         prod["turno"] = shiftNum;
 
         // Pisadas (primary counter)
-        prod["cantidadProductos_raw"] = raw_count_i;
-        prod["cantidadProductos_instantaneo"] = contador_clean;
-        prod["bit15_corruption_cantidadProductos"] = corr_contador;
-        
+        prod["cantidadProductos_raw"] = raw_count;
+        prod["cantidadProductos_instantaneo"] = contador;
+
         prod["cantidadPisadas_turno"] = acc_pisadas_out;
         prod["cantidadPisadas_min"] = static_cast<uint32_t>(pisadas_min);
-        prod["cantidadProductos_turno"] = acc_pisadas_out * factor_pisadas;  
+        prod["cantidadProductos_turno"] = acc_pisadas_out * factor_pisadas;
 
         // Production time
-        prod["tiempoProduccion_ds_instantaneo"] = time_clean;
+        prod["tiempoProduccion_ds_instantaneo"] = time_val;
         prod["tiempoProduccion_turno_s"] = static_cast<uint32_t>(acc_prod_time_s_out);
 
         // Paradas (stops)
-        prod["paradas_raw"] = paradas_raw;
-        prod["paradas_instantaneo"] = paradas_clean;
+        prod["paradas_raw"] = raw_paradas;
+        prod["paradas_instantaneo"] = paradas;
         prod["paradas_turno"] = acc_paradas_out;
-        prod["bit15_corruption_paradas"] = corr_paradas;
 
         // Tiempo paradas (stop time)
-        prod["tiempoParadas_raw"] = tiempo_paradas_raw;
-        prod["tiempoParadas_instantaneo"] = tiempo_paradas_clean;
+        prod["tiempoParadas_raw"] = raw_tiempo_paradas;
+        prod["tiempoParadas_instantaneo"] = tiempo_paradas;
         prod["tiempoParadas_turno_s"] = acc_tiempo_paradas_s_out;
-        prod["bit15_corruption_tiempoParadas"] = corr_tiempo_paradas;
 
         prod["timestamp_device"] = iso8601_utc_now();
 
@@ -643,25 +645,6 @@ class EntradaSecadorProcessor : public IMessageProcessor
     static std::mutex mtx_;
     static std::unordered_map<int, State> states_;
 
-    // ---- Same pattern used for Esmalte/SalidaHorno ----
-    static inline uint16_t clean15(int x) {
-        return static_cast<uint16_t>(x) & 0x7FFF;
-    }
-    static uint16_t diff16(uint16_t curr, uint16_t prev) {
-        return (curr >= prev)
-            ? (curr - prev)
-            : static_cast<uint16_t>(curr + (65536 - prev));
-    }
-
-    // Reject 0 and absurd deltas
-    static uint16_t safe_delta_u16(uint16_t prev, uint16_t curr, uint16_t max_reasonable)
-    {
-        const uint16_t d = diff16(curr, prev);
-        if (d == 0) return 0;
-        if (d > max_reasonable) return 0;   // ignore rollover/garbage
-        return d;
-    }
-
 public:
 static void reset_states();
     std::vector<Publication> process(const json &msg,
@@ -680,9 +663,9 @@ static void reset_states();
         uint32_t out_arranques = 0;
         uint32_t out_t_oper    = 0;
 
-        // mask MSB like other processors
-        uint16_t raw_arr    = clean15(arr_in);
-        uint16_t raw_t_oper = clean15(t_oper_s_in);
+        // Cast to uint16_t (full 16-bit, no masking)
+        uint16_t raw_arr    = static_cast<uint16_t>(arr_in);
+        uint16_t raw_t_oper = static_cast<uint16_t>(t_oper_s_in);
 
         {
             std::lock_guard<std::mutex> lock(mtx_);
@@ -697,16 +680,12 @@ static void reset_states();
                 st.last_t_operacion   = raw_t_oper;
             }
             else {
-                // use reasonable deltas: assume no more than 100 arranques per 30 s
-                st.acc_arranques += safe_delta_u16(st.last_arranques,
-                                                   raw_arr,
-                                                   100);
+                // Accumulate deltas using robust glitch detection
+                st.acc_arranques += diff_counter_robust(raw_arr, st.last_arranques);
                 st.last_arranques = raw_arr;
 
-                // tiempo de operación en segundos: delta razonable 0..30
-                st.acc_t_operacion_s += safe_delta_u16(st.last_t_operacion,
-                                                       raw_t_oper,
-                                                       30);
+                // tiempo de operación en segundos
+                st.acc_t_operacion_s += diff_counter_robust(raw_t_oper, st.last_t_operacion);
                 st.last_t_operacion = raw_t_oper;
             }
 
@@ -750,28 +729,22 @@ class SalidaSecadorProcessor : public IMessageProcessor
         bool initialized = false;
         int  shift       = -1;
 
-        // cantidadProductos (15-bit counter, MSB is flag)
-        uint16_t last_prod_q15   = 0;
-        uint32_t acc_prod_q      = 0;
+        // All counters are 16-bit (no masking)
+        uint16_t last_prod_q = 0;
+        uint32_t acc_prod_q = 0;
 
-        // paradas (15-bit counter, MSB is flag)
-        uint16_t last_stop_q15   = 0;
-        uint32_t acc_stop_q      = 0;
+        uint16_t last_stop_q = 0;
+        uint32_t acc_stop_q = 0;
 
-        // tiempoProduccion_ds (16-bit, deciseconds)
         uint16_t last_raw_prod_t = 0;
-        double   acc_prod_t_s    = 0.0;
+        double   acc_prod_t_s = 0.0;
 
-        // tiempoParadas_s (15-bit, MSB is flag)
-        uint16_t last_stop_t15   = 0;
-        uint32_t acc_stop_t_s    = 0;
+        uint16_t last_stop_t = 0;
+        uint32_t acc_stop_t_s = 0;
     };
 
     static std::mutex mtx_;
     static std::unordered_map<int, State> states_;
-
-    static constexpr uint16_t MASK_15 = 0x7FFF;  // bits 0..14
-    static constexpr uint16_t MOD_15  = 0x8000;  // 2^15
 
 public:
 static void reset_states();
@@ -782,13 +755,19 @@ static void reset_states();
         auto sh       = current_shift_localtime();
         int  shiftNum = (sh == Shift::S1 ? 1 : (sh == Shift::S2 ? 2 : 3));
 
-        // ---- Read fields ----
+        // ---- Read fields - NO MASKING ----
         int alarms = jsonu::get_opt<int>(msg, "alarms").value_or(0);
-        int prod_q = jsonu::get_opt<int>(msg, "cantidadProductos").value_or(0);
-        int prod_t = jsonu::get_opt<int>(msg, "tiempoProduccion_ds").value_or(0);
+        int prod_q_raw = jsonu::get_opt<int>(msg, "cantidadProductos").value_or(0);
+        int prod_t_raw = jsonu::get_opt<int>(msg, "tiempoProduccion_ds").value_or(0);
         int line   = jsonu::get_opt<int>(msg, "lineID").value_or(0);
-        int stop_q = jsonu::get_opt<int>(msg, "paradas").value_or(0);
-        int stop_t = jsonu::get_opt<int>(msg, "tiempoParadas_s").value_or(0);
+        int stop_q_raw = jsonu::get_opt<int>(msg, "paradas").value_or(0);
+        int stop_t_raw = jsonu::get_opt<int>(msg, "tiempoParadas_s").value_or(0);
+
+        // Cast to uint16_t (full 16-bit, no masking)
+        uint16_t prod_q = static_cast<uint16_t>(prod_q_raw);
+        uint16_t prod_t = static_cast<uint16_t>(prod_t_raw);
+        uint16_t stop_q = static_cast<uint16_t>(stop_q_raw);
+        uint16_t stop_t = static_cast<uint16_t>(stop_t_raw);
 
         // Outputs
         uint32_t prod_q_shift   = 0;
@@ -800,81 +779,42 @@ static void reset_states();
             std::lock_guard<std::mutex> lock(mtx_);
             State &st = states_[line];
 
-            // ---- Apply MSB removal for 15-bit counters ----
-            uint16_t prod_q15 = static_cast<uint16_t>(prod_q) & MASK_15;
-            uint16_t stop_q15 = static_cast<uint16_t>(stop_q) & MASK_15;
-            uint16_t prod_t16 = static_cast<uint16_t>(prod_t);           // 16-bit normal
-            uint16_t stop_t15 = static_cast<uint16_t>(stop_t) & MASK_15;
-
             // ---- First sample or shift change ----
             if (!st.initialized || st.shift != shiftNum) {
                 st.initialized = true;
                 st.shift       = shiftNum;
 
-                st.last_prod_q15   = prod_q15;
-                st.acc_prod_q      = 0;
+                st.last_prod_q = prod_q;
+                st.acc_prod_q = 0;
 
-                st.last_stop_q15   = stop_q15;
-                st.acc_stop_q      = 0;
+                st.last_stop_q = stop_q;
+                st.acc_stop_q = 0;
 
-                st.last_raw_prod_t = prod_t16;
-                st.acc_prod_t_s    = 0.0;
+                st.last_raw_prod_t = prod_t;
+                st.acc_prod_t_s = 0.0;
 
-                st.last_stop_t15   = stop_t15;
-                st.acc_stop_t_s    = 0;
+                st.last_stop_t = stop_t;
+                st.acc_stop_t_s = 0;
             }
             else {
-                // ---- cantidadProductos (15-bit modulo) ----
-                {
-                    uint16_t prev = st.last_prod_q15;
-                    uint16_t curr = prod_q15;
-                    uint16_t diff =
-                        (curr >= prev)
-                          ? static_cast<uint16_t>(curr - prev)
-                          : static_cast<uint16_t>(MOD_15 + curr - prev);
+                // Accumulate deltas
 
-                    st.acc_prod_q   += diff;
-                    st.last_prod_q15 = curr;
-                }
+                // cantidadProductos (use robust glitch detection)
+                st.acc_prod_q += diff_counter_robust(prod_q, st.last_prod_q);
+                st.last_prod_q = prod_q;
 
-                // ---- paradas (15-bit modulo) ----
-                {
-                    uint16_t prev = st.last_stop_q15;
-                    uint16_t curr = stop_q15;
-                    uint16_t diff =
-                        (curr >= prev)
-                          ? static_cast<uint16_t>(curr - prev)
-                          : static_cast<uint16_t>(MOD_15 + curr - prev);
+                // paradas (use robust glitch detection)
+                st.acc_stop_q += diff_counter_robust(stop_q, st.last_stop_q);
+                st.last_stop_q = stop_q;
 
-                    st.acc_stop_q   += diff;
-                    st.last_stop_q15 = curr;
-                }
+                // tiempoProduccion_ds (timer, ds → s)
+                uint16_t delta_t = diff_timer(prod_t, st.last_raw_prod_t);
+                st.acc_prod_t_s += delta_t * 0.1;
+                st.last_raw_prod_t = prod_t;
 
-                // ---- tiempoProduccion_ds (16-bit normal modulo, ds→s) ----
-                {
-                    uint16_t prev = st.last_raw_prod_t;
-                    uint16_t curr = prod_t16;
-                    uint16_t diff =
-                        (curr >= prev)
-                          ? static_cast<uint16_t>(curr - prev)
-                          : static_cast<uint16_t>(curr + (uint16_t)(65536 - prev));
-
-                    st.acc_prod_t_s += diff * 0.1; // ds → s
-                    st.last_raw_prod_t = curr;
-                }
-
-                // ---- tiempoParadas_s (15-bit modulo) ----
-                {
-                    uint16_t prev = st.last_stop_t15;
-                    uint16_t curr = stop_t15;
-                    uint16_t diff =
-                        (curr >= prev)
-                          ? static_cast<uint16_t>(curr - prev)
-                          : static_cast<uint16_t>(MOD_15 + curr - prev);
-
-                    st.acc_stop_t_s += diff;
-                    st.last_stop_t15 = curr;
-                }
+                // tiempoParadas_s (use robust glitch detection)
+                st.acc_stop_t_s += diff_counter_robust(stop_t, st.last_stop_t);
+                st.last_stop_t = stop_t;
             }
 
             // ---- Final accumulated values ----
@@ -925,39 +865,22 @@ class EsmalteProcessor : public IMessageProcessor
         bool initialized = false;
         int shift = -1;
 
-        // cantidadProductos (15-bit)
+        // All counters are 16-bit (no masking)
         uint16_t last_raw_prod_q = 0;
         uint32_t acc_prod_q = 0;
 
-        // paradas (15-bit)
         uint16_t last_raw_stop_q = 0;
         uint32_t acc_stop_q = 0;
 
-        // tiempoProduccion_ds (16 bits reales, sin MSB flag)
         uint16_t last_raw_prod_t = 0;
         double   acc_prod_t_s = 0.0;
 
-        // tiempoParadas_s (15-bit)
         uint16_t last_raw_stop_t = 0;
         uint32_t acc_stop_t_s = 0;
     };
 
     static std::mutex mtx_;
     static std::unordered_map<int, State> states_;
-
-    // --- Helpers ---
-    static constexpr uint16_t MASK_15 = 0x7FFF;
-    static constexpr uint16_t MOD_15  = 0x8000;
-
-    static uint16_t mask15(int x) {
-        return static_cast<uint16_t>(x) & MASK_15;
-    }
-
-    static uint16_t diff16(uint16_t curr, uint16_t prev) {
-        return (curr >= prev)
-            ? static_cast<uint16_t>(curr - prev)
-            : static_cast<uint16_t>(curr + (65536 - prev));
-    }
 
 public:
 static void reset_states();
@@ -968,13 +891,13 @@ static void reset_states();
         auto sh = current_shift_localtime();
         int shiftNum = (sh == Shift::S1 ? 1 : sh == Shift::S2 ? 2 : 3);
 
-        // ---- Extract fields ----
+        // ---- Extract fields - NO MASKING ----
         int alarms   = jsonu::get_opt<int>(msg, "alarms").value_or(0);
         int prod_q   = jsonu::get_opt<int>(msg, "cantidadProductos").value_or(0);
-        int prod_t   = jsonu::get_opt<int>(msg, "tiempoProduccion_ds").value_or(0);   // 16-bit real
+        int prod_t   = jsonu::get_opt<int>(msg, "tiempoProduccion_ds").value_or(0);
         int line     = jsonu::get_opt<int>(msg, "lineID").value_or(0);
-        int stop_q   = jsonu::get_opt<int>(msg, "paradas").value_or(0);               // 15-bit
-        int stop_t   = jsonu::get_opt<int>(msg, "tiempoParadas_s").value_or(0);       // 15-bit
+        int stop_q   = jsonu::get_opt<int>(msg, "paradas").value_or(0);
+        int stop_t   = jsonu::get_opt<int>(msg, "tiempoParadas_s").value_or(0);
 
         uint32_t prod_q_shift = 0;
         uint32_t stop_q_shift = 0;
@@ -985,7 +908,7 @@ static void reset_states();
             std::lock_guard<std::mutex> lock(mtx_);
             State &st = states_[line];
 
-            // Valores crudos sin máscara
+            // Cast to uint16_t (full 16-bit, no masking)
             uint16_t raw_prod_q = static_cast<uint16_t>(prod_q);
             uint16_t raw_stop_q = static_cast<uint16_t>(stop_q);
             uint16_t raw_prod_t = static_cast<uint16_t>(prod_t);
@@ -1003,20 +926,23 @@ static void reset_states();
                 st.last_raw_stop_t = raw_stop_t;
             }
             else {
-                // ---- PRODUCCIÓN ----
-                st.acc_prod_q += safe_delta_u16(st.last_raw_prod_q, raw_prod_q);
+                // Accumulate deltas
+
+                // cantidadProductos (use robust glitch detection)
+                st.acc_prod_q += diff_counter_robust(raw_prod_q, st.last_raw_prod_q);
                 st.last_raw_prod_q = raw_prod_q;
 
-                // ---- PARADAS ----
-                st.acc_stop_q += safe_delta_u16(st.last_raw_stop_q, raw_stop_q);
+                // paradas (use robust glitch detection)
+                st.acc_stop_q += diff_counter_robust(raw_stop_q, st.last_raw_stop_q);
                 st.last_raw_stop_q = raw_stop_q;
 
-                // ---- tiempoProduccion_ds -> 0.1 s ----
-                st.acc_prod_t_s += safe_delta_u16(st.last_raw_prod_t, raw_prod_t) * 0.1;
+                // tiempoProduccion_ds (timer, ds → s)
+                uint16_t delta_t = diff_timer(raw_prod_t, st.last_raw_prod_t);
+                st.acc_prod_t_s += delta_t * 0.1;
                 st.last_raw_prod_t = raw_prod_t;
 
-                // ---- tiempoParadas_s ----
-                st.acc_stop_t_s += safe_delta_u16(st.last_raw_stop_t, raw_stop_t);
+                // tiempoParadas_s (use robust glitch detection)
+                st.acc_stop_t_s += diff_counter_robust(raw_stop_t, st.last_raw_stop_t);
                 st.last_raw_stop_t = raw_stop_t;
             }
 
@@ -1106,27 +1032,6 @@ class EntradaHornoProcessor : public IMessageProcessor
         return (val > 9999) ? 9999 : val;
     }
 
-    // Standard 16-bit cleanup (for non-BCD fields)
-    static inline uint16_t clean16(int x) {
-        return static_cast<uint16_t>(x) & 0xFFFF;
-    }
-
-    // Calculate delta with wraparound handling
-    static uint16_t diff16(uint16_t curr, uint16_t prev) {
-        return (curr >= prev)
-             ? (curr - prev)
-             : static_cast<uint16_t>(curr + (65536 - prev));
-    }
-
-    // Safe delta with maximum reasonable value check
-    static uint16_t safe_delta_u16(uint16_t prev, uint16_t curr, uint16_t max_reasonable)
-    {
-        const uint16_t d = diff16(curr, prev);
-        if (d == 0) return 0;
-        if (d > max_reasonable) return 0;  // Reject unreasonable jumps
-        return d;
-    }
-
 public:
     static void reset_states();
     
@@ -1172,15 +1077,9 @@ public:
         // ========== OPTIONAL: METRIC FIELDS (for validation) ==========
         // D29005 - Métrica MCF (deciseconds)
         int mcf_metric = msg.value("metricaMCF", 0);
-        
-        // D29006 - Métrica MCF Acumulador
-        int mcf_acum = msg.value("metricaMCF_acum", 0);
-        
+
         // D29008 - Métrica FORMADOR (deciseconds)
         int for_metric = msg.value("metricaFOR", 0);
-        
-        // D29009 - Métrica FORMADOR Acumulador
-        int for_acum = msg.value("metricaFOR_acum", 0);
 
         // ========== OUTPUT ACCUMULATORS ==========
         uint32_t out_grades = 0;
@@ -1196,16 +1095,16 @@ public:
         // ========== CLEAN RAW VALUES ==========
         // D29007 uses BCD-converted format (max 9999)
         uint16_t raw_grades  = cleanBCD(grades);
-        
-        // Other fields are standard 16-bit
-        uint16_t raw_stops_q  = clean16(stops_q);
-        uint16_t raw_stops_t  = clean16(stops_t);
-        
-        uint16_t raw_faults_q = clean16(faults_q);
-        uint16_t raw_faults_t = clean16(faults_t);
-        
-        uint16_t raw_mcf_metric = clean16(mcf_metric);
-        uint16_t raw_for_metric = clean16(for_metric);
+
+        // Other fields are standard 16-bit (no masking)
+        uint16_t raw_stops_q  = static_cast<uint16_t>(stops_q);
+        uint16_t raw_stops_t  = static_cast<uint16_t>(stops_t);
+
+        uint16_t raw_faults_q = static_cast<uint16_t>(faults_q);
+        uint16_t raw_faults_t = static_cast<uint16_t>(faults_t);
+
+        uint16_t raw_mcf_metric = static_cast<uint16_t>(mcf_metric);
+        uint16_t raw_for_metric = static_cast<uint16_t>(for_metric);
 
         // ========== BCD OVERFLOW WARNING ==========
         if (raw_grades > 9900) {
@@ -1239,61 +1138,42 @@ public:
             }
             else {
                 // Accumulate deltas
-                
-                // Grades: Production count (CICLO)
-                // Max reasonable: ~150 grades in 30s at high production
-                uint16_t delta_grades = safe_delta_u16(st.last_raw_grades,
-                                                       raw_grades,
-                                                       150);
+
+                // Grades: Production count (CICLO) - use robust glitch detection
+                uint16_t delta_grades = diff_counter_robust(raw_grades, st.last_raw_grades);
                 st.acc_grades += delta_grades;
                 st.last_raw_grades = raw_grades;
 
-                // Stops: Quantity
-                // Max reasonable: 50 stops in 30s (unlikely but possible)
-                st.acc_stops_q += safe_delta_u16(st.last_raw_stops_q,
-                                                 raw_stops_q,
-                                                 50);
+                // Stops: Quantity - use robust glitch detection
+                st.acc_stops_q += diff_counter_robust(raw_stops_q, st.last_raw_stops_q);
                 st.last_raw_stops_q = raw_stops_q;
 
-                // Stops: Time (seconds)
-                // Max reasonable: 30s of stop time in 30s window
-                st.acc_stops_t_s += safe_delta_u16(st.last_raw_stops_t,
-                                                   raw_stops_t,
-                                                   30);
+                // Stops: Time (seconds) - use robust glitch detection
+                st.acc_stops_t_s += diff_counter_robust(raw_stops_t, st.last_raw_stops_t);
                 st.last_raw_stops_t = raw_stops_t;
 
-                // Faults: Quantity
-                // Max reasonable: 20 faults in 30s (unlikely but possible)
-                st.acc_faults_q += safe_delta_u16(st.last_raw_faults_q,
-                                                  raw_faults_q,
-                                                  20);
+                // Faults: Quantity - use robust glitch detection
+                st.acc_faults_q += diff_counter_robust(raw_faults_q, st.last_raw_faults_q);
                 st.last_raw_faults_q = raw_faults_q;
 
-                // Faults: Time (seconds)
-                // Max reasonable: 30s of fault time in 30s window
-                st.acc_faults_t_s += safe_delta_u16(st.last_raw_faults_t,
-                                                    raw_faults_t,
-                                                    30);
+                // Faults: Time (seconds) - use robust glitch detection
+                st.acc_faults_t_s += diff_counter_robust(raw_faults_t, st.last_raw_faults_t);
                 st.last_raw_faults_t = raw_faults_t;
 
-                // MCF Metric: Time in deciseconds (0.1s)
-                // Max reasonable: 300 deciseconds = 30s in 30s window
-                st.acc_mcf_metric_s += safe_delta_u16(st.last_raw_mcf_metric,
-                                                      raw_mcf_metric,
-                                                      300) * 0.1;
+                // MCF Metric: Time in deciseconds (timer, ds → s)
+                uint16_t delta_mcf = diff_timer(raw_mcf_metric, st.last_raw_mcf_metric);
+                st.acc_mcf_metric_s += delta_mcf * 0.1;
                 st.last_raw_mcf_metric = raw_mcf_metric;
 
-                // FORMADOR Metric: Time in deciseconds (0.1s)
-                // Max reasonable: 300 deciseconds = 30s in 30s window
-                st.acc_for_metric_s += safe_delta_u16(st.last_raw_for_metric,
-                                                      raw_for_metric,
-                                                      300) * 0.1;
+                // FORMADOR Metric: Time in deciseconds (timer, ds → s)
+                uint16_t delta_for = diff_timer(raw_for_metric, st.last_raw_for_metric);
+                st.acc_for_metric_s += delta_for * 0.1;
                 st.last_raw_for_metric = raw_for_metric;
 
                 // Debug: Log significant production changes
                 if (delta_grades > 0) {
-                    std::cout << "[EntradaHorno] Line " << line 
-                              << " - Produced " << delta_grades 
+                    std::cout << "[EntradaHorno] Line " << line
+                              << " - Produced " << delta_grades
                               << " grades (total: " << st.acc_grades << ")" << std::endl;
                 }
             }
@@ -1391,7 +1271,7 @@ class SalidaHornoProcessor : public IMessageProcessor
         bool initialized = false;
         int shift = -1;
 
-        // All 15-bit counters (MSB is bank flag)
+        // All counters are 16-bit (no masking)
         uint16_t last_bancalinos0 = 0;
         uint32_t acc_bancalinos0 = 0;
 
@@ -1431,46 +1311,14 @@ class SalidaHornoProcessor : public IMessageProcessor
         uint16_t last_paradas_2 = 0;
         uint32_t acc_paradas_2 = 0;
 
-        // timer1Hz is 16-bit counter (no MSB flag)
         uint16_t last_timer1Hz = 0;
         uint32_t acc_timer1Hz = 0;
 
-        // tiempo_operacion in seconds
         uint32_t acc_tiempo_operacion_s = 0;
     };
 
     static std::mutex mtx_;
     static std::unordered_map<int, State> states_;
-
-    // MSB mask for 15-bit counters
-    static constexpr uint16_t MASK_15 = 0x7FFF;
-    static constexpr uint16_t MOD_15 = 0x8000;
-
-    static inline uint16_t clean15(int x) {
-        return static_cast<uint16_t>(x) & MASK_15;
-    }
-
-    static inline bool is_corrupted(int x) {
-        return (x & 0x8000) != 0;
-    }
-
-    static uint16_t diff15(uint16_t curr, uint16_t prev) {
-        // Calculate delta for 15-bit counter with rollover
-        if (curr >= prev) {
-            return curr - prev;
-        } else {
-            return static_cast<uint16_t>(MOD_15 + curr - prev);
-        }
-    }
-
-    static uint16_t diff16(uint16_t curr, uint16_t prev) {
-        // Calculate delta for 16-bit counter with rollover
-        if (curr >= prev) {
-            return curr - prev;
-        } else {
-            return static_cast<uint16_t>(65536 + curr - prev);
-        }
-    }
 
 public:
     /**
@@ -1513,38 +1361,21 @@ public:
 
         int timer1Hz_raw = jsonu::get_opt<int>(msg, "timer1Hz").value_or(0);
 
-        // Detect corruption for all 15-bit counters
-        bool corr_bancalinos0 = is_corrupted(bancalinos0_raw);
-        bool corr_bancalinos1 = is_corrupted(bancalinos1_raw);
-        bool corr_bancalinosComb1 = is_corrupted(bancalinosComb1_raw);
-        bool corr_bancalinosComb2 = is_corrupted(bancalinosComb2_raw);
-        bool corr_bancalinosTotal = is_corrupted(bancalinosTotal_raw);
-        bool corr_cambioBarrera = is_corrupted(cambioBarrera_raw);
-        bool corr_cambioBarreraTotal = is_corrupted(cambioBarreraTotal_raw);
-        bool corr_cambioSentido = is_corrupted(cambioSentido_raw);
-        bool corr_cambioSentidoTotal = is_corrupted(cambioSentidoTotal_raw);
-        bool corr_cantidad = is_corrupted(cantidad_raw);
-        bool corr_cantidad_total = is_corrupted(cantidad_total_raw);
-        bool corr_paradas_1 = is_corrupted(paradas_1_raw);
-        bool corr_paradas_2 = is_corrupted(paradas_2_raw);
-
-        // Clean all 15-bit counters (remove MSB)
-        uint16_t bancalinos0_clean = clean15(bancalinos0_raw);
-        uint16_t bancalinos1_clean = clean15(bancalinos1_raw);
-        uint16_t bancalinosComb1_clean = clean15(bancalinosComb1_raw);
-        uint16_t bancalinosComb2_clean = clean15(bancalinosComb2_raw);
-        uint16_t bancalinosTotal_clean = clean15(bancalinosTotal_raw);
-        uint16_t cambioBarrera_clean = clean15(cambioBarrera_raw);
-        uint16_t cambioBarreraTotal_clean = clean15(cambioBarreraTotal_raw);
-        uint16_t cambioSentido_clean = clean15(cambioSentido_raw);
-        uint16_t cambioSentidoTotal_clean = clean15(cambioSentidoTotal_raw);
-        uint16_t cantidad_clean = clean15(cantidad_raw);
-        uint16_t cantidad_total_clean = clean15(cantidad_total_raw);
-        uint16_t paradas_1_clean = clean15(paradas_1_raw);
-        uint16_t paradas_2_clean = clean15(paradas_2_raw);
-
-        // timer1Hz is 16-bit (no corruption)
-        uint16_t timer1Hz_clean = static_cast<uint16_t>(timer1Hz_raw);
+        // Cast to uint16_t (full 16-bit, no masking)
+        uint16_t bancalinos0 = static_cast<uint16_t>(bancalinos0_raw);
+        uint16_t bancalinos1 = static_cast<uint16_t>(bancalinos1_raw);
+        uint16_t bancalinosComb1 = static_cast<uint16_t>(bancalinosComb1_raw);
+        uint16_t bancalinosComb2 = static_cast<uint16_t>(bancalinosComb2_raw);
+        uint16_t bancalinosTotal = static_cast<uint16_t>(bancalinosTotal_raw);
+        uint16_t cambioBarrera = static_cast<uint16_t>(cambioBarrera_raw);
+        uint16_t cambioBarreraTotal = static_cast<uint16_t>(cambioBarreraTotal_raw);
+        uint16_t cambioSentido = static_cast<uint16_t>(cambioSentido_raw);
+        uint16_t cambioSentidoTotal = static_cast<uint16_t>(cambioSentidoTotal_raw);
+        uint16_t cantidad = static_cast<uint16_t>(cantidad_raw);
+        uint16_t cantidad_total = static_cast<uint16_t>(cantidad_total_raw);
+        uint16_t paradas_1 = static_cast<uint16_t>(paradas_1_raw);
+        uint16_t paradas_2 = static_cast<uint16_t>(paradas_2_raw);
+        uint16_t timer1Hz = static_cast<uint16_t>(timer1Hz_raw);
 
         // Output accumulators
         uint32_t acc_bancalinos0_out = 0;
@@ -1560,7 +1391,6 @@ public:
         uint32_t acc_cantidad_total_out = 0;
         uint32_t acc_paradas_1_out = 0;
         uint32_t acc_paradas_2_out = 0;
-        uint32_t acc_timer1Hz_out = 0;
         uint32_t acc_tiempo_operacion_s_out = 0;
 
         {
@@ -1574,67 +1404,68 @@ public:
                 st.shift = shiftNum;
 
                 // Initialize last values
-                st.last_bancalinos0 = bancalinos0_clean;
-                st.last_bancalinos1 = bancalinos1_clean;
-                st.last_bancalinosComb1 = bancalinosComb1_clean;
-                st.last_bancalinosComb2 = bancalinosComb2_clean;
-                st.last_bancalinosTotal = bancalinosTotal_clean;
-                st.last_cambioBarrera = cambioBarrera_clean;
-                st.last_cambioBarreraTotal = cambioBarreraTotal_clean;
-                st.last_cambioSentido = cambioSentido_clean;
-                st.last_cambioSentidoTotal = cambioSentidoTotal_clean;
-                st.last_cantidad = cantidad_clean;
-                st.last_cantidad_total = cantidad_total_clean;
-                st.last_paradas_1 = paradas_1_clean;
-                st.last_paradas_2 = paradas_2_clean;
-                st.last_timer1Hz = timer1Hz_clean;
+                st.last_bancalinos0 = bancalinos0;
+                st.last_bancalinos1 = bancalinos1;
+                st.last_bancalinosComb1 = bancalinosComb1;
+                st.last_bancalinosComb2 = bancalinosComb2;
+                st.last_bancalinosTotal = bancalinosTotal;
+                st.last_cambioBarrera = cambioBarrera;
+                st.last_cambioBarreraTotal = cambioBarreraTotal;
+                st.last_cambioSentido = cambioSentido;
+                st.last_cambioSentidoTotal = cambioSentidoTotal;
+                st.last_cantidad = cantidad;
+                st.last_cantidad_total = cantidad_total;
+                st.last_paradas_1 = paradas_1;
+                st.last_paradas_2 = paradas_2;
+                st.last_timer1Hz = timer1Hz;
             }
             else {
-                // Accumulate deltas for all 15-bit counters
-                st.acc_bancalinos0 += diff15(bancalinos0_clean, st.last_bancalinos0);
-                st.last_bancalinos0 = bancalinos0_clean;
+                // Accumulate deltas using robust glitch detection
 
-                st.acc_bancalinos1 += diff15(bancalinos1_clean, st.last_bancalinos1);
-                st.last_bancalinos1 = bancalinos1_clean;
+                st.acc_bancalinos0 += diff_counter_robust(bancalinos0, st.last_bancalinos0);
+                st.last_bancalinos0 = bancalinos0;
 
-                st.acc_bancalinosComb1 += diff15(bancalinosComb1_clean, st.last_bancalinosComb1);
-                st.last_bancalinosComb1 = bancalinosComb1_clean;
+                st.acc_bancalinos1 += diff_counter_robust(bancalinos1, st.last_bancalinos1);
+                st.last_bancalinos1 = bancalinos1;
 
-                st.acc_bancalinosComb2 += diff15(bancalinosComb2_clean, st.last_bancalinosComb2);
-                st.last_bancalinosComb2 = bancalinosComb2_clean;
+                st.acc_bancalinosComb1 += diff_counter_robust(bancalinosComb1, st.last_bancalinosComb1);
+                st.last_bancalinosComb1 = bancalinosComb1;
 
-                st.acc_bancalinosTotal += diff15(bancalinosTotal_clean, st.last_bancalinosTotal);
-                st.last_bancalinosTotal = bancalinosTotal_clean;
+                st.acc_bancalinosComb2 += diff_counter_robust(bancalinosComb2, st.last_bancalinosComb2);
+                st.last_bancalinosComb2 = bancalinosComb2;
 
-                st.acc_cambioBarrera += diff15(cambioBarrera_clean, st.last_cambioBarrera);
-                st.last_cambioBarrera = cambioBarrera_clean;
+                st.acc_bancalinosTotal += diff_counter_robust(bancalinosTotal, st.last_bancalinosTotal);
+                st.last_bancalinosTotal = bancalinosTotal;
 
-                st.acc_cambioBarreraTotal += diff15(cambioBarreraTotal_clean, st.last_cambioBarreraTotal);
-                st.last_cambioBarreraTotal = cambioBarreraTotal_clean;
+                st.acc_cambioBarrera += diff_counter_robust(cambioBarrera, st.last_cambioBarrera);
+                st.last_cambioBarrera = cambioBarrera;
 
-                st.acc_cambioSentido += diff15(cambioSentido_clean, st.last_cambioSentido);
-                st.last_cambioSentido = cambioSentido_clean;
+                st.acc_cambioBarreraTotal += diff_counter_robust(cambioBarreraTotal, st.last_cambioBarreraTotal);
+                st.last_cambioBarreraTotal = cambioBarreraTotal;
 
-                st.acc_cambioSentidoTotal += diff15(cambioSentidoTotal_clean, st.last_cambioSentidoTotal);
-                st.last_cambioSentidoTotal = cambioSentidoTotal_clean;
+                st.acc_cambioSentido += diff_counter_robust(cambioSentido, st.last_cambioSentido);
+                st.last_cambioSentido = cambioSentido;
 
-                st.acc_cantidad += diff15(cantidad_clean, st.last_cantidad);
-                st.last_cantidad = cantidad_clean;
+                st.acc_cambioSentidoTotal += diff_counter_robust(cambioSentidoTotal, st.last_cambioSentidoTotal);
+                st.last_cambioSentidoTotal = cambioSentidoTotal;
 
-                st.acc_cantidad_total += diff15(cantidad_total_clean, st.last_cantidad_total);
-                st.last_cantidad_total = cantidad_total_clean;
+                st.acc_cantidad += diff_counter_robust(cantidad, st.last_cantidad);
+                st.last_cantidad = cantidad;
 
-                st.acc_paradas_1 += diff15(paradas_1_clean, st.last_paradas_1);
-                st.last_paradas_1 = paradas_1_clean;
+                st.acc_cantidad_total += diff_counter_robust(cantidad_total, st.last_cantidad_total);
+                st.last_cantidad_total = cantidad_total;
 
-                st.acc_paradas_2 += diff15(paradas_2_clean, st.last_paradas_2);
-                st.last_paradas_2 = paradas_2_clean;
+                st.acc_paradas_1 += diff_counter_robust(paradas_1, st.last_paradas_1);
+                st.last_paradas_1 = paradas_1;
 
-                // timer1Hz is 16-bit counter
-                uint16_t delta_timer = diff16(timer1Hz_clean, st.last_timer1Hz);
+                st.acc_paradas_2 += diff_counter_robust(paradas_2, st.last_paradas_2);
+                st.last_paradas_2 = paradas_2;
+
+                // timer1Hz is a timer (counts seconds)
+                uint16_t delta_timer = diff_timer(timer1Hz, st.last_timer1Hz);
                 st.acc_timer1Hz += delta_timer;
-                st.acc_tiempo_operacion_s += delta_timer; // timer1Hz counts seconds
-                st.last_timer1Hz = timer1Hz_clean;
+                st.acc_tiempo_operacion_s += delta_timer;
+                st.last_timer1Hz = timer1Hz;
             }
 
             // Copy out accumulated values
@@ -1651,7 +1482,6 @@ public:
             acc_cantidad_total_out = st.acc_cantidad_total;
             acc_paradas_1_out = st.acc_paradas_1;
             acc_paradas_2_out = st.acc_paradas_2;
-            acc_timer1Hz_out = st.acc_timer1Hz;
             acc_tiempo_operacion_s_out = st.acc_tiempo_operacion_s;
         }
 
@@ -1664,57 +1494,52 @@ public:
         prod["checksum"] = checksum;
 
         // Bancalinos fields
-        prod["bancalinos0_instantaneo"] = bancalinos0_clean;
+        prod["bancalinos0_instantaneo"] = bancalinos0;
         prod["bancalinos0_turno"] = acc_bancalinos0_out;
 
-        prod["bancalinos1_instantaneo"] = bancalinos1_clean;
+        prod["bancalinos1_instantaneo"] = bancalinos1;
         prod["bancalinos1_turno"] = acc_bancalinos1_out;
 
-        prod["bancalinosComb1_instantaneo"] = bancalinosComb1_clean;
+        prod["bancalinosComb1_instantaneo"] = bancalinosComb1;
         prod["bancalinosComb1_turno"] = acc_bancalinosComb1_out;
 
-        prod["bancalinosComb2_instantaneo"] = bancalinosComb2_clean;
+        prod["bancalinosComb2_instantaneo"] = bancalinosComb2;
         prod["bancalinosComb2_turno"] = acc_bancalinosComb2_out;
 
         prod["bancalinosTotal_raw"] = bancalinosTotal_raw;
         prod["bancalinosTotal_turno"] = acc_bancalinosTotal_out;
-        prod["bit15_corruption_bancalinosTotal"] = corr_bancalinosTotal;
 
         // CambioBarrera fields
-        prod["cambioBarrera_instantaneo"] = cambioBarrera_clean;
+        prod["cambioBarrera_instantaneo"] = cambioBarrera;
         prod["cambioBarrera_turno"] = acc_cambioBarrera_out;
 
         prod["cambioBarreraTotal_raw"] = cambioBarreraTotal_raw;
         prod["cambioBarreraTotal_turno"] = acc_cambioBarreraTotal_out;
-        prod["bit15_corruption_cambioBarreraTotal"] = corr_cambioBarreraTotal;
 
         // CambioSentido fields
-        prod["cambioSentido_instantaneo"] = cambioSentido_clean;
+        prod["cambioSentido_instantaneo"] = cambioSentido;
         prod["cambioSentido_turno"] = acc_cambioSentido_out;
 
         prod["cambioSentidoTotal_raw"] = cambioSentidoTotal_raw;
         prod["cambioSentidoTotal_turno"] = acc_cambioSentidoTotal_out;
-        prod["bit15_corruption_cambioSentidoTotal"] = corr_cambioSentidoTotal;
 
         // Cantidad fields
-        prod["cantidad_instantanea"] = cantidad_clean;
+        prod["cantidad_instantanea"] = cantidad;
         prod["cantidad_raw"] = cantidad_raw;
         prod["cantidad_produccion_turno"] = acc_cantidad_out;
-        prod["bit15_corruption_cantidad"] = corr_cantidad;
 
         prod["cantidad_total_raw"] = cantidad_total_raw;
         prod["cantidad_total_turno"] = acc_cantidad_total_out;
-        prod["bit15_corruption_cantidad_total"] = corr_cantidad_total;
 
         // Paradas fields
-        prod["paradas_1_instantaneo"] = paradas_1_clean;
+        prod["paradas_1_instantaneo"] = paradas_1;
         prod["paradas_1_turno"] = acc_paradas_1_out;
 
-        prod["paradas_2_instantaneo"] = paradas_2_clean;
+        prod["paradas_2_instantaneo"] = paradas_2;
         prod["paradas_2_turno"] = acc_paradas_2_out;
 
         // Timer fields
-        prod["timer1Hz_instantaneo"] = timer1Hz_clean;
+        prod["timer1Hz_instantaneo"] = timer1Hz;
         prod["tiempo_operacion_turno_s"] = acc_tiempo_operacion_s_out;
 
         prod["timestamp_device"] = iso8601_utc_now();
