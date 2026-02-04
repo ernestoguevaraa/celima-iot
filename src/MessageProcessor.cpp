@@ -23,73 +23,66 @@ bool detect_global_shift_change(int currentShift)
 }
 
 /**
- * Calculate counter delta with PLC bit-15 glitch handling.
+ * Calculate counter delta with PLC-compatible validation.
  *
- * The PLC has a bug where it alternates between two counter banks
- * that differ by exactly 32768. This function detects and handles
- * those glitches while preserving real counter increments.
+ * Based on PLC ladder analysis (Update_Qt_Ciclo function block):
+ * - Counters are 16-bit (0-65535) with standard rollover
+ * - PLC validates deltas using TST/TSTN on bit 15
+ * - If bit 15 is SET in delta (value >= 32768) → invalid/overflow
+ * - Additional sanity checks: Dados_Metricas uses <= 4000, Dados_Tempos uses <= 1200
  *
- * Messages arrive every ~3 minutes.
- * Expected increment: 0-20,000 units per 3 minutes
+ * PLC Register Semantics (from ladder analysis):
+ * - D29005 = PISADAS (press strokes), NOT products directly
+ * - D29006 = Metric time accumulator in DECISECONDS (0.1s)
+ * - D29003 = Parada COUNT (stop events)
+ * - D29004 = Parada TIME in SECONDS
  *
- * @param curr Current counter value (full 16-bit)
- * @param prev Previous counter value (full 16-bit, from ~3 minutes ago)
- * @return Delta to accumulate (0 if pure glitch detected)
+ * @param curr Current counter value (16-bit)
+ * @param prev Previous counter value (16-bit)
+ * @param max_valid Maximum valid delta (default 20000, conservative for ~3 min intervals)
+ * @return Delta to accumulate (0 if invalid)
  */
-static uint16_t diff_counter_robust(uint16_t curr, uint16_t prev) {
-    int raw_diff = static_cast<int>(curr) - static_cast<int>(prev);
-
-    // Detect ±32768 glitch with tolerance for simultaneous real increment
-    // Glitch is almost exactly ±32768, allow ±100 variance
-    int deviation_plus = abs(raw_diff - 32768);
-    int deviation_minus = abs(raw_diff + 32768);
-
-    // Case 1: +32768 glitch detected
-    if (deviation_plus < 100) {
-        // Extract the small real increment during the glitch
-        int real_increment = raw_diff - 32768;
-        if (real_increment >= 0 && real_increment <= 20000) {
-            return static_cast<uint16_t>(real_increment);
-        }
-        return 0;
+static uint16_t diff_counter(uint16_t curr, uint16_t prev, uint16_t max_valid = 20000) {
+    // Standard 16-bit rollover-aware subtraction
+    uint16_t delta;
+    if (curr >= prev) {
+        delta = curr - prev;
+    } else {
+        // Rollover occurred: curr wrapped past 65535
+        delta = static_cast<uint16_t>(65536 - prev + curr);
     }
-
-    // Case 2: -32768 glitch detected
-    if (deviation_minus < 100) {
-        // Extract the small real increment during the glitch
-        int real_increment = raw_diff + 32768;
-        if (real_increment >= 0 && real_increment <= 20000) {
-            return static_cast<uint16_t>(real_increment);
-        }
-        return 0;
+    
+    // PLC validation: bit 15 must NOT be set (delta < 32768)
+    // This matches TSTN(delta, &15) in the PLC Update_Qt_Ciclo function
+    if (delta >= 32768) {
+        return 0;  // Invalid - likely corruption or counter reset
     }
-
-    // Case 3: Normal forward increment (0 to 20,000 units in 3 minutes)
-    if (raw_diff >= 0 && raw_diff <= 20000) {
-        return static_cast<uint16_t>(raw_diff);
+    
+    // Sanity check: delta should be reasonable for message interval
+    // PLC uses stricter limits (4000 for metrics, 1200 for times)
+    // We use 20000 as a safe upper bound for ~3 minute intervals
+    if (delta > max_valid) {
+        return 0;  // Suspicious jump - ignore
     }
-
-    // Case 4: Counter rollover at 65536
-    // Valid only if resulting delta is reasonable
-    if (raw_diff < -45000) {
-        uint16_t rollover_delta = static_cast<uint16_t>(65536 + raw_diff);
-        if (rollover_delta <= 20000) {
-            return rollover_delta;
-        }
-    }
-
-    // Case 5: Large unexpected jump - likely corruption or reset
-    // Conservative: ignore and log for debugging
-    return 0;
+    
+    return delta;
 }
 
 /**
- * Timer delta calculation (for fields without glitch issue)
+ * Timer delta calculation for time accumulators.
+ * 
+ * Timers don't have the bit-15 validity issue since they increment
+ * monotonically with time. Just handle 16-bit rollover.
+ *
+ * @param curr Current timer value (16-bit)
+ * @param prev Previous timer value (16-bit)
+ * @return Delta in timer units
  */
 static uint16_t diff_timer(uint16_t curr, uint16_t prev) {
     if (curr >= prev) {
         return curr - prev;
     } else {
+        // Rollover at 65536
         return static_cast<uint16_t>(65536 - prev + curr);
     }
 }
@@ -119,13 +112,13 @@ public:
         if (auto dt = jsonu::get_opt<int>(msg, "deviceType"))
             out["deviceType"] = *dt;
 
-        // Example: publish to a “production” topic
+        // Example: publish to a "production" topic
         auto t1 = isa95_prefix + "/production/line/quantity";
         json p1;
         p1["quantity"] = jsonu::get_opt<int>(msg, "cantidad").value_or(0);
         p1["ts"] = std::time(nullptr);
 
-        // Example: publish to a “quality/alarms” topic
+        // Example: publish to a "quality/alarms" topic
         auto t2 = isa95_prefix + "/quality/alarms";
         json p2;
         p2["alarms"] = jsonu::get_opt<int>(msg, "alarms").value_or(0);
@@ -265,37 +258,45 @@ void CalidadProcessor::reset_states() {
 }
 
 // ============================================================================
-// PrensaHidraulica1Processor - Enhanced with Monotonic Accumulators
+// PrensaHidraulica1Processor - Fixed with correct counter handling
 // ============================================================================
-
+/**
+ * PLC Register Mapping (from salida_prensa_1.pdf Sección12):
+ * 
+ * Input fields (from decoder, TODO: update decoder field names):
+ * - "cantidadProductos" = D29005 = PISADAS (press stroke count, NOT products!)
+ * - "tiempoProduccion_ds" = D29006 = Metric time accumulator (DECISECONDS)
+ * - "paradas" = D29003 = Stop event COUNT
+ * - "tiempoParadas_s" = D29004 = Stop duration (SECONDS)
+ * - "alarms" = D29002 = Status Lento (status bits)
+ * 
+ * The PLC calculates: Products = PISADAS × Fila × Pac
+ * We apply: Products = PISADAS × factor_pisadas (per line)
+ */
 class PrensaHidraulica1Processor : public IMessageProcessor
 {
     struct PH1State {
         bool initialized = false;
         int  shift       = -1;
 
-        // All counters are 16-bit (no masking)
-        uint16_t last_contador = 0;
+        // Counters are 16-bit with bit-15 validation
+        uint16_t last_pisadas = 0;        // D29005 - PISADAS (press strokes)
         uint32_t acc_pisadas = 0;
 
-        uint16_t last_raw_prod_time = 0;
-        double   acc_prod_time_s = 0.0;
+        uint16_t last_metrica_tiempo = 0; // D29006 - Metric time (deciseconds)
+        double   acc_metrica_tiempo_s = 0.0;
 
-        uint16_t last_paradas = 0;
-        uint32_t acc_paradas = 0;
+        uint16_t last_paradas_count = 0;  // D29003 - Stop count
+        uint32_t acc_paradas_count = 0;
 
-        uint16_t last_tiempo_paradas = 0;
-        uint32_t acc_tiempo_paradas_s = 0;
+        uint16_t last_paradas_tiempo = 0; // D29004 - Stop time (seconds)
+        uint32_t acc_paradas_tiempo_s = 0;
     };
 
     static std::mutex mtx_;
     static std::unordered_map<int, PH1State> states_;
 
 public:
-    /**
-     * Reset all accumulated states across all lines
-     * Useful for testing or manual reset operations
-     */
     static void reset_states() {
         std::lock_guard<std::mutex> lock(mtx_);
         states_.clear();
@@ -307,25 +308,35 @@ public:
         auto sh = current_shift_localtime();
         int shiftNum = (sh == Shift::S1 ? 1 : (sh == Shift::S2 ? 2 : 3));
 
-        // Read inputs - NO MASKING
+        // Read inputs from decoder
+        // NOTE: Field names will change when decoder is updated
+        // Current: cantidadProductos → Should be: pisadas
         int line          = jsonu::get_opt<int>(msg, "lineID").value_or(0);
         int alarms        = jsonu::get_opt<int>(msg, "alarms").value_or(0);
-        int raw_count     = jsonu::get_opt<int>(msg, "cantidadProductos").value_or(0);
-        int raw_time      = jsonu::get_opt<int>(msg, "tiempoProduccion_ds").value_or(0);
+        
+        // D29005 - PISADAS (decoder currently calls this "cantidadProductos")
+        int raw_pisadas   = jsonu::get_opt<int>(msg, "cantidadProductos").value_or(0);
+        
+        // D29006 - Metric time in deciseconds
+        int raw_tiempo    = jsonu::get_opt<int>(msg, "tiempoProduccion_ds").value_or(0);
+        
+        // D29003 - Stop count
         int raw_paradas   = jsonu::get_opt<int>(msg, "paradas").value_or(0);
+        
+        // D29004 - Stop time in seconds
         int raw_tiempo_paradas = jsonu::get_opt<int>(msg, "tiempoParadas_s").value_or(0);
 
-        // Cast to uint16_t (full 16-bit, no masking)
-        uint16_t contador = static_cast<uint16_t>(raw_count);
-        uint16_t time_val = static_cast<uint16_t>(raw_time);
-        uint16_t paradas = static_cast<uint16_t>(raw_paradas);
-        uint16_t tiempo_paradas = static_cast<uint16_t>(raw_tiempo_paradas);
+        // Cast to uint16_t
+        uint16_t pisadas = static_cast<uint16_t>(raw_pisadas);
+        uint16_t metrica_tiempo = static_cast<uint16_t>(raw_tiempo);
+        uint16_t paradas_count = static_cast<uint16_t>(raw_paradas);
+        uint16_t paradas_tiempo = static_cast<uint16_t>(raw_tiempo_paradas);
 
         // Output accumulators
         uint32_t acc_pisadas_out = 0;
-        double   acc_prod_time_s_out = 0.0;
-        uint32_t acc_paradas_out = 0;
-        uint32_t acc_tiempo_paradas_s_out = 0;
+        double   acc_metrica_tiempo_s_out = 0.0;
+        uint32_t acc_paradas_count_out = 0;
+        uint32_t acc_paradas_tiempo_s_out = 0;
         double   pisadas_min = 0.0;
 
         {
@@ -337,72 +348,59 @@ public:
                 st = PH1State();
                 st.initialized = true;
                 st.shift = shiftNum;
-                st.last_contador = contador;
-                st.last_raw_prod_time = time_val;
-                st.last_paradas = paradas;
-                st.last_tiempo_paradas = tiempo_paradas;
+                st.last_pisadas = pisadas;
+                st.last_metrica_tiempo = metrica_tiempo;
+                st.last_paradas_count = paradas_count;
+                st.last_paradas_tiempo = paradas_tiempo;
             }
             else {
-                // Accumulate deltas
+                // Accumulate deltas using PLC-compatible validation
 
-                // Counters (use robust glitch detection)
-                uint16_t delta_count = diff_counter_robust(contador, st.last_contador);
-                st.acc_pisadas += delta_count;
-                st.last_contador = contador;
+                // D29005 - PISADAS counter (use diff_counter with bit-15 validation)
+                uint16_t delta_pisadas = diff_counter(pisadas, st.last_pisadas);
+                st.acc_pisadas += delta_pisadas;
+                st.last_pisadas = pisadas;
 
-                // Timer (no glitch, use normal diff)
-                uint16_t delta_time = diff_timer(time_val, st.last_raw_prod_time);
-                st.acc_prod_time_s += delta_time * 0.1;
-                st.last_raw_prod_time = time_val;
+                // D29006 - Metric time is a timer (deciseconds → seconds)
+                uint16_t delta_tiempo = diff_timer(metrica_tiempo, st.last_metrica_tiempo);
+                st.acc_metrica_tiempo_s += delta_tiempo * 0.1;
+                st.last_metrica_tiempo = metrica_tiempo;
 
-                // Counters (use robust glitch detection)
-                uint16_t delta_paradas = diff_counter_robust(paradas, st.last_paradas);
-                st.acc_paradas += delta_paradas;
-                st.last_paradas = paradas;
+                // D29003 - Stop count counter
+                uint16_t delta_paradas = diff_counter(paradas_count, st.last_paradas_count);
+                st.acc_paradas_count += delta_paradas;
+                st.last_paradas_count = paradas_count;
 
-                // Counters (use robust glitch detection)
-                uint16_t delta_tiempo = diff_counter_robust(tiempo_paradas, st.last_tiempo_paradas);
-                st.acc_tiempo_paradas_s += delta_tiempo;
-                st.last_tiempo_paradas = tiempo_paradas;
+                // D29004 - Stop time counter (seconds)
+                uint16_t delta_tiempo_paradas = diff_counter(paradas_tiempo, st.last_paradas_tiempo);
+                st.acc_paradas_tiempo_s += delta_tiempo_paradas;
+                st.last_paradas_tiempo = paradas_tiempo;
             }
 
             // Copy out accumulated values
             acc_pisadas_out = st.acc_pisadas;
-            acc_prod_time_s_out = st.acc_prod_time_s;
-            acc_paradas_out = st.acc_paradas;
-            acc_tiempo_paradas_s_out = st.acc_tiempo_paradas_s;
+            acc_metrica_tiempo_s_out = st.acc_metrica_tiempo_s;
+            acc_paradas_count_out = st.acc_paradas_count;
+            acc_paradas_tiempo_s_out = st.acc_paradas_tiempo_s;
 
             // Calculate rate (pisadas per minute)
-            if (acc_prod_time_s_out > 1.0) {
-                pisadas_min = acc_pisadas_out / (acc_prod_time_s_out / 60.0);
+            if (acc_metrica_tiempo_s_out > 1.0) {
+                pisadas_min = acc_pisadas_out / (acc_metrica_tiempo_s_out / 60.0);
             }
         }
 
-        // Build output JSON
-
-        //Calcular facto de pisadas
+        // Calculate products from pisadas using line-specific factor
         int factor_pisadas;
         switch (line) {
-            case 1:
-                factor_pisadas = L1_PIEZAS_PISADA;
-                break;
-            case 2:
-                factor_pisadas = L2_PIEZAS_PISADA;
-                break;
-            case 3:
-                factor_pisadas = L3_PIEZAS_PISADA;
-                break;
-            case 4:
-                factor_pisadas = L4_PIEZAS_PISADA;
-                break;
-            case 5:
-                factor_pisadas = L5_PIEZAS_PISADA;
-                break;
-            default:
-                factor_pisadas = 3; // Valor por defecto si la línea no es reconocida
-                break;
+            case 1: factor_pisadas = L1_PIEZAS_PISADA; break;
+            case 2: factor_pisadas = L2_PIEZAS_PISADA; break;
+            case 3: factor_pisadas = L3_PIEZAS_PISADA; break;
+            case 4: factor_pisadas = L4_PIEZAS_PISADA; break;
+            case 5: factor_pisadas = L5_PIEZAS_PISADA; break;
+            default: factor_pisadas = 3; break;
         }
 
+        // Build output JSON
         json qual;
         qual["alarms"] = alarms;
         qual["timestamp_device"] = iso8601_utc_now();
@@ -411,27 +409,26 @@ public:
         prod["maquina_id"] = 1;
         prod["turno"] = shiftNum;
 
-        // Pisadas (primary counter)
-        prod["cantidadProductos_raw"] = raw_count;
-        prod["cantidadProductos_instantaneo"] = contador;
-
-        prod["cantidadPisadas_turno"] = acc_pisadas_out;
+        // Pisadas (primary counter from D29005)
+        prod["cantidadProductos_raw"] = raw_pisadas;         // Raw value for debugging
+        prod["cantidadProductos_instantaneo"] = pisadas;     // Current instantaneous
+        prod["cantidadPisadas_turno"] = acc_pisadas_out;     // Accumulated pisadas
         prod["cantidadPisadas_min"] = static_cast<uint32_t>(pisadas_min);
-        prod["cantidadProductos_turno"] = acc_pisadas_out * factor_pisadas;
+        prod["cantidadProductos_turno"] = acc_pisadas_out * factor_pisadas;  // Calculated products
 
-        // Production time
-        prod["tiempoProduccion_ds_instantaneo"] = time_val;
-        prod["tiempoProduccion_turno_s"] = static_cast<uint32_t>(acc_prod_time_s_out);
+        // Production time (from D29006 - deciseconds converted to seconds)
+        prod["tiempoProduccion_ds_instantaneo"] = metrica_tiempo;
+        prod["tiempoProduccion_turno_s"] = static_cast<uint32_t>(acc_metrica_tiempo_s_out);
 
-        // Paradas (stops)
+        // Paradas count (from D29003)
         prod["paradas_raw"] = raw_paradas;
-        prod["paradas_instantaneo"] = paradas;
-        prod["paradas_turno"] = acc_paradas_out;
+        prod["paradas_instantaneo"] = paradas_count;
+        prod["paradas_turno"] = acc_paradas_count_out;
 
-        // Tiempo paradas (stop time)
+        // Paradas time (from D29004 - already in seconds)
         prod["tiempoParadas_raw"] = raw_tiempo_paradas;
-        prod["tiempoParadas_instantaneo"] = tiempo_paradas;
-        prod["tiempoParadas_turno_s"] = acc_tiempo_paradas_s_out;
+        prod["tiempoParadas_instantaneo"] = paradas_tiempo;
+        prod["tiempoParadas_turno_s"] = acc_paradas_tiempo_s_out;
 
         prod["timestamp_device"] = iso8601_utc_now();
 
@@ -448,7 +445,7 @@ std::unordered_map<int, PrensaHidraulica1Processor::PH1State>
     PrensaHidraulica1Processor::states_;
 
 // ============================================================================
-// PrensaHidraulica2Processor - Enhanced with Monotonic Accumulators
+// PrensaHidraulica2Processor - Fixed with correct counter handling
 // ============================================================================
 
 class PrensaHidraulica2Processor : public IMessageProcessor
@@ -457,28 +454,23 @@ class PrensaHidraulica2Processor : public IMessageProcessor
         bool initialized = false;
         int  shift       = -1;
 
-        // All counters are 16-bit (no masking)
-        uint16_t last_contador = 0;
+        uint16_t last_pisadas = 0;
         uint32_t acc_pisadas = 0;
 
-        uint16_t last_raw_prod_time = 0;
-        double   acc_prod_time_s = 0.0;
+        uint16_t last_metrica_tiempo = 0;
+        double   acc_metrica_tiempo_s = 0.0;
 
-        uint16_t last_paradas = 0;
-        uint32_t acc_paradas = 0;
+        uint16_t last_paradas_count = 0;
+        uint32_t acc_paradas_count = 0;
 
-        uint16_t last_tiempo_paradas = 0;
-        uint32_t acc_tiempo_paradas_s = 0;
+        uint16_t last_paradas_tiempo = 0;
+        uint32_t acc_paradas_tiempo_s = 0;
     };
 
     static std::mutex mtx_;
     static std::unordered_map<int, PH2State> states_;
 
 public:
-    /**
-     * Reset all accumulated states across all lines
-     * Useful for testing or manual reset operations
-     */
     static void reset_states() {
         std::lock_guard<std::mutex> lock(mtx_);
         states_.clear();
@@ -490,25 +482,22 @@ public:
         auto sh = current_shift_localtime();
         int shiftNum = (sh == Shift::S1 ? 1 : (sh == Shift::S2 ? 2 : 3));
 
-        // Read inputs - NO MASKING
         int line          = jsonu::get_opt<int>(msg, "lineID").value_or(0);
         int alarms        = jsonu::get_opt<int>(msg, "alarms").value_or(0);
-        int raw_count     = jsonu::get_opt<int>(msg, "cantidadProductos").value_or(0);
-        int raw_time      = jsonu::get_opt<int>(msg, "tiempoProduccion_ds").value_or(0);
+        int raw_pisadas   = jsonu::get_opt<int>(msg, "cantidadProductos").value_or(0);
+        int raw_tiempo    = jsonu::get_opt<int>(msg, "tiempoProduccion_ds").value_or(0);
         int raw_paradas   = jsonu::get_opt<int>(msg, "paradas").value_or(0);
         int raw_tiempo_paradas = jsonu::get_opt<int>(msg, "tiempoParadas_s").value_or(0);
 
-        // Cast to uint16_t (full 16-bit, no masking)
-        uint16_t contador = static_cast<uint16_t>(raw_count);
-        uint16_t time_val = static_cast<uint16_t>(raw_time);
-        uint16_t paradas = static_cast<uint16_t>(raw_paradas);
-        uint16_t tiempo_paradas = static_cast<uint16_t>(raw_tiempo_paradas);
+        uint16_t pisadas = static_cast<uint16_t>(raw_pisadas);
+        uint16_t metrica_tiempo = static_cast<uint16_t>(raw_tiempo);
+        uint16_t paradas_count = static_cast<uint16_t>(raw_paradas);
+        uint16_t paradas_tiempo = static_cast<uint16_t>(raw_tiempo_paradas);
 
-        // Output accumulators
         uint32_t acc_pisadas_out = 0;
-        double   acc_prod_time_s_out = 0.0;
-        uint32_t acc_paradas_out = 0;
-        uint32_t acc_tiempo_paradas_s_out = 0;
+        double   acc_metrica_tiempo_s_out = 0.0;
+        uint32_t acc_paradas_count_out = 0;
+        uint32_t acc_paradas_tiempo_s_out = 0;
         double   pisadas_min = 0.0;
 
         {
@@ -516,73 +505,51 @@ public:
             PH2State &st = states_[line];
 
             if (!st.initialized || st.shift != shiftNum) {
-                // New shift - initialize
                 st = PH2State();
                 st.initialized = true;
                 st.shift = shiftNum;
-                st.last_contador = contador;
-                st.last_raw_prod_time = time_val;
-                st.last_paradas = paradas;
-                st.last_tiempo_paradas = tiempo_paradas;
+                st.last_pisadas = pisadas;
+                st.last_metrica_tiempo = metrica_tiempo;
+                st.last_paradas_count = paradas_count;
+                st.last_paradas_tiempo = paradas_tiempo;
             }
             else {
-                // Accumulate deltas
+                // Use PLC-compatible counter validation
+                uint16_t delta_pisadas = diff_counter(pisadas, st.last_pisadas);
+                st.acc_pisadas += delta_pisadas;
+                st.last_pisadas = pisadas;
 
-                // Counters (use robust glitch detection)
-                uint16_t delta_count = diff_counter_robust(contador, st.last_contador);
-                st.acc_pisadas += delta_count;
-                st.last_contador = contador;
+                uint16_t delta_tiempo = diff_timer(metrica_tiempo, st.last_metrica_tiempo);
+                st.acc_metrica_tiempo_s += delta_tiempo * 0.1;
+                st.last_metrica_tiempo = metrica_tiempo;
 
-                // Timer (no glitch, use normal diff)
-                uint16_t delta_time = diff_timer(time_val, st.last_raw_prod_time);
-                st.acc_prod_time_s += delta_time * 0.1;
-                st.last_raw_prod_time = time_val;
+                uint16_t delta_paradas = diff_counter(paradas_count, st.last_paradas_count);
+                st.acc_paradas_count += delta_paradas;
+                st.last_paradas_count = paradas_count;
 
-                // Counters (use robust glitch detection)
-                uint16_t delta_paradas = diff_counter_robust(paradas, st.last_paradas);
-                st.acc_paradas += delta_paradas;
-                st.last_paradas = paradas;
-
-                // Counters (use robust glitch detection)
-                uint16_t delta_tiempo = diff_counter_robust(tiempo_paradas, st.last_tiempo_paradas);
-                st.acc_tiempo_paradas_s += delta_tiempo;
-                st.last_tiempo_paradas = tiempo_paradas;
+                uint16_t delta_tiempo_paradas = diff_counter(paradas_tiempo, st.last_paradas_tiempo);
+                st.acc_paradas_tiempo_s += delta_tiempo_paradas;
+                st.last_paradas_tiempo = paradas_tiempo;
             }
 
-            // Copy out accumulated values
             acc_pisadas_out = st.acc_pisadas;
-            acc_prod_time_s_out = st.acc_prod_time_s;
-            acc_paradas_out = st.acc_paradas;
-            acc_tiempo_paradas_s_out = st.acc_tiempo_paradas_s;
+            acc_metrica_tiempo_s_out = st.acc_metrica_tiempo_s;
+            acc_paradas_count_out = st.acc_paradas_count;
+            acc_paradas_tiempo_s_out = st.acc_paradas_tiempo_s;
 
-            // Calculate rate (pisadas per minute)
-            if (acc_prod_time_s_out > 1.0) {
-                pisadas_min = acc_pisadas_out / (acc_prod_time_s_out / 60.0);
+            if (acc_metrica_tiempo_s_out > 1.0) {
+                pisadas_min = acc_pisadas_out / (acc_metrica_tiempo_s_out / 60.0);
             }
         }
 
-        // Build output JSON
-               //Calcular facto de pisadas
         int factor_pisadas;
         switch (line) {
-            case 1:
-                factor_pisadas = L1_PIEZAS_PISADA;
-                break;
-            case 2:
-                factor_pisadas = L2_PIEZAS_PISADA;
-                break;
-            case 3:
-                factor_pisadas = L3_PIEZAS_PISADA;
-                break;
-            case 4:
-                factor_pisadas = L4_PIEZAS_PISADA;
-                break;
-            case 5:
-                factor_pisadas = L5_PIEZAS_PISADA;
-                break;
-            default:
-                factor_pisadas = 3; // Valor por defecto si la línea no es reconocida
-                break;
+            case 1: factor_pisadas = L1_PIEZAS_PISADA; break;
+            case 2: factor_pisadas = L2_PIEZAS_PISADA; break;
+            case 3: factor_pisadas = L3_PIEZAS_PISADA; break;
+            case 4: factor_pisadas = L4_PIEZAS_PISADA; break;
+            case 5: factor_pisadas = L5_PIEZAS_PISADA; break;
+            default: factor_pisadas = 3; break;
         }
 
         json qual;
@@ -590,30 +557,25 @@ public:
         qual["timestamp_device"] = iso8601_utc_now();
 
         json prod;
-        prod["maquina_id"] = 2;  // Machine ID 2 for Prensa Hidraulica 2
+        prod["maquina_id"] = 2;
         prod["turno"] = shiftNum;
 
-        // Pisadas (primary counter)
-        prod["cantidadProductos_raw"] = raw_count;
-        prod["cantidadProductos_instantaneo"] = contador;
-
+        prod["cantidadProductos_raw"] = raw_pisadas;
+        prod["cantidadProductos_instantaneo"] = pisadas;
         prod["cantidadPisadas_turno"] = acc_pisadas_out;
         prod["cantidadPisadas_min"] = static_cast<uint32_t>(pisadas_min);
         prod["cantidadProductos_turno"] = acc_pisadas_out * factor_pisadas;
 
-        // Production time
-        prod["tiempoProduccion_ds_instantaneo"] = time_val;
-        prod["tiempoProduccion_turno_s"] = static_cast<uint32_t>(acc_prod_time_s_out);
+        prod["tiempoProduccion_ds_instantaneo"] = metrica_tiempo;
+        prod["tiempoProduccion_turno_s"] = static_cast<uint32_t>(acc_metrica_tiempo_s_out);
 
-        // Paradas (stops)
         prod["paradas_raw"] = raw_paradas;
-        prod["paradas_instantaneo"] = paradas;
-        prod["paradas_turno"] = acc_paradas_out;
+        prod["paradas_instantaneo"] = paradas_count;
+        prod["paradas_turno"] = acc_paradas_count_out;
 
-        // Tiempo paradas (stop time)
         prod["tiempoParadas_raw"] = raw_tiempo_paradas;
-        prod["tiempoParadas_instantaneo"] = tiempo_paradas;
-        prod["tiempoParadas_turno_s"] = acc_tiempo_paradas_s_out;
+        prod["tiempoParadas_instantaneo"] = paradas_tiempo;
+        prod["tiempoParadas_turno_s"] = acc_paradas_tiempo_s_out;
 
         prod["timestamp_device"] = iso8601_utc_now();
 
@@ -629,6 +591,10 @@ std::mutex PrensaHidraulica2Processor::mtx_;
 std::unordered_map<int, PrensaHidraulica2Processor::PH2State>
     PrensaHidraulica2Processor::states_;
 
+// ============================================================================
+// EntradaSecadorProcessor - Fixed with correct counter handling
+// ============================================================================
+
 class EntradaSecadorProcessor : public IMessageProcessor
 {
     struct State {
@@ -639,31 +605,29 @@ class EntradaSecadorProcessor : public IMessageProcessor
         uint32_t acc_arranques  = 0;
 
         uint16_t last_t_operacion = 0;
-        uint32_t acc_t_operacion_s = 0;  // tiempoOperacion viene en segundos
+        uint32_t acc_t_operacion_s = 0;
     };
 
     static std::mutex mtx_;
     static std::unordered_map<int, State> states_;
 
 public:
-static void reset_states();
+    static void reset_states();
+    
     std::vector<Publication> process(const json &msg,
                                      const std::string &isa95_prefix) override
     {
-        // ---- Determine shift ----
         auto sh = current_shift_localtime();
         int shiftNum = (sh == Shift::S1 ? 1 : (sh == Shift::S2 ? 2 : 3));
 
         int lineID        = msg.value("lineID", 0);
         int alarms        = msg.value("alarms", 0);
-
         int arr_in        = msg.value("arranques", 0);
         int t_oper_s_in   = msg.value("tiempoOperacion_s", 0);
 
         uint32_t out_arranques = 0;
         uint32_t out_t_oper    = 0;
 
-        // Cast to uint16_t (full 16-bit, no masking)
         uint16_t raw_arr    = static_cast<uint16_t>(arr_in);
         uint16_t raw_t_oper = static_cast<uint16_t>(t_oper_s_in);
 
@@ -675,17 +639,15 @@ static void reset_states();
                 st = State();
                 st.initialized     = true;
                 st.shift           = shiftNum;
-
                 st.last_arranques     = raw_arr;
                 st.last_t_operacion   = raw_t_oper;
             }
             else {
-                // Accumulate deltas using robust glitch detection
-                st.acc_arranques += diff_counter_robust(raw_arr, st.last_arranques);
+                // Use PLC-compatible counter validation
+                st.acc_arranques += diff_counter(raw_arr, st.last_arranques);
                 st.last_arranques = raw_arr;
 
-                // tiempo de operación en segundos
-                st.acc_t_operacion_s += diff_counter_robust(raw_t_oper, st.last_t_operacion);
+                st.acc_t_operacion_s += diff_counter(raw_t_oper, st.last_t_operacion);
                 st.last_t_operacion = raw_t_oper;
             }
 
@@ -693,7 +655,6 @@ static void reset_states();
             out_t_oper    = st.acc_t_operacion_s;
         }
 
-        // ---- Build outputs ----
         json j_alarms;
         j_alarms["alarms"] = alarms;
         j_alarms["ts"] = iso8601_utc_now();
@@ -716,12 +677,15 @@ std::mutex EntradaSecadorProcessor::mtx_;
 std::unordered_map<int, EntradaSecadorProcessor::State>
     EntradaSecadorProcessor::states_;
 
-
 void EntradaSecadorProcessor::reset_states()
 {
     std::lock_guard<std::mutex> lk(mtx_);
     states_.clear();
 }
+
+// ============================================================================
+// SalidaSecadorProcessor - Fixed with correct counter handling
+// ============================================================================
 
 class SalidaSecadorProcessor : public IMessageProcessor
 {
@@ -729,7 +693,6 @@ class SalidaSecadorProcessor : public IMessageProcessor
         bool initialized = false;
         int  shift       = -1;
 
-        // All counters are 16-bit (no masking)
         uint16_t last_prod_q = 0;
         uint32_t acc_prod_q = 0;
 
@@ -747,15 +710,14 @@ class SalidaSecadorProcessor : public IMessageProcessor
     static std::unordered_map<int, State> states_;
 
 public:
-static void reset_states();
+    static void reset_states();
+    
     std::vector<Publication> process(const json &msg,
                                      const std::string &isa95_prefix) override
     {
-        // ---- Current shift ----
         auto sh       = current_shift_localtime();
         int  shiftNum = (sh == Shift::S1 ? 1 : (sh == Shift::S2 ? 2 : 3));
 
-        // ---- Read fields - NO MASKING ----
         int alarms = jsonu::get_opt<int>(msg, "alarms").value_or(0);
         int prod_q_raw = jsonu::get_opt<int>(msg, "cantidadProductos").value_or(0);
         int prod_t_raw = jsonu::get_opt<int>(msg, "tiempoProduccion_ds").value_or(0);
@@ -763,13 +725,11 @@ static void reset_states();
         int stop_q_raw = jsonu::get_opt<int>(msg, "paradas").value_or(0);
         int stop_t_raw = jsonu::get_opt<int>(msg, "tiempoParadas_s").value_or(0);
 
-        // Cast to uint16_t (full 16-bit, no masking)
         uint16_t prod_q = static_cast<uint16_t>(prod_q_raw);
         uint16_t prod_t = static_cast<uint16_t>(prod_t_raw);
         uint16_t stop_q = static_cast<uint16_t>(stop_q_raw);
         uint16_t stop_t = static_cast<uint16_t>(stop_t_raw);
 
-        // Outputs
         uint32_t prod_q_shift   = 0;
         double   prod_t_shift_s = 0.0;
         uint32_t stop_q_shift   = 0;
@@ -779,52 +739,41 @@ static void reset_states();
             std::lock_guard<std::mutex> lock(mtx_);
             State &st = states_[line];
 
-            // ---- First sample or shift change ----
             if (!st.initialized || st.shift != shiftNum) {
                 st.initialized = true;
                 st.shift       = shiftNum;
-
                 st.last_prod_q = prod_q;
                 st.acc_prod_q = 0;
-
                 st.last_stop_q = stop_q;
                 st.acc_stop_q = 0;
-
                 st.last_raw_prod_t = prod_t;
                 st.acc_prod_t_s = 0.0;
-
                 st.last_stop_t = stop_t;
                 st.acc_stop_t_s = 0;
             }
             else {
-                // Accumulate deltas
-
-                // cantidadProductos (use robust glitch detection)
-                st.acc_prod_q += diff_counter_robust(prod_q, st.last_prod_q);
+                // Use PLC-compatible counter validation
+                st.acc_prod_q += diff_counter(prod_q, st.last_prod_q);
                 st.last_prod_q = prod_q;
 
-                // paradas (use robust glitch detection)
-                st.acc_stop_q += diff_counter_robust(stop_q, st.last_stop_q);
+                st.acc_stop_q += diff_counter(stop_q, st.last_stop_q);
                 st.last_stop_q = stop_q;
 
-                // tiempoProduccion_ds (timer, ds → s)
+                // Timer for production time (deciseconds → seconds)
                 uint16_t delta_t = diff_timer(prod_t, st.last_raw_prod_t);
                 st.acc_prod_t_s += delta_t * 0.1;
                 st.last_raw_prod_t = prod_t;
 
-                // tiempoParadas_s (use robust glitch detection)
-                st.acc_stop_t_s += diff_counter_robust(stop_t, st.last_stop_t);
+                st.acc_stop_t_s += diff_counter(stop_t, st.last_stop_t);
                 st.last_stop_t = stop_t;
             }
 
-            // ---- Final accumulated values ----
             prod_q_shift   = st.acc_prod_q;
             prod_t_shift_s = st.acc_prod_t_s;
             stop_q_shift   = st.acc_stop_q;
             stop_t_shift_s = st.acc_stop_t_s;
         }
 
-        // ---- Build MQTT payloads ----
         json qual;
         qual["alarms"]           = alarms;
         qual["timestamp_device"] = iso8601_utc_now();
@@ -832,12 +781,10 @@ static void reset_states();
         json prod;
         prod["maquina_id"]          = 4;
         prod["turno"]               = shiftNum;
-
         prod["cantidad_produccion"] = prod_q_shift;
         prod["tiempo_produccion"]   = static_cast<uint32_t>(prod_t_shift_s);
         prod["cantidad_paradas"]    = stop_q_shift;
         prod["tiempo_paradas"]      = stop_t_shift_s;
-
         prod["timestamp_device"]    = iso8601_utc_now();
 
         auto t1 = isa95_prefix + std::to_string(line) + "/salida_secador/alarms";
@@ -847,7 +794,6 @@ static void reset_states();
     }
 };
 
-// ---- STATIC DEFINITIONS ----
 std::mutex SalidaSecadorProcessor::mtx_;
 std::unordered_map<int, SalidaSecadorProcessor::State>
     SalidaSecadorProcessor::states_;
@@ -858,6 +804,9 @@ void SalidaSecadorProcessor::reset_states()
     states_.clear();
 }
 
+// ============================================================================
+// EsmalteProcessor - Fixed with correct counter handling
+// ============================================================================
 
 class EsmalteProcessor : public IMessageProcessor
 {
@@ -865,7 +814,6 @@ class EsmalteProcessor : public IMessageProcessor
         bool initialized = false;
         int shift = -1;
 
-        // All counters are 16-bit (no masking)
         uint16_t last_raw_prod_q = 0;
         uint32_t acc_prod_q = 0;
 
@@ -883,15 +831,14 @@ class EsmalteProcessor : public IMessageProcessor
     static std::unordered_map<int, State> states_;
 
 public:
-static void reset_states();
+    static void reset_states();
+    
     std::vector<Publication> process(const json &msg,
                                      const std::string &isa95_prefix) override
     {
-        // ---- Determine shift ----
         auto sh = current_shift_localtime();
         int shiftNum = (sh == Shift::S1 ? 1 : sh == Shift::S2 ? 2 : 3);
 
-        // ---- Extract fields - NO MASKING ----
         int alarms   = jsonu::get_opt<int>(msg, "alarms").value_or(0);
         int prod_q   = jsonu::get_opt<int>(msg, "cantidadProductos").value_or(0);
         int prod_t   = jsonu::get_opt<int>(msg, "tiempoProduccion_ds").value_or(0);
@@ -908,41 +855,34 @@ static void reset_states();
             std::lock_guard<std::mutex> lock(mtx_);
             State &st = states_[line];
 
-            // Cast to uint16_t (full 16-bit, no masking)
             uint16_t raw_prod_q = static_cast<uint16_t>(prod_q);
             uint16_t raw_stop_q = static_cast<uint16_t>(stop_q);
             uint16_t raw_prod_t = static_cast<uint16_t>(prod_t);
             uint16_t raw_stop_t = static_cast<uint16_t>(stop_t);
 
-            // Reset por primer mensaje o cambio de turno
             if (!st.initialized || st.shift != shiftNum) {
                 st = State();
                 st.initialized = true;
                 st.shift = shiftNum;
-
                 st.last_raw_prod_q = raw_prod_q;
                 st.last_raw_stop_q = raw_stop_q;
                 st.last_raw_prod_t = raw_prod_t;
                 st.last_raw_stop_t = raw_stop_t;
             }
             else {
-                // Accumulate deltas
-
-                // cantidadProductos (use robust glitch detection)
-                st.acc_prod_q += diff_counter_robust(raw_prod_q, st.last_raw_prod_q);
+                // Use PLC-compatible counter validation
+                st.acc_prod_q += diff_counter(raw_prod_q, st.last_raw_prod_q);
                 st.last_raw_prod_q = raw_prod_q;
 
-                // paradas (use robust glitch detection)
-                st.acc_stop_q += diff_counter_robust(raw_stop_q, st.last_raw_stop_q);
+                st.acc_stop_q += diff_counter(raw_stop_q, st.last_raw_stop_q);
                 st.last_raw_stop_q = raw_stop_q;
 
-                // tiempoProduccion_ds (timer, ds → s)
+                // Timer for production time (deciseconds → seconds)
                 uint16_t delta_t = diff_timer(raw_prod_t, st.last_raw_prod_t);
                 st.acc_prod_t_s += delta_t * 0.1;
                 st.last_raw_prod_t = raw_prod_t;
 
-                // tiempoParadas_s (use robust glitch detection)
-                st.acc_stop_t_s += diff_counter_robust(raw_stop_t, st.last_raw_stop_t);
+                st.acc_stop_t_s += diff_counter(raw_stop_t, st.last_raw_stop_t);
                 st.last_raw_stop_t = raw_stop_t;
             }
 
@@ -952,8 +892,6 @@ static void reset_states();
             stop_t_shift_s    = st.acc_stop_t_s;
         }
 
-
-        // ---- Create outputs ----
         json qual;
         qual["alarms"] = alarms;
         qual["timestamp_device"] = iso8601_utc_now();
@@ -974,7 +912,6 @@ static void reset_states();
     }
 };
 
-// ---- STATIC DEFINITIONS ----
 std::mutex EsmalteProcessor::mtx_;
 std::unordered_map<int, EsmalteProcessor::State>
     EsmalteProcessor::states_;
@@ -985,39 +922,50 @@ void EsmalteProcessor::reset_states()
     states_.clear();
 }
 
-// EntradaHornoProcessor - CORRECTED VERSION
-// Matches decoder_corrected.js field names
-// Device Type: 6 (Entrada Horno)
-
+// ============================================================================
+// EntradaHornoProcessor - Fixed with correct counter handling
+// ============================================================================
+/**
+ * PLC Register Mapping (from entrada_horno.pdf Sección14):
+ * 
+ * This device has ADDITIONAL registers compared to standard devices:
+ * - D29007 = Número de Grades (BCD-converted grid/rack count) - PRIMARY PRODUCTION
+ * - D29008 = Métrica FORMADOR count
+ * - D29009 = Métrica FORMADOR time accumulator (deciseconds)
+ * - D29013 = Falha Forno count (oven fault count)
+ * - D29014 = Falha Forno time (oven fault time in seconds)
+ */
 class EntradaHornoProcessor : public IMessageProcessor
 {
     struct State {
         bool initialized = false;
         int  shift = -1;
 
-        // Production: Número de Grades (CICLO)
+        // D29007 - Número de Grades (BCD-converted)
         uint16_t last_raw_grades = 0;
         uint32_t acc_grades = 0;
 
-        // Stops: Paradas MCF
+        // D29003 - Paradas MCF count
         uint16_t last_raw_stops_q = 0;
         uint32_t acc_stops_q = 0;
 
+        // D29004 - Paradas MCF time (seconds)
         uint16_t last_raw_stops_t = 0;
         uint32_t acc_stops_t_s = 0;
 
-        // Faults: Falha Forno
+        // D29013 - Falha Forno count
         uint16_t last_raw_faults_q = 0;
         uint32_t acc_faults_q = 0;
 
+        // D29014 - Falha Forno time (seconds)
         uint16_t last_raw_faults_t = 0;
         uint32_t acc_faults_t_s = 0;
 
-        // Optional: MCF Metrics for validation
+        // D29005/D29006 - MCF Metrics (optional validation)
         uint16_t last_raw_mcf_metric = 0;
         double   acc_mcf_metric_s = 0.0;
 
-        // Optional: FORMADOR Metrics for validation
+        // D29008/D29009 - FORMADOR Metrics (optional validation)
         uint16_t last_raw_for_metric = 0;
         double   acc_for_metric_s = 0.0;
     };
@@ -1025,10 +973,9 @@ class EntradaHornoProcessor : public IMessageProcessor
     static std::mutex mtx_;
     static std::unordered_map<int, State> states_;
 
-    // Clean BCD-converted value (D29007 has max 9999 from BCD origin)
+    // D29007 uses BCD-converted format (max 9999)
     static inline uint16_t cleanBCD(int x) {
         uint16_t val = static_cast<uint16_t>(x);
-        // Cap at BCD maximum value
         return (val > 9999) ? 9999 : val;
     }
 
@@ -1041,89 +988,53 @@ public:
         auto sh = current_shift_localtime();
         int shiftNum = (sh == Shift::S1 ? 1 : sh == Shift::S2 ? 2 : 3);
 
-        // ========== HEADER FIELDS ==========
         int line     = msg.value("lineID", 0);
         int devType  = msg.value("deviceType", 0);
 
-        // Validate device type
         if (devType != 6) {
-            // Log warning: wrong device type for this processor
             std::cerr << "[EntradaHorno] WARNING: Wrong deviceType " 
                       << devType << " (expected 6)" << std::endl;
         }
 
-        // ========== STATUS & DIAGNOSTICS ==========
-        int status   = msg.value("status", 0);       // D29002 - Status Lento
-        int timer    = msg.value("timer1Hz", 0);     // D29001 - 1Hz Timer
-
-        // ========== PRODUCTION FIELDS (CRITICAL) ==========
-        // D29007 - Número de Grades (CICLO) - The actual production count!
+        int status   = msg.value("status", 0);
+        int timer    = msg.value("timer1Hz", 0);
         int grades   = msg.value("cantidadGrades", 0);
-
-        // ========== STOP FIELDS ==========
-        // D29003 - Parada MCF Quantidade
         int stops_q  = msg.value("paradas", 0);
-        
-        // D29004 - Parada MCF Tempo (seconds)
         int stops_t  = msg.value("tiempoParadas_s", 0);
-
-        // ========== FAULT FIELDS ==========
-        // D29013 - Falha Forno Quantidade
         int faults_q = msg.value("fallaHorno", 0);
-        
-        // D29014 - Falha Forno Tempo (seconds)
         int faults_t = msg.value("tiempoFalla_s", 0);
-
-        // ========== OPTIONAL: METRIC FIELDS (for validation) ==========
-        // D29005 - Métrica MCF (deciseconds)
         int mcf_metric = msg.value("metricaMCF", 0);
-
-        // D29008 - Métrica FORMADOR (deciseconds)
         int for_metric = msg.value("metricaFOR", 0);
 
-        // ========== OUTPUT ACCUMULATORS ==========
         uint32_t out_grades = 0;
         uint32_t out_stops_q = 0;
         uint32_t out_faults_q = 0;
-
         uint32_t out_stops_t_s = 0;
         uint32_t out_faults_t_s = 0;
-        
         double   out_mcf_metric_s = 0.0;
         double   out_for_metric_s = 0.0;
 
-        // ========== CLEAN RAW VALUES ==========
-        // D29007 uses BCD-converted format (max 9999)
         uint16_t raw_grades  = cleanBCD(grades);
-
-        // Other fields are standard 16-bit (no masking)
         uint16_t raw_stops_q  = static_cast<uint16_t>(stops_q);
         uint16_t raw_stops_t  = static_cast<uint16_t>(stops_t);
-
         uint16_t raw_faults_q = static_cast<uint16_t>(faults_q);
         uint16_t raw_faults_t = static_cast<uint16_t>(faults_t);
-
         uint16_t raw_mcf_metric = static_cast<uint16_t>(mcf_metric);
         uint16_t raw_for_metric = static_cast<uint16_t>(for_metric);
 
-        // ========== BCD OVERFLOW WARNING ==========
         if (raw_grades > 9900) {
             std::cerr << "[EntradaHorno] WARNING: Grade counter approaching BCD limit: " 
                       << raw_grades << " (max 9999)" << std::endl;
         }
 
-        // ========== STATE MANAGEMENT & ACCUMULATION ==========
         {
             std::lock_guard<std::mutex> lock(mtx_);
             State &st = states_[line];
 
-            // Initialize or reset on shift change
             if (!st.initialized || st.shift != shiftNum) {
                 st = State();
                 st.initialized = true;
                 st.shift = shiftNum;
-
-                // Store initial values (no accumulation on first message)
                 st.last_raw_grades     = raw_grades;
                 st.last_raw_stops_q    = raw_stops_q;
                 st.last_raw_stops_t    = raw_stops_t;
@@ -1137,40 +1048,33 @@ public:
                           << " initialized (grades=" << raw_grades << ")" << std::endl;
             }
             else {
-                // Accumulate deltas
-
-                // Grades: Production count (CICLO) - use robust glitch detection
-                uint16_t delta_grades = diff_counter_robust(raw_grades, st.last_raw_grades);
+                // Use PLC-compatible counter validation
+                uint16_t delta_grades = diff_counter(raw_grades, st.last_raw_grades);
                 st.acc_grades += delta_grades;
                 st.last_raw_grades = raw_grades;
 
-                // Stops: Quantity - use robust glitch detection
-                st.acc_stops_q += diff_counter_robust(raw_stops_q, st.last_raw_stops_q);
+                st.acc_stops_q += diff_counter(raw_stops_q, st.last_raw_stops_q);
                 st.last_raw_stops_q = raw_stops_q;
 
-                // Stops: Time (seconds) - use robust glitch detection
-                st.acc_stops_t_s += diff_counter_robust(raw_stops_t, st.last_raw_stops_t);
+                st.acc_stops_t_s += diff_counter(raw_stops_t, st.last_raw_stops_t);
                 st.last_raw_stops_t = raw_stops_t;
 
-                // Faults: Quantity - use robust glitch detection
-                st.acc_faults_q += diff_counter_robust(raw_faults_q, st.last_raw_faults_q);
+                st.acc_faults_q += diff_counter(raw_faults_q, st.last_raw_faults_q);
                 st.last_raw_faults_q = raw_faults_q;
 
-                // Faults: Time (seconds) - use robust glitch detection
-                st.acc_faults_t_s += diff_counter_robust(raw_faults_t, st.last_raw_faults_t);
+                st.acc_faults_t_s += diff_counter(raw_faults_t, st.last_raw_faults_t);
                 st.last_raw_faults_t = raw_faults_t;
 
-                // MCF Metric: Time in deciseconds (timer, ds → s)
+                // MCF Metric timer (deciseconds → seconds)
                 uint16_t delta_mcf = diff_timer(raw_mcf_metric, st.last_raw_mcf_metric);
                 st.acc_mcf_metric_s += delta_mcf * 0.1;
                 st.last_raw_mcf_metric = raw_mcf_metric;
 
-                // FORMADOR Metric: Time in deciseconds (timer, ds → s)
+                // FORMADOR Metric timer (deciseconds → seconds)
                 uint16_t delta_for = diff_timer(raw_for_metric, st.last_raw_for_metric);
                 st.acc_for_metric_s += delta_for * 0.1;
                 st.last_raw_for_metric = raw_for_metric;
 
-                // Debug: Log significant production changes
                 if (delta_grades > 0) {
                     std::cout << "[EntradaHorno] Line " << line
                               << " - Produced " << delta_grades
@@ -1178,7 +1082,6 @@ public:
                 }
             }
 
-            // Copy accumulated values for output
             out_grades       = st.acc_grades;
             out_stops_q      = st.acc_stops_q;
             out_faults_q     = st.acc_faults_q;
@@ -1188,57 +1091,32 @@ public:
             out_for_metric_s = st.acc_for_metric_s;
         }
 
-        // ========== CALCULATE VACIO HORNO (EMPTY FURNACE TIME) ==========
-        // Formula: vacio = total_time - production_time - stops_time - failures_time
-        // timer = D29001 (total shift time in seconds)
-        // out_mcf_metric_s = accumulated production time (D29006 in deciseconds → seconds)
-        // out_stops_t_s = accumulated stop time (D29004 in seconds)
-        // out_faults_t_s = accumulated failure time (D29014 in seconds)
-        
+        // Calculate empty furnace time
         double vacio_horno_sec = static_cast<double>(timer) 
                                  - out_mcf_metric_s 
                                  - static_cast<double>(out_stops_t_s) 
                                  - static_cast<double>(out_faults_t_s);
-        
-        // Convert to minutes and ensure non-negative
         double vacio_horno_min = (vacio_horno_sec > 0) ? (vacio_horno_sec / 60.0) : 0.0;
 
-        // ========== BUILD PUBLICATIONS ==========
-        
-        // Publication 1: Status & Alarms
         json j_status;
-        j_status["status"]    = status;       // Status word from D29002
-        j_status["timer"]     = timer;        // 1Hz timer from D29001
-        j_status["raw_grades"] = raw_grades;  // Current raw value
+        j_status["status"]    = status;
+        j_status["timer"]     = timer;
+        j_status["raw_grades"] = raw_grades;
         j_status["ts"]        = iso8601_utc_now();
 
-        // Publication 2: Production Data
         json j_prod;
-        j_prod["maquina_id"] = 6;  // Device type (Entrada Horno)
+        j_prod["maquina_id"] = 6;
         j_prod["turno"]      = shiftNum;
-
-        // CRITICAL: Production count (grades/racks)
         j_prod["cantidad_produccion"] = out_grades;
-        
-        // Stops
         j_prod["cantidad_paradas"]    = out_stops_q;
         j_prod["tiempo_paradas"]      = out_stops_t_s;
-        
-        // Faults
         j_prod["cantidad_fallas"]     = out_faults_q;
         j_prod["tiempo_fallas"]       = out_faults_t_s;
-
-        // Optional: Metrics (for advanced analytics)
         j_prod["tiempo_metrica_mcf"]  = (uint32_t)out_mcf_metric_s;
         j_prod["tiempo_metrica_for"]  = (uint32_t)out_for_metric_s;
-
-        // NEW: Empty furnace time in minutes
         j_prod["vacio_horno_min"]     = vacio_horno_min;
-
-        // Metadata
         j_prod["timestamp_device"]    = iso8601_utc_now();
 
-        // Build topic paths
         auto topic_status = isa95_prefix + std::to_string(line) + "/entrada_horno/status";
         auto topic_prod   = isa95_prefix + std::to_string(line) + "/entrada_horno/production";
 
@@ -1249,7 +1127,6 @@ public:
     }
 };
 
-// Static member initialization
 std::mutex EntradaHornoProcessor::mtx_;
 std::unordered_map<int, EntradaHornoProcessor::State>
     EntradaHornoProcessor::states_;
@@ -1262,7 +1139,7 @@ void EntradaHornoProcessor::reset_states()
 }
 
 // ============================================================================
-// SalidaHornoProcessor - Complete Implementation with Monotonic Accumulators
+// SalidaHornoProcessor - Fixed with correct counter handling
 // ============================================================================
 
 class SalidaHornoProcessor : public IMessageProcessor
@@ -1271,7 +1148,6 @@ class SalidaHornoProcessor : public IMessageProcessor
         bool initialized = false;
         int shift = -1;
 
-        // All counters are 16-bit (no masking)
         uint16_t last_bancalinos0 = 0;
         uint32_t acc_bancalinos0 = 0;
 
@@ -1321,10 +1197,6 @@ class SalidaHornoProcessor : public IMessageProcessor
     static std::unordered_map<int, State> states_;
 
 public:
-    /**
-     * Reset all accumulated states across all lines
-     * Useful for testing or manual reset operations
-     */
     static void reset_states() {
         std::lock_guard<std::mutex> lock(mtx_);
         states_.clear();
@@ -1336,7 +1208,6 @@ public:
         auto sh = current_shift_localtime();
         int shiftNum = (sh == Shift::S1 ? 1 : (sh == Shift::S2 ? 2 : 3));
 
-        // Read all raw values from PLC
         int line = jsonu::get_opt<int>(msg, "lineID").value_or(0);
         int alarms = jsonu::get_opt<int>(msg, "alarms").value_or(0);
         int checksum = jsonu::get_opt<int>(msg, "checksum").value_or(0);
@@ -1361,7 +1232,6 @@ public:
 
         int timer1Hz_raw = jsonu::get_opt<int>(msg, "timer1Hz").value_or(0);
 
-        // Cast to uint16_t (full 16-bit, no masking)
         uint16_t bancalinos0 = static_cast<uint16_t>(bancalinos0_raw);
         uint16_t bancalinos1 = static_cast<uint16_t>(bancalinos1_raw);
         uint16_t bancalinosComb1 = static_cast<uint16_t>(bancalinosComb1_raw);
@@ -1377,7 +1247,6 @@ public:
         uint16_t paradas_2 = static_cast<uint16_t>(paradas_2_raw);
         uint16_t timer1Hz = static_cast<uint16_t>(timer1Hz_raw);
 
-        // Output accumulators
         uint32_t acc_bancalinos0_out = 0;
         uint32_t acc_bancalinos1_out = 0;
         uint32_t acc_bancalinosComb1_out = 0;
@@ -1398,12 +1267,10 @@ public:
             State &st = states_[line];
 
             if (!st.initialized || st.shift != shiftNum) {
-                // New shift - reset all accumulators
                 st = State();
                 st.initialized = true;
                 st.shift = shiftNum;
 
-                // Initialize last values
                 st.last_bancalinos0 = bancalinos0;
                 st.last_bancalinos1 = bancalinos1;
                 st.last_bancalinosComb1 = bancalinosComb1;
@@ -1420,45 +1287,44 @@ public:
                 st.last_timer1Hz = timer1Hz;
             }
             else {
-                // Accumulate deltas using robust glitch detection
-
-                st.acc_bancalinos0 += diff_counter_robust(bancalinos0, st.last_bancalinos0);
+                // Use PLC-compatible counter validation for all counters
+                st.acc_bancalinos0 += diff_counter(bancalinos0, st.last_bancalinos0);
                 st.last_bancalinos0 = bancalinos0;
 
-                st.acc_bancalinos1 += diff_counter_robust(bancalinos1, st.last_bancalinos1);
+                st.acc_bancalinos1 += diff_counter(bancalinos1, st.last_bancalinos1);
                 st.last_bancalinos1 = bancalinos1;
 
-                st.acc_bancalinosComb1 += diff_counter_robust(bancalinosComb1, st.last_bancalinosComb1);
+                st.acc_bancalinosComb1 += diff_counter(bancalinosComb1, st.last_bancalinosComb1);
                 st.last_bancalinosComb1 = bancalinosComb1;
 
-                st.acc_bancalinosComb2 += diff_counter_robust(bancalinosComb2, st.last_bancalinosComb2);
+                st.acc_bancalinosComb2 += diff_counter(bancalinosComb2, st.last_bancalinosComb2);
                 st.last_bancalinosComb2 = bancalinosComb2;
 
-                st.acc_bancalinosTotal += diff_counter_robust(bancalinosTotal, st.last_bancalinosTotal);
+                st.acc_bancalinosTotal += diff_counter(bancalinosTotal, st.last_bancalinosTotal);
                 st.last_bancalinosTotal = bancalinosTotal;
 
-                st.acc_cambioBarrera += diff_counter_robust(cambioBarrera, st.last_cambioBarrera);
+                st.acc_cambioBarrera += diff_counter(cambioBarrera, st.last_cambioBarrera);
                 st.last_cambioBarrera = cambioBarrera;
 
-                st.acc_cambioBarreraTotal += diff_counter_robust(cambioBarreraTotal, st.last_cambioBarreraTotal);
+                st.acc_cambioBarreraTotal += diff_counter(cambioBarreraTotal, st.last_cambioBarreraTotal);
                 st.last_cambioBarreraTotal = cambioBarreraTotal;
 
-                st.acc_cambioSentido += diff_counter_robust(cambioSentido, st.last_cambioSentido);
+                st.acc_cambioSentido += diff_counter(cambioSentido, st.last_cambioSentido);
                 st.last_cambioSentido = cambioSentido;
 
-                st.acc_cambioSentidoTotal += diff_counter_robust(cambioSentidoTotal, st.last_cambioSentidoTotal);
+                st.acc_cambioSentidoTotal += diff_counter(cambioSentidoTotal, st.last_cambioSentidoTotal);
                 st.last_cambioSentidoTotal = cambioSentidoTotal;
 
-                st.acc_cantidad += diff_counter_robust(cantidad, st.last_cantidad);
+                st.acc_cantidad += diff_counter(cantidad, st.last_cantidad);
                 st.last_cantidad = cantidad;
 
-                st.acc_cantidad_total += diff_counter_robust(cantidad_total, st.last_cantidad_total);
+                st.acc_cantidad_total += diff_counter(cantidad_total, st.last_cantidad_total);
                 st.last_cantidad_total = cantidad_total;
 
-                st.acc_paradas_1 += diff_counter_robust(paradas_1, st.last_paradas_1);
+                st.acc_paradas_1 += diff_counter(paradas_1, st.last_paradas_1);
                 st.last_paradas_1 = paradas_1;
 
-                st.acc_paradas_2 += diff_counter_robust(paradas_2, st.last_paradas_2);
+                st.acc_paradas_2 += diff_counter(paradas_2, st.last_paradas_2);
                 st.last_paradas_2 = paradas_2;
 
                 // timer1Hz is a timer (counts seconds)
@@ -1468,7 +1334,6 @@ public:
                 st.last_timer1Hz = timer1Hz;
             }
 
-            // Copy out accumulated values
             acc_bancalinos0_out = st.acc_bancalinos0;
             acc_bancalinos1_out = st.acc_bancalinos1;
             acc_bancalinosComb1_out = st.acc_bancalinosComb1;
@@ -1485,7 +1350,6 @@ public:
             acc_tiempo_operacion_s_out = st.acc_tiempo_operacion_s;
         }
 
-        // Build output JSON with all fields
         json prod;
         prod["maquina_id"] = 7;
         prod["turno"] = shiftNum;
@@ -1493,7 +1357,6 @@ public:
         prod["lineID"] = line;
         prod["checksum"] = checksum;
 
-        // Bancalinos fields
         prod["bancalinos0_instantaneo"] = bancalinos0;
         prod["bancalinos0_turno"] = acc_bancalinos0_out;
 
@@ -1509,21 +1372,18 @@ public:
         prod["bancalinosTotal_raw"] = bancalinosTotal_raw;
         prod["bancalinosTotal_turno"] = acc_bancalinosTotal_out;
 
-        // CambioBarrera fields
         prod["cambioBarrera_instantaneo"] = cambioBarrera;
         prod["cambioBarrera_turno"] = acc_cambioBarrera_out;
 
         prod["cambioBarreraTotal_raw"] = cambioBarreraTotal_raw;
         prod["cambioBarreraTotal_turno"] = acc_cambioBarreraTotal_out;
 
-        // CambioSentido fields
         prod["cambioSentido_instantaneo"] = cambioSentido;
         prod["cambioSentido_turno"] = acc_cambioSentido_out;
 
         prod["cambioSentidoTotal_raw"] = cambioSentidoTotal_raw;
         prod["cambioSentidoTotal_turno"] = acc_cambioSentidoTotal_out;
 
-        // Cantidad fields
         prod["cantidad_instantanea"] = cantidad;
         prod["cantidad_raw"] = cantidad_raw;
         prod["cantidad_produccion_turno"] = acc_cantidad_out;
@@ -1531,20 +1391,17 @@ public:
         prod["cantidad_total_raw"] = cantidad_total_raw;
         prod["cantidad_total_turno"] = acc_cantidad_total_out;
 
-        // Paradas fields
         prod["paradas_1_instantaneo"] = paradas_1;
         prod["paradas_1_turno"] = acc_paradas_1_out;
 
         prod["paradas_2_instantaneo"] = paradas_2;
         prod["paradas_2_turno"] = acc_paradas_2_out;
 
-        // Timer fields
         prod["timer1Hz_instantaneo"] = timer1Hz;
         prod["tiempo_operacion_turno_s"] = acc_tiempo_operacion_s_out;
 
         prod["timestamp_device"] = iso8601_utc_now();
 
-        // Alarms
         json qual;
         qual["alarms"] = alarms;
         qual["timestamp_device"] = iso8601_utc_now();
@@ -1556,11 +1413,14 @@ public:
     }
 };
 
-// Static definitions
 std::mutex SalidaHornoProcessor::mtx_;
 std::unordered_map<int, SalidaHornoProcessor::State>
     SalidaHornoProcessor::states_;
 
+
+// ============================================================================
+// Factory functions
+// ============================================================================
 
 std::unique_ptr<IMessageProcessor> createDefaultProcessor()
 {
@@ -1601,5 +1461,5 @@ void reset_all_processor_states()
     EsmalteProcessor::reset_states();
     EntradaHornoProcessor::reset_states();
     SalidaHornoProcessor::reset_states();
-    CalidadProcessor::reset_states();   // si lo tienes
+    CalidadProcessor::reset_states();
 }
