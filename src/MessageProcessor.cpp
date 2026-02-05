@@ -28,7 +28,7 @@ bool detect_global_shift_change(int currentShift)
  * Based on PLC ladder analysis (Update_Qt_Ciclo function block):
  * - Counters are 16-bit (0-65535) with standard rollover
  * - PLC validates deltas using TST/TSTN on bit 15
- * - If bit 15 is SET in delta (value >= 32768) → invalid/overflow
+ * - If bit 15 is SET in delta (value >= 32768) â†’ invalid/overflow
  * - Additional sanity checks: Dados_Metricas uses <= 4000, Dados_Tempos uses <= 1200
  *
  * PLC Register Semantics (from ladder analysis):
@@ -261,7 +261,7 @@ void CalidadProcessor::reset_states() {
 // PrensaHidraulica1Processor - Fixed with correct counter handling
 // ============================================================================
 /**
- * PLC Register Mapping (from salida_prensa_1.pdf Sección12):
+ * PLC Register Mapping (from salida_prensa_1.pdf SecciÃ³n12):
  * 
  * Input fields (from decoder, TODO: update decoder field names):
  * - "cantidadProductos" = D29005 = PISADAS (press stroke count, NOT products!)
@@ -270,8 +270,8 @@ void CalidadProcessor::reset_states() {
  * - "tiempoParadas_s" = D29004 = Stop duration (SECONDS)
  * - "alarms" = D29002 = Status Lento (status bits)
  * 
- * The PLC calculates: Products = PISADAS × Fila × Pac
- * We apply: Products = PISADAS × factor_pisadas (per line)
+ * The PLC calculates: Products = PISADAS Ã— Fila Ã— Pac
+ * We apply: Products = PISADAS Ã— factor_pisadas (per line)
  */
 class PrensaHidraulica1Processor : public IMessageProcessor
 {
@@ -310,7 +310,7 @@ public:
 
         // Read inputs from decoder
         // NOTE: Field names will change when decoder is updated
-        // Current: cantidadProductos → Should be: pisadas
+        // Current: cantidadProductos â†’ Should be: pisadas
         int line          = jsonu::get_opt<int>(msg, "lineID").value_or(0);
         int alarms        = jsonu::get_opt<int>(msg, "alarms").value_or(0);
         
@@ -361,7 +361,7 @@ public:
                 st.acc_pisadas += delta_pisadas;
                 st.last_pisadas = pisadas;
 
-                // D29006 - Metric time is a timer (deciseconds → seconds)
+                // D29006 - Metric time is a timer (deciseconds â†’ seconds)
                 uint16_t delta_tiempo = diff_timer(metrica_tiempo, st.last_metrica_tiempo);
                 st.acc_metrica_tiempo_s += delta_tiempo * 0.1;
                 st.last_metrica_tiempo = metrica_tiempo;
@@ -591,610 +591,80 @@ std::mutex PrensaHidraulica2Processor::mtx_;
 std::unordered_map<int, PrensaHidraulica2Processor::PH2State>
     PrensaHidraulica2Processor::states_;
 
-// ============================================================================
-// EntradaSecadorProcessor - Fixed with correct counter handling
-// ============================================================================
+/**
+ * EntradaSecadorProcessor - CORRECTED VERSION
+ * 
+ * Changes from original:
+ * 1. Reads NEW semantic field names from LoRaWAN decoder v2
+ * 2. ALL counters are 16-bit (removed clean15 misuse)
+ * 3. Tracks ALL fields from PLC (not just 2)
+ * 4. Output JSON uses correct semantic names
+ * 
+ * Input fields (from decoder v2):
+ *   checksum, timer1Hz, alarms, paradas_cantidad, paradas_tempo_s,
+ *   ingreso_elevador_cantidad, ingreso_elevador_tiempo_ds,
+ *   bancalino_l1_cantidad, bancalino_l1_tiempo_ds,
+ *   bancalino_l2_cantidad, bancalino_l2_tiempo_ds
+ * 
+ * PLC Register mapping:
+ *   D29003 = paradas_cantidad (stop events)
+ *   D29004 = paradas_tempo_s (stop time in seconds)
+ *   D29005 = ingreso_elevador_cantidad (elevator entry events)
+ *   D29006 = ingreso_elevador_tiempo_ds (elevator time in deciseconds)
+ *   D29007 = bancalino_l1_cantidad (bancalino L1 movements)
+ *   D29008 = bancalino_l1_tiempo_ds (bancalino L1 time in deciseconds)
+ *   D29009 = bancalino_l2_cantidad (bancalino L2 movements)
+ *   D29010 = bancalino_l2_tiempo_ds (bancalino L2 time in deciseconds)
+ */
 
 class EntradaSecadorProcessor : public IMessageProcessor
 {
-    struct State {
-        bool initialized = false;
-        int  shift = -1;
-
-        uint16_t last_arranques = 0;
-        uint32_t acc_arranques  = 0;
-
-        uint16_t last_t_operacion = 0;
-        uint32_t acc_t_operacion_s = 0;
-    };
-
-    static std::mutex mtx_;
-    static std::unordered_map<int, State> states_;
-
-public:
-    static void reset_states();
-    
-    std::vector<Publication> process(const json &msg,
-                                     const std::string &isa95_prefix) override
+private:
+    struct State
     {
-        auto sh = current_shift_localtime();
-        int shiftNum = (sh == Shift::S1 ? 1 : (sh == Shift::S2 ? 2 : 3));
-
-        int lineID        = msg.value("lineID", 0);
-        int alarms        = msg.value("alarms", 0);
-        int arr_in        = msg.value("arranques", 0);
-        int t_oper_s_in   = msg.value("tiempoOperacion_s", 0);
-
-        uint32_t out_arranques = 0;
-        uint32_t out_t_oper    = 0;
-
-        uint16_t raw_arr    = static_cast<uint16_t>(arr_in);
-        uint16_t raw_t_oper = static_cast<uint16_t>(t_oper_s_in);
-
-        {
-            std::lock_guard<std::mutex> lock(mtx_);
-            State &st = states_[lineID];
-
-            if (!st.initialized || st.shift != shiftNum) {
-                st = State();
-                st.initialized     = true;
-                st.shift           = shiftNum;
-                st.last_arranques     = raw_arr;
-                st.last_t_operacion   = raw_t_oper;
-            }
-            else {
-                // Use PLC-compatible counter validation
-                st.acc_arranques += diff_counter(raw_arr, st.last_arranques);
-                st.last_arranques = raw_arr;
-
-                st.acc_t_operacion_s += diff_counter(raw_t_oper, st.last_t_operacion);
-                st.last_t_operacion = raw_t_oper;
-            }
-
-            out_arranques = st.acc_arranques;
-            out_t_oper    = st.acc_t_operacion_s;
-        }
-
-        json j_alarms;
-        j_alarms["alarms"] = alarms;
-        j_alarms["ts"] = iso8601_utc_now();
-
-        json prod;
-        prod["maquina_id"] = 3;
-        prod["turno"] = shiftNum;
-        prod["cantidad_arranques"] = out_arranques;
-        prod["tiempo_operacion"]   = out_t_oper;
-        prod["timestamp_device"]   = iso8601_utc_now();
-
-        auto t1 = isa95_prefix + std::to_string(lineID) + "/entrada_secador/alarms";
-        auto t2 = isa95_prefix + std::to_string(lineID) + "/entrada_secador/production";
-
-        return {make_pub(t1, j_alarms), make_pub(t2, prod)};
-    }
-};
-
-std::mutex EntradaSecadorProcessor::mtx_;
-std::unordered_map<int, EntradaSecadorProcessor::State>
-    EntradaSecadorProcessor::states_;
-
-void EntradaSecadorProcessor::reset_states()
-{
-    std::lock_guard<std::mutex> lk(mtx_);
-    states_.clear();
-}
-
-// ============================================================================
-// SalidaSecadorProcessor - Fixed with correct counter handling
-// ============================================================================
-
-class SalidaSecadorProcessor : public IMessageProcessor
-{
-    struct State {
         bool initialized = false;
-        int  shift       = -1;
+        int shift = 0;
 
-        uint16_t last_prod_q = 0;
-        uint32_t acc_prod_q = 0;
-
-        uint16_t last_stop_q = 0;
-        uint32_t acc_stop_q = 0;
-
-        uint16_t last_raw_prod_t = 0;
-        double   acc_prod_t_s = 0.0;
-
-        uint16_t last_stop_t = 0;
-        uint32_t acc_stop_t_s = 0;
-    };
-
-    static std::mutex mtx_;
-    static std::unordered_map<int, State> states_;
-
-public:
-    static void reset_states();
-    
-    std::vector<Publication> process(const json &msg,
-                                     const std::string &isa95_prefix) override
-    {
-        auto sh       = current_shift_localtime();
-        int  shiftNum = (sh == Shift::S1 ? 1 : (sh == Shift::S2 ? 2 : 3));
-
-        int alarms = jsonu::get_opt<int>(msg, "alarms").value_or(0);
-        int prod_q_raw = jsonu::get_opt<int>(msg, "cantidadProductos").value_or(0);
-        int prod_t_raw = jsonu::get_opt<int>(msg, "tiempoProduccion_ds").value_or(0);
-        int line   = jsonu::get_opt<int>(msg, "lineID").value_or(0);
-        int stop_q_raw = jsonu::get_opt<int>(msg, "paradas").value_or(0);
-        int stop_t_raw = jsonu::get_opt<int>(msg, "tiempoParadas_s").value_or(0);
-
-        uint16_t prod_q = static_cast<uint16_t>(prod_q_raw);
-        uint16_t prod_t = static_cast<uint16_t>(prod_t_raw);
-        uint16_t stop_q = static_cast<uint16_t>(stop_q_raw);
-        uint16_t stop_t = static_cast<uint16_t>(stop_t_raw);
-
-        uint32_t prod_q_shift   = 0;
-        double   prod_t_shift_s = 0.0;
-        uint32_t stop_q_shift   = 0;
-        uint32_t stop_t_shift_s = 0;
-
-        {
-            std::lock_guard<std::mutex> lock(mtx_);
-            State &st = states_[line];
-
-            if (!st.initialized || st.shift != shiftNum) {
-                st.initialized = true;
-                st.shift       = shiftNum;
-                st.last_prod_q = prod_q;
-                st.acc_prod_q = 0;
-                st.last_stop_q = stop_q;
-                st.acc_stop_q = 0;
-                st.last_raw_prod_t = prod_t;
-                st.acc_prod_t_s = 0.0;
-                st.last_stop_t = stop_t;
-                st.acc_stop_t_s = 0;
-            }
-            else {
-                // Use PLC-compatible counter validation
-                st.acc_prod_q += diff_counter(prod_q, st.last_prod_q);
-                st.last_prod_q = prod_q;
-
-                st.acc_stop_q += diff_counter(stop_q, st.last_stop_q);
-                st.last_stop_q = stop_q;
-
-                // Timer for production time (deciseconds → seconds)
-                uint16_t delta_t = diff_timer(prod_t, st.last_raw_prod_t);
-                st.acc_prod_t_s += delta_t * 0.1;
-                st.last_raw_prod_t = prod_t;
-
-                st.acc_stop_t_s += diff_counter(stop_t, st.last_stop_t);
-                st.last_stop_t = stop_t;
-            }
-
-            prod_q_shift   = st.acc_prod_q;
-            prod_t_shift_s = st.acc_prod_t_s;
-            stop_q_shift   = st.acc_stop_q;
-            stop_t_shift_s = st.acc_stop_t_s;
-        }
-
-        json qual;
-        qual["alarms"]           = alarms;
-        qual["timestamp_device"] = iso8601_utc_now();
-
-        json prod;
-        prod["maquina_id"]          = 4;
-        prod["turno"]               = shiftNum;
-        prod["cantidad_produccion"] = prod_q_shift;
-        prod["tiempo_produccion"]   = static_cast<uint32_t>(prod_t_shift_s);
-        prod["cantidad_paradas"]    = stop_q_shift;
-        prod["tiempo_paradas"]      = stop_t_shift_s;
-        prod["timestamp_device"]    = iso8601_utc_now();
-
-        auto t1 = isa95_prefix + std::to_string(line) + "/salida_secador/alarms";
-        auto t2 = isa95_prefix + std::to_string(line) + "/salida_secador/production";
-
-        return { make_pub(t1, qual), make_pub(t2, prod) };
-    }
-};
-
-std::mutex SalidaSecadorProcessor::mtx_;
-std::unordered_map<int, SalidaSecadorProcessor::State>
-    SalidaSecadorProcessor::states_;
-
-void SalidaSecadorProcessor::reset_states()
-{
-    std::lock_guard<std::mutex> lk(mtx_);
-    states_.clear();
-}
-
-// ============================================================================
-// EsmalteProcessor - Fixed with correct counter handling
-// ============================================================================
-
-class EsmalteProcessor : public IMessageProcessor
-{
-    struct State {
-        bool initialized = false;
-        int shift = -1;
-
-        uint16_t last_raw_prod_q = 0;
-        uint32_t acc_prod_q = 0;
-
-        uint16_t last_raw_stop_q = 0;
-        uint32_t acc_stop_q = 0;
-
-        uint16_t last_raw_prod_t = 0;
-        double   acc_prod_t_s = 0.0;
-
-        uint16_t last_raw_stop_t = 0;
-        uint32_t acc_stop_t_s = 0;
-    };
-
-    static std::mutex mtx_;
-    static std::unordered_map<int, State> states_;
-
-public:
-    static void reset_states();
-    
-    std::vector<Publication> process(const json &msg,
-                                     const std::string &isa95_prefix) override
-    {
-        auto sh = current_shift_localtime();
-        int shiftNum = (sh == Shift::S1 ? 1 : sh == Shift::S2 ? 2 : 3);
-
-        int alarms   = jsonu::get_opt<int>(msg, "alarms").value_or(0);
-        int prod_q   = jsonu::get_opt<int>(msg, "cantidadProductos").value_or(0);
-        int prod_t   = jsonu::get_opt<int>(msg, "tiempoProduccion_ds").value_or(0);
-        int line     = jsonu::get_opt<int>(msg, "lineID").value_or(0);
-        int stop_q   = jsonu::get_opt<int>(msg, "paradas").value_or(0);
-        int stop_t   = jsonu::get_opt<int>(msg, "tiempoParadas_s").value_or(0);
-
-        uint32_t prod_q_shift = 0;
-        uint32_t stop_q_shift = 0;
-        double   prod_t_shift_s = 0.0;
-        uint32_t stop_t_shift_s = 0;
-
-        {
-            std::lock_guard<std::mutex> lock(mtx_);
-            State &st = states_[line];
-
-            uint16_t raw_prod_q = static_cast<uint16_t>(prod_q);
-            uint16_t raw_stop_q = static_cast<uint16_t>(stop_q);
-            uint16_t raw_prod_t = static_cast<uint16_t>(prod_t);
-            uint16_t raw_stop_t = static_cast<uint16_t>(stop_t);
-
-            if (!st.initialized || st.shift != shiftNum) {
-                st = State();
-                st.initialized = true;
-                st.shift = shiftNum;
-                st.last_raw_prod_q = raw_prod_q;
-                st.last_raw_stop_q = raw_stop_q;
-                st.last_raw_prod_t = raw_prod_t;
-                st.last_raw_stop_t = raw_stop_t;
-            }
-            else {
-                // Use PLC-compatible counter validation
-                st.acc_prod_q += diff_counter(raw_prod_q, st.last_raw_prod_q);
-                st.last_raw_prod_q = raw_prod_q;
-
-                st.acc_stop_q += diff_counter(raw_stop_q, st.last_raw_stop_q);
-                st.last_raw_stop_q = raw_stop_q;
-
-                // Timer for production time (deciseconds → seconds)
-                uint16_t delta_t = diff_timer(raw_prod_t, st.last_raw_prod_t);
-                st.acc_prod_t_s += delta_t * 0.1;
-                st.last_raw_prod_t = raw_prod_t;
-
-                st.acc_stop_t_s += diff_counter(raw_stop_t, st.last_raw_stop_t);
-                st.last_raw_stop_t = raw_stop_t;
-            }
-
-            prod_q_shift      = st.acc_prod_q;
-            stop_q_shift      = st.acc_stop_q;
-            prod_t_shift_s    = st.acc_prod_t_s;
-            stop_t_shift_s    = st.acc_stop_t_s;
-        }
-
-        json qual;
-        qual["alarms"] = alarms;
-        qual["timestamp_device"] = iso8601_utc_now();
-
-        json prod;
-        prod["maquina_id"]        = 5;
-        prod["turno"]             = shiftNum;
-        prod["cantidad_produccion"] = prod_q_shift;
-        prod["tiempo_produccion"]   = static_cast<uint32_t>(prod_t_shift_s);
-        prod["cantidad_paradas"]    = stop_q_shift;
-        prod["tiempo_paradas"]      = stop_t_shift_s;
-        prod["timestamp_device"]    = iso8601_utc_now();
-
-        auto t1 = isa95_prefix + std::to_string(line) + "/esmalte/alarms";
-        auto t2 = isa95_prefix + std::to_string(line) + "/esmalte/production";
-
-        return {make_pub(t1, qual), make_pub(t2, prod)};
-    }
-};
-
-std::mutex EsmalteProcessor::mtx_;
-std::unordered_map<int, EsmalteProcessor::State>
-    EsmalteProcessor::states_;
-
-void EsmalteProcessor::reset_states()
-{
-    std::lock_guard<std::mutex> lk(mtx_);
-    states_.clear();
-}
-
-// ============================================================================
-// EntradaHornoProcessor - Fixed with correct counter handling
-// ============================================================================
-/**
- * PLC Register Mapping (from entrada_horno.pdf Sección14):
- * 
- * This device has ADDITIONAL registers compared to standard devices:
- * - D29007 = Número de Grades (BCD-converted grid/rack count) - PRIMARY PRODUCTION
- * - D29008 = Métrica FORMADOR count
- * - D29009 = Métrica FORMADOR time accumulator (deciseconds)
- * - D29013 = Falha Forno count (oven fault count)
- * - D29014 = Falha Forno time (oven fault time in seconds)
- */
-class EntradaHornoProcessor : public IMessageProcessor
-{
-    struct State {
-        bool initialized = false;
-        int  shift = -1;
-
-        // D29007 - Número de Grades (BCD-converted)
-        uint16_t last_raw_grades = 0;
-        uint32_t acc_grades = 0;
-
-        // D29003 - Paradas MCF count
-        uint16_t last_raw_stops_q = 0;
-        uint32_t acc_stops_q = 0;
-
-        // D29004 - Paradas MCF time (seconds)
-        uint16_t last_raw_stops_t = 0;
-        uint32_t acc_stops_t_s = 0;
-
-        // D29013 - Falha Forno count
-        uint16_t last_raw_faults_q = 0;
-        uint32_t acc_faults_q = 0;
-
-        // D29014 - Falha Forno time (seconds)
-        uint16_t last_raw_faults_t = 0;
-        uint32_t acc_faults_t_s = 0;
-
-        // D29005/D29006 - MCF Metrics (optional validation)
-        uint16_t last_raw_mcf_metric = 0;
-        double   acc_mcf_metric_s = 0.0;
-
-        // D29008/D29009 - FORMADOR Metrics (optional validation)
-        uint16_t last_raw_for_metric = 0;
-        double   acc_for_metric_s = 0.0;
-    };
-
-    static std::mutex mtx_;
-    static std::unordered_map<int, State> states_;
-
-    // D29007 uses BCD-converted format (max 9999)
-    static inline uint16_t cleanBCD(int x) {
-        uint16_t val = static_cast<uint16_t>(x);
-        return (val > 9999) ? 9999 : val;
-    }
-
-public:
-    static void reset_states();
-    
-    std::vector<Publication> process(const json &msg,
-                                     const std::string &isa95_prefix) override
-    {
-        auto sh = current_shift_localtime();
-        int shiftNum = (sh == Shift::S1 ? 1 : sh == Shift::S2 ? 2 : 3);
-
-        int line     = msg.value("lineID", 0);
-        int devType  = msg.value("deviceType", 0);
-
-        if (devType != 6) {
-            std::cerr << "[EntradaHorno] WARNING: Wrong deviceType " 
-                      << devType << " (expected 6)" << std::endl;
-        }
-
-        int status   = msg.value("status", 0);
-        int timer    = msg.value("timer1Hz", 0);
-        int grades   = msg.value("cantidadGrades", 0);
-        int stops_q  = msg.value("paradas", 0);
-        int stops_t  = msg.value("tiempoParadas_s", 0);
-        int faults_q = msg.value("fallaHorno", 0);
-        int faults_t = msg.value("tiempoFalla_s", 0);
-        int mcf_metric = msg.value("metricaMCF", 0);
-        int for_metric = msg.value("metricaFOR", 0);
-
-        uint32_t out_grades = 0;
-        uint32_t out_stops_q = 0;
-        uint32_t out_faults_q = 0;
-        uint32_t out_stops_t_s = 0;
-        uint32_t out_faults_t_s = 0;
-        double   out_mcf_metric_s = 0.0;
-        double   out_for_metric_s = 0.0;
-
-        uint16_t raw_grades  = cleanBCD(grades);
-        uint16_t raw_stops_q  = static_cast<uint16_t>(stops_q);
-        uint16_t raw_stops_t  = static_cast<uint16_t>(stops_t);
-        uint16_t raw_faults_q = static_cast<uint16_t>(faults_q);
-        uint16_t raw_faults_t = static_cast<uint16_t>(faults_t);
-        uint16_t raw_mcf_metric = static_cast<uint16_t>(mcf_metric);
-        uint16_t raw_for_metric = static_cast<uint16_t>(for_metric);
-
-        if (raw_grades > 9900) {
-            std::cerr << "[EntradaHorno] WARNING: Grade counter approaching BCD limit: " 
-                      << raw_grades << " (max 9999)" << std::endl;
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(mtx_);
-            State &st = states_[line];
-
-            if (!st.initialized || st.shift != shiftNum) {
-                st = State();
-                st.initialized = true;
-                st.shift = shiftNum;
-                st.last_raw_grades     = raw_grades;
-                st.last_raw_stops_q    = raw_stops_q;
-                st.last_raw_stops_t    = raw_stops_t;
-                st.last_raw_faults_q   = raw_faults_q;
-                st.last_raw_faults_t   = raw_faults_t;
-                st.last_raw_mcf_metric = raw_mcf_metric;
-                st.last_raw_for_metric = raw_for_metric;
-
-                std::cout << "[EntradaHorno] Line " << line 
-                          << " - Shift " << shiftNum 
-                          << " initialized (grades=" << raw_grades << ")" << std::endl;
-            }
-            else {
-                // Use PLC-compatible counter validation
-                uint16_t delta_grades = diff_counter(raw_grades, st.last_raw_grades);
-                st.acc_grades += delta_grades;
-                st.last_raw_grades = raw_grades;
-
-                st.acc_stops_q += diff_counter(raw_stops_q, st.last_raw_stops_q);
-                st.last_raw_stops_q = raw_stops_q;
-
-                st.acc_stops_t_s += diff_counter(raw_stops_t, st.last_raw_stops_t);
-                st.last_raw_stops_t = raw_stops_t;
-
-                st.acc_faults_q += diff_counter(raw_faults_q, st.last_raw_faults_q);
-                st.last_raw_faults_q = raw_faults_q;
-
-                st.acc_faults_t_s += diff_counter(raw_faults_t, st.last_raw_faults_t);
-                st.last_raw_faults_t = raw_faults_t;
-
-                // MCF Metric timer (deciseconds → seconds)
-                uint16_t delta_mcf = diff_timer(raw_mcf_metric, st.last_raw_mcf_metric);
-                st.acc_mcf_metric_s += delta_mcf * 0.1;
-                st.last_raw_mcf_metric = raw_mcf_metric;
-
-                // FORMADOR Metric timer (deciseconds → seconds)
-                uint16_t delta_for = diff_timer(raw_for_metric, st.last_raw_for_metric);
-                st.acc_for_metric_s += delta_for * 0.1;
-                st.last_raw_for_metric = raw_for_metric;
-
-                if (delta_grades > 0) {
-                    std::cout << "[EntradaHorno] Line " << line
-                              << " - Produced " << delta_grades
-                              << " grades (total: " << st.acc_grades << ")" << std::endl;
-                }
-            }
-
-            out_grades       = st.acc_grades;
-            out_stops_q      = st.acc_stops_q;
-            out_faults_q     = st.acc_faults_q;
-            out_stops_t_s    = st.acc_stops_t_s;
-            out_faults_t_s   = st.acc_faults_t_s;
-            out_mcf_metric_s = st.acc_mcf_metric_s;
-            out_for_metric_s = st.acc_for_metric_s;
-        }
-
-        // Calculate empty furnace time
-        double vacio_horno_sec = static_cast<double>(timer) 
-                                 - out_mcf_metric_s 
-                                 - static_cast<double>(out_stops_t_s) 
-                                 - static_cast<double>(out_faults_t_s);
-        double vacio_horno_min = (vacio_horno_sec > 0) ? (vacio_horno_sec / 60.0) : 0.0;
-
-        json j_status;
-        j_status["status"]    = status;
-        j_status["timer"]     = timer;
-        j_status["raw_grades"] = raw_grades;
-        j_status["ts"]        = iso8601_utc_now();
-
-        json j_prod;
-        j_prod["maquina_id"] = 6;
-        j_prod["turno"]      = shiftNum;
-        j_prod["cantidad_produccion"] = out_grades;
-        j_prod["cantidad_paradas"]    = out_stops_q;
-        j_prod["tiempo_paradas"]      = out_stops_t_s;
-        j_prod["cantidad_fallas"]     = out_faults_q;
-        j_prod["tiempo_fallas"]       = out_faults_t_s;
-        j_prod["tiempo_metrica_mcf"]  = (uint32_t)out_mcf_metric_s;
-        j_prod["tiempo_metrica_for"]  = (uint32_t)out_for_metric_s;
-        j_prod["vacio_horno_min"]     = vacio_horno_min;
-        j_prod["timestamp_device"]    = iso8601_utc_now();
-
-        auto topic_status = isa95_prefix + std::to_string(line) + "/entrada_horno/status";
-        auto topic_prod   = isa95_prefix + std::to_string(line) + "/entrada_horno/production";
-
-        return { 
-            make_pub(topic_status, j_status), 
-            make_pub(topic_prod, j_prod) 
-        };
-    }
-};
-
-std::mutex EntradaHornoProcessor::mtx_;
-std::unordered_map<int, EntradaHornoProcessor::State>
-    EntradaHornoProcessor::states_;
-
-void EntradaHornoProcessor::reset_states()
-{
-    std::lock_guard<std::mutex> lk(mtx_);
-    states_.clear();
-    std::cout << "[EntradaHornoProcessor] All states reset" << std::endl;
-}
-
-// ============================================================================
-// SalidaHornoProcessor - Fixed with correct counter handling
-// ============================================================================
-
-class SalidaHornoProcessor : public IMessageProcessor
-{
-    struct State {
-        bool initialized = false;
-        int shift = -1;
-
-        uint16_t last_bancalinos0 = 0;
-        uint32_t acc_bancalinos0 = 0;
-
-        uint16_t last_bancalinos1 = 0;
-        uint32_t acc_bancalinos1 = 0;
-
-        uint16_t last_bancalinosComb1 = 0;
-        uint32_t acc_bancalinosComb1 = 0;
-
-        uint16_t last_bancalinosComb2 = 0;
-        uint32_t acc_bancalinosComb2 = 0;
-
-        uint16_t last_bancalinosTotal = 0;
-        uint32_t acc_bancalinosTotal = 0;
-
-        uint16_t last_cambioBarrera = 0;
-        uint32_t acc_cambioBarrera = 0;
-
-        uint16_t last_cambioBarreraTotal = 0;
-        uint32_t acc_cambioBarreraTotal = 0;
-
-        uint16_t last_cambioSentido = 0;
-        uint32_t acc_cambioSentido = 0;
-
-        uint16_t last_cambioSentidoTotal = 0;
-        uint32_t acc_cambioSentidoTotal = 0;
-
-        uint16_t last_cantidad = 0;
-        uint32_t acc_cantidad = 0;
-
-        uint16_t last_cantidad_total = 0;
-        uint32_t acc_cantidad_total = 0;
-
-        uint16_t last_paradas_1 = 0;
-        uint32_t acc_paradas_1 = 0;
-
-        uint16_t last_paradas_2 = 0;
-        uint32_t acc_paradas_2 = 0;
-
+        // All 16-bit counters - last values and accumulators
         uint16_t last_timer1Hz = 0;
         uint32_t acc_timer1Hz = 0;
 
-        uint32_t acc_tiempo_operacion_s = 0;
+        uint16_t last_paradas_cantidad = 0;
+        uint32_t acc_paradas_cantidad = 0;
+
+        uint16_t last_paradas_tempo = 0;
+        uint32_t acc_paradas_tempo_s = 0;
+
+        uint16_t last_ingreso_elevador_cantidad = 0;
+        uint32_t acc_ingreso_elevador_cantidad = 0;
+
+        uint16_t last_ingreso_elevador_tiempo = 0;
+        uint32_t acc_ingreso_elevador_tiempo_ds = 0;
+
+        uint16_t last_bancalino_l1_cantidad = 0;
+        uint32_t acc_bancalino_l1_cantidad = 0;
+
+        uint16_t last_bancalino_l1_tiempo = 0;
+        uint32_t acc_bancalino_l1_tiempo_ds = 0;
+
+        uint16_t last_bancalino_l2_cantidad = 0;
+        uint32_t acc_bancalino_l2_cantidad = 0;
+
+        uint16_t last_bancalino_l2_tiempo = 0;
+        uint32_t acc_bancalino_l2_tiempo_ds = 0;
     };
 
     static std::mutex mtx_;
     static std::unordered_map<int, State> states_;
+
+    // 16-bit counter delta with rollover handling
+    static uint16_t diff16(uint16_t curr, uint16_t prev) {
+        if (curr >= prev) {
+            return curr - prev;
+        } else {
+            return static_cast<uint16_t>(65536 + curr - prev);
+        }
+    }
 
 public:
     static void reset_states() {
@@ -1208,148 +678,1096 @@ public:
         auto sh = current_shift_localtime();
         int shiftNum = (sh == Shift::S1 ? 1 : (sh == Shift::S2 ? 2 : 3));
 
+        // === Read header fields ===
         int line = jsonu::get_opt<int>(msg, "lineID").value_or(0);
         int alarms = jsonu::get_opt<int>(msg, "alarms").value_or(0);
         int checksum = jsonu::get_opt<int>(msg, "checksum").value_or(0);
         int deviceType = jsonu::get_opt<int>(msg, "deviceType").value_or(0);
 
-        int bancalinos0_raw = jsonu::get_opt<int>(msg, "bancalinos0").value_or(0);
-        int bancalinos1_raw = jsonu::get_opt<int>(msg, "bancalinos1").value_or(0);
-        int bancalinosComb1_raw = jsonu::get_opt<int>(msg, "bancalinosComb1").value_or(0);
-        int bancalinosComb2_raw = jsonu::get_opt<int>(msg, "bancalinosComb2").value_or(0);
-        int bancalinosTotal_raw = jsonu::get_opt<int>(msg, "bancalinosTotal").value_or(0);
+        // === Read all 16-bit counters (new semantic names from decoder v2) ===
+        uint16_t timer1Hz = static_cast<uint16_t>(
+            jsonu::get_opt<int>(msg, "timer1Hz").value_or(0));
 
-        int cambioBarrera_raw = jsonu::get_opt<int>(msg, "cambioBarrera").value_or(0);
-        int cambioBarreraTotal_raw = jsonu::get_opt<int>(msg, "cambioBarreraTotal").value_or(0);
-        int cambioSentido_raw = jsonu::get_opt<int>(msg, "cambioSentido").value_or(0);
-        int cambioSentidoTotal_raw = jsonu::get_opt<int>(msg, "cambioSentidoTotal").value_or(0);
+        uint16_t paradas_cantidad = static_cast<uint16_t>(
+            jsonu::get_opt<int>(msg, "paradas_cantidad").value_or(0));
 
-        int cantidad_raw = jsonu::get_opt<int>(msg, "cantidad").value_or(0);
-        int cantidad_total_raw = jsonu::get_opt<int>(msg, "cantidad_total").value_or(0);
+        uint16_t paradas_tempo = static_cast<uint16_t>(
+            jsonu::get_opt<int>(msg, "paradas_tempo_s").value_or(0));
 
-        int paradas_1_raw = jsonu::get_opt<int>(msg, "paradas_1").value_or(0);
-        int paradas_2_raw = jsonu::get_opt<int>(msg, "paradas_2").value_or(0);
+        uint16_t ingreso_elevador_cantidad = static_cast<uint16_t>(
+            jsonu::get_opt<int>(msg, "ingreso_elevador_cantidad").value_or(0));
 
-        int timer1Hz_raw = jsonu::get_opt<int>(msg, "timer1Hz").value_or(0);
+        uint16_t ingreso_elevador_tiempo = static_cast<uint16_t>(
+            jsonu::get_opt<int>(msg, "ingreso_elevador_tiempo_ds").value_or(0));
 
-        uint16_t bancalinos0 = static_cast<uint16_t>(bancalinos0_raw);
-        uint16_t bancalinos1 = static_cast<uint16_t>(bancalinos1_raw);
-        uint16_t bancalinosComb1 = static_cast<uint16_t>(bancalinosComb1_raw);
-        uint16_t bancalinosComb2 = static_cast<uint16_t>(bancalinosComb2_raw);
-        uint16_t bancalinosTotal = static_cast<uint16_t>(bancalinosTotal_raw);
-        uint16_t cambioBarrera = static_cast<uint16_t>(cambioBarrera_raw);
-        uint16_t cambioBarreraTotal = static_cast<uint16_t>(cambioBarreraTotal_raw);
-        uint16_t cambioSentido = static_cast<uint16_t>(cambioSentido_raw);
-        uint16_t cambioSentidoTotal = static_cast<uint16_t>(cambioSentidoTotal_raw);
-        uint16_t cantidad = static_cast<uint16_t>(cantidad_raw);
-        uint16_t cantidad_total = static_cast<uint16_t>(cantidad_total_raw);
-        uint16_t paradas_1 = static_cast<uint16_t>(paradas_1_raw);
-        uint16_t paradas_2 = static_cast<uint16_t>(paradas_2_raw);
-        uint16_t timer1Hz = static_cast<uint16_t>(timer1Hz_raw);
+        uint16_t bancalino_l1_cantidad = static_cast<uint16_t>(
+            jsonu::get_opt<int>(msg, "bancalino_l1_cantidad").value_or(0));
 
-        uint32_t acc_bancalinos0_out = 0;
-        uint32_t acc_bancalinos1_out = 0;
-        uint32_t acc_bancalinosComb1_out = 0;
-        uint32_t acc_bancalinosComb2_out = 0;
-        uint32_t acc_bancalinosTotal_out = 0;
-        uint32_t acc_cambioBarrera_out = 0;
-        uint32_t acc_cambioBarreraTotal_out = 0;
-        uint32_t acc_cambioSentido_out = 0;
-        uint32_t acc_cambioSentidoTotal_out = 0;
-        uint32_t acc_cantidad_out = 0;
-        uint32_t acc_cantidad_total_out = 0;
-        uint32_t acc_paradas_1_out = 0;
-        uint32_t acc_paradas_2_out = 0;
-        uint32_t acc_tiempo_operacion_s_out = 0;
+        uint16_t bancalino_l1_tiempo = static_cast<uint16_t>(
+            jsonu::get_opt<int>(msg, "bancalino_l1_tiempo_ds").value_or(0));
+
+        uint16_t bancalino_l2_cantidad = static_cast<uint16_t>(
+            jsonu::get_opt<int>(msg, "bancalino_l2_cantidad").value_or(0));
+
+        uint16_t bancalino_l2_tiempo = static_cast<uint16_t>(
+            jsonu::get_opt<int>(msg, "bancalino_l2_tiempo_ds").value_or(0));
+
+        // === Output accumulators ===
+        uint32_t acc_timer1Hz_out = 0;
+        uint32_t acc_paradas_cantidad_out = 0;
+        uint32_t acc_paradas_tempo_s_out = 0;
+        uint32_t acc_ingreso_elevador_cantidad_out = 0;
+        uint32_t acc_ingreso_elevador_tiempo_ds_out = 0;
+        uint32_t acc_bancalino_l1_cantidad_out = 0;
+        uint32_t acc_bancalino_l1_tiempo_ds_out = 0;
+        uint32_t acc_bancalino_l2_cantidad_out = 0;
+        uint32_t acc_bancalino_l2_tiempo_ds_out = 0;
 
         {
             std::lock_guard<std::mutex> lock(mtx_);
             State &st = states_[line];
 
             if (!st.initialized || st.shift != shiftNum) {
+                // New shift - reset all accumulators and store initial values
                 st = State();
                 st.initialized = true;
                 st.shift = shiftNum;
 
-                st.last_bancalinos0 = bancalinos0;
-                st.last_bancalinos1 = bancalinos1;
-                st.last_bancalinosComb1 = bancalinosComb1;
-                st.last_bancalinosComb2 = bancalinosComb2;
-                st.last_bancalinosTotal = bancalinosTotal;
-                st.last_cambioBarrera = cambioBarrera;
-                st.last_cambioBarreraTotal = cambioBarreraTotal;
-                st.last_cambioSentido = cambioSentido;
-                st.last_cambioSentidoTotal = cambioSentidoTotal;
-                st.last_cantidad = cantidad;
-                st.last_cantidad_total = cantidad_total;
-                st.last_paradas_1 = paradas_1;
-                st.last_paradas_2 = paradas_2;
                 st.last_timer1Hz = timer1Hz;
+                st.last_paradas_cantidad = paradas_cantidad;
+                st.last_paradas_tempo = paradas_tempo;
+                st.last_ingreso_elevador_cantidad = ingreso_elevador_cantidad;
+                st.last_ingreso_elevador_tiempo = ingreso_elevador_tiempo;
+                st.last_bancalino_l1_cantidad = bancalino_l1_cantidad;
+                st.last_bancalino_l1_tiempo = bancalino_l1_tiempo;
+                st.last_bancalino_l2_cantidad = bancalino_l2_cantidad;
+                st.last_bancalino_l2_tiempo = bancalino_l2_tiempo;
             }
             else {
-                // Use PLC-compatible counter validation for all counters
-                st.acc_bancalinos0 += diff_counter(bancalinos0, st.last_bancalinos0);
-                st.last_bancalinos0 = bancalinos0;
+                // Accumulate deltas using diff_counter with validation (ALL counters are 16-bit)
+                st.acc_timer1Hz += diff_timer(timer1Hz, st.last_timer1Hz);
+                st.last_timer1Hz = timer1Hz;
 
-                st.acc_bancalinos1 += diff_counter(bancalinos1, st.last_bancalinos1);
-                st.last_bancalinos1 = bancalinos1;
+                st.acc_paradas_cantidad += diff_counter(paradas_cantidad, st.last_paradas_cantidad);
+                st.last_paradas_cantidad = paradas_cantidad;
 
-                st.acc_bancalinosComb1 += diff_counter(bancalinosComb1, st.last_bancalinosComb1);
-                st.last_bancalinosComb1 = bancalinosComb1;
+                st.acc_paradas_tempo_s += diff_timer(paradas_tempo, st.last_paradas_tempo);
+                st.last_paradas_tempo = paradas_tempo;
 
-                st.acc_bancalinosComb2 += diff_counter(bancalinosComb2, st.last_bancalinosComb2);
-                st.last_bancalinosComb2 = bancalinosComb2;
+                st.acc_ingreso_elevador_cantidad += diff_counter(ingreso_elevador_cantidad, st.last_ingreso_elevador_cantidad);
+                st.last_ingreso_elevador_cantidad = ingreso_elevador_cantidad;
 
-                st.acc_bancalinosTotal += diff_counter(bancalinosTotal, st.last_bancalinosTotal);
-                st.last_bancalinosTotal = bancalinosTotal;
+                st.acc_ingreso_elevador_tiempo_ds += diff_timer(ingreso_elevador_tiempo, st.last_ingreso_elevador_tiempo);
+                st.last_ingreso_elevador_tiempo = ingreso_elevador_tiempo;
 
-                st.acc_cambioBarrera += diff_counter(cambioBarrera, st.last_cambioBarrera);
-                st.last_cambioBarrera = cambioBarrera;
+                st.acc_bancalino_l1_cantidad += diff_counter(bancalino_l1_cantidad, st.last_bancalino_l1_cantidad);
+                st.last_bancalino_l1_cantidad = bancalino_l1_cantidad;
 
-                st.acc_cambioBarreraTotal += diff_counter(cambioBarreraTotal, st.last_cambioBarreraTotal);
-                st.last_cambioBarreraTotal = cambioBarreraTotal;
+                st.acc_bancalino_l1_tiempo_ds += diff_timer(bancalino_l1_tiempo, st.last_bancalino_l1_tiempo);
+                st.last_bancalino_l1_tiempo = bancalino_l1_tiempo;
 
-                st.acc_cambioSentido += diff_counter(cambioSentido, st.last_cambioSentido);
-                st.last_cambioSentido = cambioSentido;
+                st.acc_bancalino_l2_cantidad += diff_counter(bancalino_l2_cantidad, st.last_bancalino_l2_cantidad);
+                st.last_bancalino_l2_cantidad = bancalino_l2_cantidad;
 
-                st.acc_cambioSentidoTotal += diff_counter(cambioSentidoTotal, st.last_cambioSentidoTotal);
-                st.last_cambioSentidoTotal = cambioSentidoTotal;
+                st.acc_bancalino_l2_tiempo_ds += diff_timer(bancalino_l2_tiempo, st.last_bancalino_l2_tiempo);
+                st.last_bancalino_l2_tiempo = bancalino_l2_tiempo;
+            }
 
-                st.acc_cantidad += diff_counter(cantidad, st.last_cantidad);
-                st.last_cantidad = cantidad;
+            // Copy accumulated values to output
+            acc_timer1Hz_out = st.acc_timer1Hz;
+            acc_paradas_cantidad_out = st.acc_paradas_cantidad;
+            acc_paradas_tempo_s_out = st.acc_paradas_tempo_s;
+            acc_ingreso_elevador_cantidad_out = st.acc_ingreso_elevador_cantidad;
+            acc_ingreso_elevador_tiempo_ds_out = st.acc_ingreso_elevador_tiempo_ds;
+            acc_bancalino_l1_cantidad_out = st.acc_bancalino_l1_cantidad;
+            acc_bancalino_l1_tiempo_ds_out = st.acc_bancalino_l1_tiempo_ds;
+            acc_bancalino_l2_cantidad_out = st.acc_bancalino_l2_cantidad;
+            acc_bancalino_l2_tiempo_ds_out = st.acc_bancalino_l2_tiempo_ds;
+        }
 
-                st.acc_cantidad_total += diff_counter(cantidad_total, st.last_cantidad_total);
-                st.last_cantidad_total = cantidad_total;
+        // === Build output JSON with CORRECT semantic field names ===
+        json prod;
+        prod["maquina_id"] = 3;
+        prod["turno"] = shiftNum;
+        prod["deviceType"] = deviceType;
+        prod["lineID"] = line;
+        prod["checksum"] = checksum;
 
-                st.acc_paradas_1 += diff_counter(paradas_1, st.last_paradas_1);
-                st.last_paradas_1 = paradas_1;
+        // Timer/validation
+        prod["timer1Hz_instantaneo"] = timer1Hz;
+        prod["timer1Hz_turno"] = acc_timer1Hz_out;
 
-                st.acc_paradas_2 += diff_counter(paradas_2, st.last_paradas_2);
-                st.last_paradas_2 = paradas_2;
+        // Paradas (stops) - D29003, D29004
+        prod["paradas_instantaneo"] = paradas_cantidad;
+        prod["paradas_turno"] = acc_paradas_cantidad_out;
+        prod["paradas_tiempo_instantaneo_s"] = paradas_tempo;
+        prod["paradas_tiempo_turno_s"] = acc_paradas_tempo_s_out;
 
-                // timer1Hz is a timer (counts seconds)
+        // Ingreso Elevador - D29005, D29006
+        prod["ingreso_elevador_instantaneo"] = ingreso_elevador_cantidad;
+        prod["ingreso_elevador_turno"] = acc_ingreso_elevador_cantidad_out;
+        prod["ingreso_elevador_tiempo_instantaneo_ds"] = ingreso_elevador_tiempo;
+        prod["ingreso_elevador_tiempo_turno_ds"] = acc_ingreso_elevador_tiempo_ds_out;
+
+        // Bancalino Linea 1 - D29007, D29008
+        prod["bancalino_l1_instantaneo"] = bancalino_l1_cantidad;
+        prod["bancalino_l1_turno"] = acc_bancalino_l1_cantidad_out;
+        prod["bancalino_l1_tiempo_instantaneo_ds"] = bancalino_l1_tiempo;
+        prod["bancalino_l1_tiempo_turno_ds"] = acc_bancalino_l1_tiempo_ds_out;
+
+        // Bancalino Linea 2 - D29009, D29010
+        prod["bancalino_l2_instantaneo"] = bancalino_l2_cantidad;
+        prod["bancalino_l2_turno"] = acc_bancalino_l2_cantidad_out;
+        prod["bancalino_l2_tiempo_instantaneo_ds"] = bancalino_l2_tiempo;
+        prod["bancalino_l2_tiempo_turno_ds"] = acc_bancalino_l2_tiempo_ds_out;
+
+        prod["timestamp_device"] = iso8601_utc_now();
+
+        // Alarms
+        json qual;
+        qual["alarms"] = alarms;
+        qual["timestamp_device"] = iso8601_utc_now();
+
+        auto t1 = isa95_prefix + std::to_string(line) + "/entrada_secador/alarms";
+        auto t2 = isa95_prefix + std::to_string(line) + "/entrada_secador/production";
+
+        return { make_pub(t1, qual), make_pub(t2, prod) };
+    }
+};
+
+// Static definitions
+std::mutex EntradaSecadorProcessor::mtx_;
+std::unordered_map<int, EntradaSecadorProcessor::State> EntradaSecadorProcessor::states_;
+
+
+
+/**
+ * SalidaSecadorProcessor - CORRECTED VERSION
+ * 
+ * Changes from original:
+ * 1. Reads NEW semantic field names from LoRaWAN decoder v2
+ * 2. ALL counters are 16-bit (removed 15-bit MASK misuse)
+ * 3. Uses diff16() for all delta calculations (rollover at 65535)
+ * 4. Output JSON uses correct semantic names
+ * 
+ * Input fields (from decoder v2):
+ *   checksum, timer1Hz, alarms, parada_mds_cantidad, parada_mds_tiempo_s,
+ *   metrica_mds_cantidad, metrica_mds_tiempo_ds
+ * 
+ * PLC Register mapping (SecciÃ³n6):
+ *   D29003 = parada_mds_cantidad (stop events)
+ *   D29004 = parada_mds_tiempo_s (stop time in seconds)
+ *   D29005 = metrica_mds_cantidad (MDS cycles - NOT products!)
+ *   D29006 = metrica_mds_tiempo_ds (MDS cycle time in deciseconds)
+ * 
+ * MDS = Mesa de Descarga Secador (Dryer Discharge Table)
+ */
+
+class SalidaSecadorProcessor : public IMessageProcessor
+{
+private:
+    struct State
+    {
+        bool initialized = false;
+        int shift = 0;
+
+        // All 16-bit counters - last values and accumulators
+        uint16_t last_timer1Hz = 0;
+        uint32_t acc_timer1Hz = 0;
+
+        uint16_t last_parada_mds_cantidad = 0;
+        uint32_t acc_parada_mds_cantidad = 0;
+
+        uint16_t last_parada_mds_tiempo = 0;
+        uint32_t acc_parada_mds_tiempo_s = 0;
+
+        uint16_t last_metrica_mds_cantidad = 0;
+        uint32_t acc_metrica_mds_cantidad = 0;
+
+        uint16_t last_metrica_mds_tiempo = 0;
+        uint32_t acc_metrica_mds_tiempo_ds = 0;
+    };
+
+    static std::mutex mtx_;
+    static std::unordered_map<int, State> states_;
+
+    // 16-bit counter delta with rollover handling
+    static uint16_t diff16(uint16_t curr, uint16_t prev) {
+        if (curr >= prev) {
+            return curr - prev;
+        } else {
+            return static_cast<uint16_t>(65536 + curr - prev);
+        }
+    }
+
+public:
+    static void reset_states() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        states_.clear();
+    }
+
+    std::vector<Publication> process(const json &msg,
+                                     const std::string &isa95_prefix) override
+    {
+        auto sh = current_shift_localtime();
+        int shiftNum = (sh == Shift::S1 ? 1 : (sh == Shift::S2 ? 2 : 3));
+
+        // === Read header fields ===
+        int line = jsonu::get_opt<int>(msg, "lineID").value_or(0);
+        int alarms = jsonu::get_opt<int>(msg, "alarms").value_or(0);
+        int checksum = jsonu::get_opt<int>(msg, "checksum").value_or(0);
+        int deviceType = jsonu::get_opt<int>(msg, "deviceType").value_or(0);
+
+        // === Read all 16-bit counters (new semantic names from decoder v2) ===
+        uint16_t timer1Hz = static_cast<uint16_t>(
+            jsonu::get_opt<int>(msg, "timer1Hz").value_or(0));
+
+        uint16_t parada_mds_cantidad = static_cast<uint16_t>(
+            jsonu::get_opt<int>(msg, "parada_mds_cantidad").value_or(0));
+
+        uint16_t parada_mds_tiempo = static_cast<uint16_t>(
+            jsonu::get_opt<int>(msg, "parada_mds_tiempo_s").value_or(0));
+
+        uint16_t metrica_mds_cantidad = static_cast<uint16_t>(
+            jsonu::get_opt<int>(msg, "metrica_mds_cantidad").value_or(0));
+
+        uint16_t metrica_mds_tiempo = static_cast<uint16_t>(
+            jsonu::get_opt<int>(msg, "metrica_mds_tiempo_ds").value_or(0));
+
+        // === Output accumulators ===
+        uint32_t acc_timer1Hz_out = 0;
+        uint32_t acc_parada_mds_cantidad_out = 0;
+        uint32_t acc_parada_mds_tiempo_s_out = 0;
+        uint32_t acc_metrica_mds_cantidad_out = 0;
+        uint32_t acc_metrica_mds_tiempo_ds_out = 0;
+
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            State &st = states_[line];
+
+            if (!st.initialized || st.shift != shiftNum) {
+                // New shift - reset all accumulators and store initial values
+                st = State();
+                st.initialized = true;
+                st.shift = shiftNum;
+
+                st.last_timer1Hz = timer1Hz;
+                st.last_parada_mds_cantidad = parada_mds_cantidad;
+                st.last_parada_mds_tiempo = parada_mds_tiempo;
+                st.last_metrica_mds_cantidad = metrica_mds_cantidad;
+                st.last_metrica_mds_tiempo = metrica_mds_tiempo;
+            }
+            else {
+                // Accumulate deltas using diff_counter with validation (ALL counters are 16-bit)
+                st.acc_timer1Hz += diff_timer(timer1Hz, st.last_timer1Hz);
+                st.last_timer1Hz = timer1Hz;
+
+                st.acc_parada_mds_cantidad += diff_counter(parada_mds_cantidad, st.last_parada_mds_cantidad);
+                st.last_parada_mds_cantidad = parada_mds_cantidad;
+
+                st.acc_parada_mds_tiempo_s += diff_timer(parada_mds_tiempo, st.last_parada_mds_tiempo);
+                st.last_parada_mds_tiempo = parada_mds_tiempo;
+
+                st.acc_metrica_mds_cantidad += diff_counter(metrica_mds_cantidad, st.last_metrica_mds_cantidad);
+                st.last_metrica_mds_cantidad = metrica_mds_cantidad;
+
+                st.acc_metrica_mds_tiempo_ds += diff_timer(metrica_mds_tiempo, st.last_metrica_mds_tiempo);
+                st.last_metrica_mds_tiempo = metrica_mds_tiempo;
+            }
+
+            // Copy accumulated values to output
+            acc_timer1Hz_out = st.acc_timer1Hz;
+            acc_parada_mds_cantidad_out = st.acc_parada_mds_cantidad;
+            acc_parada_mds_tiempo_s_out = st.acc_parada_mds_tiempo_s;
+            acc_metrica_mds_cantidad_out = st.acc_metrica_mds_cantidad;
+            acc_metrica_mds_tiempo_ds_out = st.acc_metrica_mds_tiempo_ds;
+        }
+
+        // === Build output JSON with CORRECT semantic field names ===
+        json prod;
+        prod["maquina_id"] = 4;
+        prod["turno"] = shiftNum;
+        prod["deviceType"] = deviceType;
+        prod["lineID"] = line;
+        prod["checksum"] = checksum;
+
+        // Timer/validation
+        prod["timer1Hz_instantaneo"] = timer1Hz;
+        prod["timer1Hz_turno"] = acc_timer1Hz_out;
+
+        // Parada MDS (stops) - D29003, D29004
+        prod["parada_mds_instantaneo"] = parada_mds_cantidad;
+        prod["parada_mds_turno"] = acc_parada_mds_cantidad_out;
+        prod["parada_mds_tiempo_instantaneo_s"] = parada_mds_tiempo;
+        prod["parada_mds_tiempo_turno_s"] = acc_parada_mds_tiempo_s_out;
+
+        // MÃ©trica MDS (cycles) - D29005, D29006
+        // NOTE: These are MDS machine CYCLES, NOT product count!
+        prod["metrica_mds_instantaneo"] = metrica_mds_cantidad;
+        prod["metrica_mds_turno"] = acc_metrica_mds_cantidad_out;
+        prod["metrica_mds_tiempo_instantaneo_ds"] = metrica_mds_tiempo;
+        prod["metrica_mds_tiempo_turno_ds"] = acc_metrica_mds_tiempo_ds_out;
+        
+        // Convert deciseconds to seconds for convenience
+        prod["metrica_mds_tiempo_turno_s"] = static_cast<double>(acc_metrica_mds_tiempo_ds_out) * 0.1;
+
+        prod["timestamp_device"] = iso8601_utc_now();
+
+        // Alarms
+        json qual;
+        qual["alarms"] = alarms;
+        qual["timestamp_device"] = iso8601_utc_now();
+
+        auto t1 = isa95_prefix + std::to_string(line) + "/salida_secador/alarms";
+        auto t2 = isa95_prefix + std::to_string(line) + "/salida_secador/production";
+
+        return { make_pub(t1, qual), make_pub(t2, prod) };
+    }
+};
+
+// Static definitions
+std::mutex SalidaSecadorProcessor::mtx_;
+std::unordered_map<int, SalidaSecadorProcessor::State> SalidaSecadorProcessor::states_;
+
+/**
+ * EsmalteProcessor - CORRECTED VERSION
+ * 
+ * Changes from original:
+ * 1. Reads NEW semantic field names from LoRaWAN decoder v2
+ * 2. ALL counters are 16-bit (removed 15-bit MASK misuse)
+ * 3. Uses diff16() for all delta calculations (rollover at 65535)
+ * 4. Output JSON uses correct semantic names
+ * 
+ * Input fields (from decoder v2):
+ *   checksum, timer1Hz, alarms, parada_esm_cantidad, parada_esm_tiempo_s,
+ *   metrica_esm_cantidad, metrica_esm_tiempo_ds
+ * 
+ * PLC Register mapping (SecciÃ³n1):
+ *   D29003 = parada_esm_cantidad (stop events)
+ *   D29004 = parada_esm_tiempo_s (stop time in seconds)
+ *   D29005 = metrica_esm_cantidad (ESM cycles - NOT products!)
+ *   D29006 = metrica_esm_tiempo_ds (ESM cycle time in deciseconds)
+ * 
+ * ESM = Esmaltadora (Glazing Machine)
+ */
+
+class EsmalteProcessor : public IMessageProcessor
+{
+private:
+    struct State
+    {
+        bool initialized = false;
+        int shift = 0;
+
+        // All 16-bit counters - last values and accumulators
+        uint16_t last_timer1Hz = 0;
+        uint32_t acc_timer1Hz = 0;
+
+        uint16_t last_parada_esm_cantidad = 0;
+        uint32_t acc_parada_esm_cantidad = 0;
+
+        uint16_t last_parada_esm_tiempo = 0;
+        uint32_t acc_parada_esm_tiempo_s = 0;
+
+        uint16_t last_metrica_esm_cantidad = 0;
+        uint32_t acc_metrica_esm_cantidad = 0;
+
+        uint16_t last_metrica_esm_tiempo = 0;
+        uint32_t acc_metrica_esm_tiempo_ds = 0;
+    };
+
+    static std::mutex mtx_;
+    static std::unordered_map<int, State> states_;
+
+    // 16-bit counter delta with rollover handling
+    static uint16_t diff16(uint16_t curr, uint16_t prev) {
+        if (curr >= prev) {
+            return curr - prev;
+        } else {
+            return static_cast<uint16_t>(65536 + curr - prev);
+        }
+    }
+
+public:
+    static void reset_states() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        states_.clear();
+    }
+
+    std::vector<Publication> process(const json &msg,
+                                     const std::string &isa95_prefix) override
+    {
+        auto sh = current_shift_localtime();
+        int shiftNum = (sh == Shift::S1 ? 1 : (sh == Shift::S2 ? 2 : 3));
+
+        // === Read header fields ===
+        int line = jsonu::get_opt<int>(msg, "lineID").value_or(0);
+        int alarms = jsonu::get_opt<int>(msg, "alarms").value_or(0);
+        int checksum = jsonu::get_opt<int>(msg, "checksum").value_or(0);
+        int deviceType = jsonu::get_opt<int>(msg, "deviceType").value_or(0);
+
+        // === Read all 16-bit counters (new semantic names from decoder v2) ===
+        uint16_t timer1Hz = static_cast<uint16_t>(
+            jsonu::get_opt<int>(msg, "timer1Hz").value_or(0));
+
+        uint16_t parada_esm_cantidad = static_cast<uint16_t>(
+            jsonu::get_opt<int>(msg, "parada_esm_cantidad").value_or(0));
+
+        uint16_t parada_esm_tiempo = static_cast<uint16_t>(
+            jsonu::get_opt<int>(msg, "parada_esm_tiempo_s").value_or(0));
+
+        uint16_t metrica_esm_cantidad = static_cast<uint16_t>(
+            jsonu::get_opt<int>(msg, "metrica_esm_cantidad").value_or(0));
+
+        uint16_t metrica_esm_tiempo = static_cast<uint16_t>(
+            jsonu::get_opt<int>(msg, "metrica_esm_tiempo_ds").value_or(0));
+
+        // === Output accumulators ===
+        uint32_t acc_timer1Hz_out = 0;
+        uint32_t acc_parada_esm_cantidad_out = 0;
+        uint32_t acc_parada_esm_tiempo_s_out = 0;
+        uint32_t acc_metrica_esm_cantidad_out = 0;
+        uint32_t acc_metrica_esm_tiempo_ds_out = 0;
+
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            State &st = states_[line];
+
+            if (!st.initialized || st.shift != shiftNum) {
+                // New shift - reset all accumulators and store initial values
+                st = State();
+                st.initialized = true;
+                st.shift = shiftNum;
+
+                st.last_timer1Hz = timer1Hz;
+                st.last_parada_esm_cantidad = parada_esm_cantidad;
+                st.last_parada_esm_tiempo = parada_esm_tiempo;
+                st.last_metrica_esm_cantidad = metrica_esm_cantidad;
+                st.last_metrica_esm_tiempo = metrica_esm_tiempo;
+            }
+            else {
+                // Accumulate deltas using diff_counter with validation (ALL counters are 16-bit)
+                st.acc_timer1Hz += diff_timer(timer1Hz, st.last_timer1Hz);
+                st.last_timer1Hz = timer1Hz;
+
+                st.acc_parada_esm_cantidad += diff_counter(parada_esm_cantidad, st.last_parada_esm_cantidad);
+                st.last_parada_esm_cantidad = parada_esm_cantidad;
+
+                st.acc_parada_esm_tiempo_s += diff_timer(parada_esm_tiempo, st.last_parada_esm_tiempo);
+                st.last_parada_esm_tiempo = parada_esm_tiempo;
+
+                st.acc_metrica_esm_cantidad += diff_counter(metrica_esm_cantidad, st.last_metrica_esm_cantidad);
+                st.last_metrica_esm_cantidad = metrica_esm_cantidad;
+
+                st.acc_metrica_esm_tiempo_ds += diff_timer(metrica_esm_tiempo, st.last_metrica_esm_tiempo);
+                st.last_metrica_esm_tiempo = metrica_esm_tiempo;
+            }
+
+            // Copy accumulated values to output
+            acc_timer1Hz_out = st.acc_timer1Hz;
+            acc_parada_esm_cantidad_out = st.acc_parada_esm_cantidad;
+            acc_parada_esm_tiempo_s_out = st.acc_parada_esm_tiempo_s;
+            acc_metrica_esm_cantidad_out = st.acc_metrica_esm_cantidad;
+            acc_metrica_esm_tiempo_ds_out = st.acc_metrica_esm_tiempo_ds;
+        }
+
+        // === Build output JSON with CORRECT semantic field names ===
+        json prod;
+        prod["maquina_id"] = 5;
+        prod["turno"] = shiftNum;
+        prod["deviceType"] = deviceType;
+        prod["lineID"] = line;
+        prod["checksum"] = checksum;
+
+        // Timer/validation
+        prod["timer1Hz_instantaneo"] = timer1Hz;
+        prod["timer1Hz_turno"] = acc_timer1Hz_out;
+
+        // Parada ESM (stops) - D29003, D29004
+        prod["parada_esm_instantaneo"] = parada_esm_cantidad;
+        prod["parada_esm_turno"] = acc_parada_esm_cantidad_out;
+        prod["parada_esm_tiempo_instantaneo_s"] = parada_esm_tiempo;
+        prod["parada_esm_tiempo_turno_s"] = acc_parada_esm_tiempo_s_out;
+
+        // MÃ©trica ESM (cycles) - D29005, D29006
+        // NOTE: These are ESM machine CYCLES, NOT product count!
+        prod["metrica_esm_instantaneo"] = metrica_esm_cantidad;
+        prod["metrica_esm_turno"] = acc_metrica_esm_cantidad_out;
+        prod["metrica_esm_tiempo_instantaneo_ds"] = metrica_esm_tiempo;
+        prod["metrica_esm_tiempo_turno_ds"] = acc_metrica_esm_tiempo_ds_out;
+        
+        // Convert deciseconds to seconds for convenience
+        prod["metrica_esm_tiempo_turno_s"] = static_cast<double>(acc_metrica_esm_tiempo_ds_out) * 0.1;
+
+        prod["timestamp_device"] = iso8601_utc_now();
+
+        // Alarms
+        json qual;
+        qual["alarms"] = alarms;
+        qual["timestamp_device"] = iso8601_utc_now();
+
+        auto t1 = isa95_prefix + std::to_string(line) + "/esmalte/alarms";
+        auto t2 = isa95_prefix + std::to_string(line) + "/esmalte/production";
+
+        return { make_pub(t1, qual), make_pub(t2, prod) };
+    }
+};
+
+// Static definitions
+std::mutex EsmalteProcessor::mtx_;
+std::unordered_map<int, EsmalteProcessor::State> EsmalteProcessor::states_;
+
+/**
+ * EntradaHornoProcessor - CORRECTED VERSION v2
+ * 
+ * CRITICAL FIX: Previous decoder had wrong register mapping!
+ * This processor reads from the CORRECTED decoder v2 field names.
+ * 
+ * Input fields (from decoder v2):
+ *   checksum, timer1Hz, alarms, parada_mcf_cantidad, parada_mcf_tiempo_s,
+ *   metrica_mcf_cantidad, metrica_mcf_tiempo_ds, numero_grades,
+ *   metrica_formador_cantidad, metrica_formador_tiempo_ds,
+ *   falha_forno_cantidad, falha_forno_tiempo_s
+ * 
+ * PLC Register mapping (SecciÃ³n14):
+ *   D29003 = parada_mcf_cantidad (MCF stop count)
+ *   D29004 = parada_mcf_tiempo_s (MCF stop time, seconds)
+ *   D29005 = metrica_mcf_cantidad (MCF cycle count)
+ *   D29006 = metrica_mcf_tiempo_ds (MCF time, deciseconds)
+ *   D29007 = numero_grades (PRODUCTION COUNT! BCD from D410)
+ *   D29008 = metrica_formador_cantidad (formador cycle count)
+ *   D29009 = metrica_formador_tiempo_ds (formador time, deciseconds)
+ *   D29013 = falha_forno_cantidad (furnace failure count)
+ *   D29014 = falha_forno_tiempo_s (furnace failure time, seconds)
+ * 
+ * MCF = Mesa de Carga Forno (Kiln Loading Table)
+ * FORMADOR = Formador de Grades (Rack Former)
+ */
+
+class EntradaHornoProcessor : public IMessageProcessor
+{
+private:
+    struct State
+    {
+        bool initialized = false;
+        int shift = 0;
+
+        // Timer
+        uint16_t last_timer1Hz = 0;
+        uint32_t acc_timer1Hz = 0;
+
+        // Production: NÃºmero de Grades (D29007)
+        uint16_t last_numero_grades = 0;
+        uint32_t acc_numero_grades = 0;
+
+        // Parada MCF - D29003, D29004
+        uint16_t last_parada_mcf_cantidad = 0;
+        uint32_t acc_parada_mcf_cantidad = 0;
+
+        uint16_t last_parada_mcf_tiempo = 0;
+        uint32_t acc_parada_mcf_tiempo_s = 0;
+
+        // MÃ©trica MCF - D29005, D29006
+        uint16_t last_metrica_mcf_cantidad = 0;
+        uint32_t acc_metrica_mcf_cantidad = 0;
+
+        uint16_t last_metrica_mcf_tiempo = 0;
+        uint32_t acc_metrica_mcf_tiempo_ds = 0;
+
+        // MÃ©trica Formador - D29008, D29009
+        uint16_t last_metrica_formador_cantidad = 0;
+        uint32_t acc_metrica_formador_cantidad = 0;
+
+        uint16_t last_metrica_formador_tiempo = 0;
+        uint32_t acc_metrica_formador_tiempo_ds = 0;
+
+        // Falha Forno - D29013, D29014
+        uint16_t last_falha_forno_cantidad = 0;
+        uint32_t acc_falha_forno_cantidad = 0;
+
+        uint16_t last_falha_forno_tiempo = 0;
+        uint32_t acc_falha_forno_tiempo_s = 0;
+    };
+
+    static std::mutex mtx_;
+    static std::unordered_map<int, State> states_;
+
+    // 16-bit counter delta with rollover handling
+    static uint16_t diff16(uint16_t curr, uint16_t prev) {
+        if (curr >= prev) {
+            return curr - prev;
+        } else {
+            return static_cast<uint16_t>(65536 + curr - prev);
+        }
+    }
+
+public:
+    static void reset_states() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        states_.clear();
+    }
+
+    std::vector<Publication> process(const json &msg,
+                                     const std::string &isa95_prefix) override
+    {
+        auto sh = current_shift_localtime();
+        int shiftNum = (sh == Shift::S1 ? 1 : (sh == Shift::S2 ? 2 : 3));
+
+        // === Read header fields ===
+        int line = jsonu::get_opt<int>(msg, "lineID").value_or(0);
+        int alarms = jsonu::get_opt<int>(msg, "alarms").value_or(0);
+        int checksum = jsonu::get_opt<int>(msg, "checksum").value_or(0);
+        int deviceType = jsonu::get_opt<int>(msg, "deviceType").value_or(0);
+
+        // === Read all 16-bit counters (CORRECTED field names from decoder v2) ===
+        
+        uint16_t timer1Hz = static_cast<uint16_t>(
+            jsonu::get_opt<int>(msg, "timer1Hz").value_or(0));
+
+        // PRODUCTION COUNT - D29007 (BCD converted from D410)
+        uint16_t numero_grades = static_cast<uint16_t>(
+            jsonu::get_opt<int>(msg, "numero_grades").value_or(0));
+
+        // Parada MCF - D29003, D29004
+        uint16_t parada_mcf_cantidad = static_cast<uint16_t>(
+            jsonu::get_opt<int>(msg, "parada_mcf_cantidad").value_or(0));
+        uint16_t parada_mcf_tiempo = static_cast<uint16_t>(
+            jsonu::get_opt<int>(msg, "parada_mcf_tiempo_s").value_or(0));
+
+        // MÃ©trica MCF - D29005, D29006
+        uint16_t metrica_mcf_cantidad = static_cast<uint16_t>(
+            jsonu::get_opt<int>(msg, "metrica_mcf_cantidad").value_or(0));
+        uint16_t metrica_mcf_tiempo = static_cast<uint16_t>(
+            jsonu::get_opt<int>(msg, "metrica_mcf_tiempo_ds").value_or(0));
+
+        // MÃ©trica Formador - D29008, D29009
+        uint16_t metrica_formador_cantidad = static_cast<uint16_t>(
+            jsonu::get_opt<int>(msg, "metrica_formador_cantidad").value_or(0));
+        uint16_t metrica_formador_tiempo = static_cast<uint16_t>(
+            jsonu::get_opt<int>(msg, "metrica_formador_tiempo_ds").value_or(0));
+
+        // Falha Forno - D29013, D29014
+        uint16_t falha_forno_cantidad = static_cast<uint16_t>(
+            jsonu::get_opt<int>(msg, "falha_forno_cantidad").value_or(0));
+        uint16_t falha_forno_tiempo = static_cast<uint16_t>(
+            jsonu::get_opt<int>(msg, "falha_forno_tiempo_s").value_or(0));
+
+        // === Output accumulators ===
+        uint32_t acc_timer1Hz_out = 0;
+        uint32_t acc_numero_grades_out = 0;
+        uint32_t acc_parada_mcf_cantidad_out = 0;
+        uint32_t acc_parada_mcf_tiempo_s_out = 0;
+        uint32_t acc_metrica_mcf_cantidad_out = 0;
+        uint32_t acc_metrica_mcf_tiempo_ds_out = 0;
+        uint32_t acc_metrica_formador_cantidad_out = 0;
+        uint32_t acc_metrica_formador_tiempo_ds_out = 0;
+        uint32_t acc_falha_forno_cantidad_out = 0;
+        uint32_t acc_falha_forno_tiempo_s_out = 0;
+
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            State &st = states_[line];
+
+            if (!st.initialized || st.shift != shiftNum) {
+                // New shift - reset all accumulators and store initial values
+                st = State();
+                st.initialized = true;
+                st.shift = shiftNum;
+
+                st.last_timer1Hz = timer1Hz;
+                st.last_numero_grades = numero_grades;
+                st.last_parada_mcf_cantidad = parada_mcf_cantidad;
+                st.last_parada_mcf_tiempo = parada_mcf_tiempo;
+                st.last_metrica_mcf_cantidad = metrica_mcf_cantidad;
+                st.last_metrica_mcf_tiempo = metrica_mcf_tiempo;
+                st.last_metrica_formador_cantidad = metrica_formador_cantidad;
+                st.last_metrica_formador_tiempo = metrica_formador_tiempo;
+                st.last_falha_forno_cantidad = falha_forno_cantidad;
+                st.last_falha_forno_tiempo = falha_forno_tiempo;
+            }
+            else {
+                // Accumulate deltas using diff_counter with validation (ALL counters are 16-bit)
+                st.acc_timer1Hz += diff_timer(timer1Hz, st.last_timer1Hz);
+                st.last_timer1Hz = timer1Hz;
+
+                st.acc_numero_grades += diff_counter(numero_grades, st.last_numero_grades);
+                st.last_numero_grades = numero_grades;
+
+                st.acc_parada_mcf_cantidad += diff_counter(parada_mcf_cantidad, st.last_parada_mcf_cantidad);
+                st.last_parada_mcf_cantidad = parada_mcf_cantidad;
+
+                st.acc_parada_mcf_tiempo_s += diff_timer(parada_mcf_tiempo, st.last_parada_mcf_tiempo);
+                st.last_parada_mcf_tiempo = parada_mcf_tiempo;
+
+                st.acc_metrica_mcf_cantidad += diff_counter(metrica_mcf_cantidad, st.last_metrica_mcf_cantidad);
+                st.last_metrica_mcf_cantidad = metrica_mcf_cantidad;
+
+                st.acc_metrica_mcf_tiempo_ds += diff_timer(metrica_mcf_tiempo, st.last_metrica_mcf_tiempo);
+                st.last_metrica_mcf_tiempo = metrica_mcf_tiempo;
+
+                st.acc_metrica_formador_cantidad += diff_counter(metrica_formador_cantidad, st.last_metrica_formador_cantidad);
+                st.last_metrica_formador_cantidad = metrica_formador_cantidad;
+
+                st.acc_metrica_formador_tiempo_ds += diff_timer(metrica_formador_tiempo, st.last_metrica_formador_tiempo);
+                st.last_metrica_formador_tiempo = metrica_formador_tiempo;
+
+                st.acc_falha_forno_cantidad += diff_counter(falha_forno_cantidad, st.last_falha_forno_cantidad);
+                st.last_falha_forno_cantidad = falha_forno_cantidad;
+
+                st.acc_falha_forno_tiempo_s += diff_timer(falha_forno_tiempo, st.last_falha_forno_tiempo);
+                st.last_falha_forno_tiempo = falha_forno_tiempo;
+            }
+
+            // Copy accumulated values to output
+            acc_timer1Hz_out = st.acc_timer1Hz;
+            acc_numero_grades_out = st.acc_numero_grades;
+            acc_parada_mcf_cantidad_out = st.acc_parada_mcf_cantidad;
+            acc_parada_mcf_tiempo_s_out = st.acc_parada_mcf_tiempo_s;
+            acc_metrica_mcf_cantidad_out = st.acc_metrica_mcf_cantidad;
+            acc_metrica_mcf_tiempo_ds_out = st.acc_metrica_mcf_tiempo_ds;
+            acc_metrica_formador_cantidad_out = st.acc_metrica_formador_cantidad;
+            acc_metrica_formador_tiempo_ds_out = st.acc_metrica_formador_tiempo_ds;
+            acc_falha_forno_cantidad_out = st.acc_falha_forno_cantidad;
+            acc_falha_forno_tiempo_s_out = st.acc_falha_forno_tiempo_s;
+        }
+
+        // === Build output JSON with CORRECT semantic field names ===
+        json prod;
+        prod["maquina_id"] = 6;
+        prod["turno"] = shiftNum;
+        prod["deviceType"] = deviceType;
+        prod["lineID"] = line;
+        prod["checksum"] = checksum;
+
+        // Timer/validation
+        prod["timer1Hz_instantaneo"] = timer1Hz;
+        prod["timer1Hz_turno"] = acc_timer1Hz_out;
+
+        // PRODUCTION COUNT - numero_grades (D29007) ðŸŽ¯
+        prod["numero_grades_instantaneo"] = numero_grades;
+        prod["numero_grades_turno"] = acc_numero_grades_out;
+
+        // Parada MCF - D29003, D29004
+        prod["parada_mcf_instantaneo"] = parada_mcf_cantidad;
+        prod["parada_mcf_turno"] = acc_parada_mcf_cantidad_out;
+        prod["parada_mcf_tiempo_instantaneo_s"] = parada_mcf_tiempo;
+        prod["parada_mcf_tiempo_turno_s"] = acc_parada_mcf_tiempo_s_out;
+
+        // MÃ©trica MCF - D29005, D29006
+        prod["metrica_mcf_instantaneo"] = metrica_mcf_cantidad;
+        prod["metrica_mcf_turno"] = acc_metrica_mcf_cantidad_out;
+        prod["metrica_mcf_tiempo_instantaneo_ds"] = metrica_mcf_tiempo;
+        prod["metrica_mcf_tiempo_turno_ds"] = acc_metrica_mcf_tiempo_ds_out;
+        prod["metrica_mcf_tiempo_turno_s"] = static_cast<double>(acc_metrica_mcf_tiempo_ds_out) * 0.1;
+
+        // MÃ©trica Formador - D29008, D29009
+        prod["metrica_formador_instantaneo"] = metrica_formador_cantidad;
+        prod["metrica_formador_turno"] = acc_metrica_formador_cantidad_out;
+        prod["metrica_formador_tiempo_instantaneo_ds"] = metrica_formador_tiempo;
+        prod["metrica_formador_tiempo_turno_ds"] = acc_metrica_formador_tiempo_ds_out;
+        prod["metrica_formador_tiempo_turno_s"] = static_cast<double>(acc_metrica_formador_tiempo_ds_out) * 0.1;
+
+        // Falha Forno - D29013, D29014
+        prod["falha_forno_instantaneo"] = falha_forno_cantidad;
+        prod["falha_forno_turno"] = acc_falha_forno_cantidad_out;
+        prod["falha_forno_tiempo_instantaneo_s"] = falha_forno_tiempo;
+        prod["falha_forno_tiempo_turno_s"] = acc_falha_forno_tiempo_s_out;
+
+        prod["timestamp_device"] = iso8601_utc_now();
+
+        // Alarms
+        json qual;
+        qual["alarms"] = alarms;
+        qual["timestamp_device"] = iso8601_utc_now();
+
+        auto t1 = isa95_prefix + std::to_string(line) + "/entrada_horno/alarms";
+        auto t2 = isa95_prefix + std::to_string(line) + "/entrada_horno/production";
+
+        return { make_pub(t1, qual), make_pub(t2, prod) };
+    }
+};
+
+// Static definitions
+std::mutex EntradaHornoProcessor::mtx_;
+std::unordered_map<int, EntradaHornoProcessor::State> EntradaHornoProcessor::states_;
+
+/**
+ * SalidaHornoProcessor - CORRECTED VERSION
+ * 
+ * Changes from original:
+ * 1. Reads NEW semantic field names from LoRaWAN decoder
+ * 2. ALL counters are 16-bit (removed clean15/diff15 misuse)
+ * 3. Outputs OLD field names in JSON for backward compatibility
+ * 
+ * Input fields (from decoder v3):
+ *   checksum, timer1Hz, alarms, paradas_cantidad, paradas_tempo,
+ *   metrica_mdf_ciclos, metrica_mdf_tiempo, bancalinos_q301, bancalinos_q300,
+ *   bancalinos_comb1, parada_escolha_cantidad, parada_escolha_tempo,
+ *   sentido_escolha_cantidad, sentido_escolha_tiempo, barreira1_cantidad,
+ *   barreira1_tiempo, bancalinos_comb2, bancalinos_total
+ * 
+ * Output fields (backward compatible):
+ *   cantidad_*, bancalinos0_*, bancalinos1_*, paradas_1_*, paradas_2_*, etc.
+ */
+
+class SalidaHornoProcessor : public IMessageProcessor
+{
+private:
+    struct State
+    {
+        bool initialized = false;
+        int shift = 0;
+
+        // All 16-bit counters - last values and accumulators
+        uint16_t last_timer1Hz = 0;
+        uint32_t acc_timer1Hz = 0;
+        uint32_t acc_tiempo_operacion_s = 0;
+
+        uint16_t last_paradas_cantidad = 0;
+        uint32_t acc_paradas_cantidad = 0;
+
+        uint16_t last_paradas_tempo = 0;
+        uint32_t acc_paradas_tempo = 0;
+
+        uint16_t last_metrica_ciclos = 0;
+        uint32_t acc_metrica_ciclos = 0;
+
+        uint16_t last_metrica_tiempo = 0;
+        uint32_t acc_metrica_tiempo = 0;
+
+        uint16_t last_bancalinos_q301 = 0;
+        uint32_t acc_bancalinos_q301 = 0;
+
+        uint16_t last_bancalinos_q300 = 0;
+        uint32_t acc_bancalinos_q300 = 0;
+
+        uint16_t last_bancalinos_comb1 = 0;
+        uint32_t acc_bancalinos_comb1 = 0;
+
+        uint16_t last_bancalinos_comb2 = 0;
+        uint32_t acc_bancalinos_comb2 = 0;
+
+        uint16_t last_bancalinos_total = 0;
+        uint32_t acc_bancalinos_total = 0;
+
+        uint16_t last_parada_escolha_cantidad = 0;
+        uint32_t acc_parada_escolha_cantidad = 0;
+
+        uint16_t last_parada_escolha_tempo = 0;
+        uint32_t acc_parada_escolha_tempo = 0;
+
+        uint16_t last_sentido_escolha_cantidad = 0;
+        uint32_t acc_sentido_escolha_cantidad = 0;
+
+        uint16_t last_sentido_escolha_tiempo = 0;
+        uint32_t acc_sentido_escolha_tiempo = 0;
+
+        uint16_t last_barreira1_cantidad = 0;
+        uint32_t acc_barreira1_cantidad = 0;
+
+        uint16_t last_barreira1_tiempo = 0;
+        uint32_t acc_barreira1_tiempo = 0;
+    };
+
+    static std::mutex mtx_;
+    static std::unordered_map<int, State> states_;
+
+    // 16-bit counter delta with rollover handling
+    static uint16_t diff16(uint16_t curr, uint16_t prev) {
+        if (curr >= prev) {
+            return curr - prev;
+        } else {
+            return static_cast<uint16_t>(65536 + curr - prev);
+        }
+    }
+
+public:
+    static void reset_states() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        states_.clear();
+    }
+
+    std::vector<Publication> process(const json &msg,
+                                     const std::string &isa95_prefix) override
+    {
+        auto sh = current_shift_localtime();
+        int shiftNum = (sh == Shift::S1 ? 1 : (sh == Shift::S2 ? 2 : 3));
+
+        // === Read header fields ===
+        int line = jsonu::get_opt<int>(msg, "lineID").value_or(0);
+        int alarms = jsonu::get_opt<int>(msg, "alarms").value_or(0);
+        int checksum = jsonu::get_opt<int>(msg, "checksum").value_or(0);
+        int deviceType = jsonu::get_opt<int>(msg, "deviceType").value_or(0);
+
+        // === Read all 16-bit counters (new semantic names from decoder v3) ===
+        uint16_t timer1Hz = static_cast<uint16_t>(
+            jsonu::get_opt<int>(msg, "timer1Hz").value_or(0));
+        
+        uint16_t paradas_cantidad = static_cast<uint16_t>(
+            jsonu::get_opt<int>(msg, "paradas_cantidad").value_or(0));
+        
+        uint16_t paradas_tempo = static_cast<uint16_t>(
+            jsonu::get_opt<int>(msg, "paradas_tempo").value_or(0));
+        
+        uint16_t metrica_ciclos = static_cast<uint16_t>(
+            jsonu::get_opt<int>(msg, "metrica_mdf_ciclos").value_or(0));
+        
+        uint16_t metrica_tiempo = static_cast<uint16_t>(
+            jsonu::get_opt<int>(msg, "metrica_mdf_tiempo").value_or(0));
+        
+        uint16_t bancalinos_q301 = static_cast<uint16_t>(
+            jsonu::get_opt<int>(msg, "bancalinos_q301").value_or(0));
+        
+        uint16_t bancalinos_q300 = static_cast<uint16_t>(
+            jsonu::get_opt<int>(msg, "bancalinos_q300").value_or(0));
+        
+        uint16_t bancalinos_comb1 = static_cast<uint16_t>(
+            jsonu::get_opt<int>(msg, "bancalinos_comb1").value_or(0));
+        
+        uint16_t bancalinos_comb2 = static_cast<uint16_t>(
+            jsonu::get_opt<int>(msg, "bancalinos_comb2").value_or(0));
+        
+        uint16_t bancalinos_total = static_cast<uint16_t>(
+            jsonu::get_opt<int>(msg, "bancalinos_total").value_or(0));
+        
+        uint16_t parada_escolha_cantidad = static_cast<uint16_t>(
+            jsonu::get_opt<int>(msg, "parada_escolha_cantidad").value_or(0));
+        
+        uint16_t parada_escolha_tempo = static_cast<uint16_t>(
+            jsonu::get_opt<int>(msg, "parada_escolha_tempo").value_or(0));
+        
+        uint16_t sentido_escolha_cantidad = static_cast<uint16_t>(
+            jsonu::get_opt<int>(msg, "sentido_escolha_cantidad").value_or(0));
+        
+        uint16_t sentido_escolha_tiempo = static_cast<uint16_t>(
+            jsonu::get_opt<int>(msg, "sentido_escolha_tiempo").value_or(0));
+        
+        uint16_t barreira1_cantidad = static_cast<uint16_t>(
+            jsonu::get_opt<int>(msg, "barreira1_cantidad").value_or(0));
+        
+        uint16_t barreira1_tiempo = static_cast<uint16_t>(
+            jsonu::get_opt<int>(msg, "barreira1_tiempo").value_or(0));
+
+        // === Output accumulators ===
+        uint32_t acc_timer1Hz_out = 0;
+        uint32_t acc_tiempo_operacion_s_out = 0;
+        uint32_t acc_paradas_cantidad_out = 0;
+        uint32_t acc_paradas_tempo_out = 0;
+        uint32_t acc_metrica_ciclos_out = 0;
+        uint32_t acc_metrica_tiempo_out = 0;
+        uint32_t acc_bancalinos_q301_out = 0;
+        uint32_t acc_bancalinos_q300_out = 0;
+        uint32_t acc_bancalinos_comb1_out = 0;
+        uint32_t acc_bancalinos_comb2_out = 0;
+        uint32_t acc_bancalinos_total_out = 0;
+        uint32_t acc_parada_escolha_cantidad_out = 0;
+        uint32_t acc_parada_escolha_tempo_out = 0;
+        uint32_t acc_sentido_escolha_cantidad_out = 0;
+        uint32_t acc_sentido_escolha_tiempo_out = 0;
+        uint32_t acc_barreira1_cantidad_out = 0;
+        uint32_t acc_barreira1_tiempo_out = 0;
+
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            State &st = states_[line];
+
+            if (!st.initialized || st.shift != shiftNum) {
+                // New shift - reset all accumulators and store initial values
+                st = State();
+                st.initialized = true;
+                st.shift = shiftNum;
+
+                st.last_timer1Hz = timer1Hz;
+                st.last_paradas_cantidad = paradas_cantidad;
+                st.last_paradas_tempo = paradas_tempo;
+                st.last_metrica_ciclos = metrica_ciclos;
+                st.last_metrica_tiempo = metrica_tiempo;
+                st.last_bancalinos_q301 = bancalinos_q301;
+                st.last_bancalinos_q300 = bancalinos_q300;
+                st.last_bancalinos_comb1 = bancalinos_comb1;
+                st.last_bancalinos_comb2 = bancalinos_comb2;
+                st.last_bancalinos_total = bancalinos_total;
+                st.last_parada_escolha_cantidad = parada_escolha_cantidad;
+                st.last_parada_escolha_tempo = parada_escolha_tempo;
+                st.last_sentido_escolha_cantidad = sentido_escolha_cantidad;
+                st.last_sentido_escolha_tiempo = sentido_escolha_tiempo;
+                st.last_barreira1_cantidad = barreira1_cantidad;
+                st.last_barreira1_tiempo = barreira1_tiempo;
+            }
+            else {
+                // Accumulate deltas using diff_counter with validation (ALL counters are 16-bit)
                 uint16_t delta_timer = diff_timer(timer1Hz, st.last_timer1Hz);
                 st.acc_timer1Hz += delta_timer;
                 st.acc_tiempo_operacion_s += delta_timer;
                 st.last_timer1Hz = timer1Hz;
+
+                st.acc_paradas_cantidad += diff_counter(paradas_cantidad, st.last_paradas_cantidad);
+                st.last_paradas_cantidad = paradas_cantidad;
+
+                st.acc_paradas_tempo += diff_timer(paradas_tempo, st.last_paradas_tempo);
+                st.last_paradas_tempo = paradas_tempo;
+
+                st.acc_metrica_ciclos += diff_counter(metrica_ciclos, st.last_metrica_ciclos);
+                st.last_metrica_ciclos = metrica_ciclos;
+
+                st.acc_metrica_tiempo += diff_timer(metrica_tiempo, st.last_metrica_tiempo);
+                st.last_metrica_tiempo = metrica_tiempo;
+
+                st.acc_bancalinos_q301 += diff_counter(bancalinos_q301, st.last_bancalinos_q301);
+                st.last_bancalinos_q301 = bancalinos_q301;
+
+                st.acc_bancalinos_q300 += diff_counter(bancalinos_q300, st.last_bancalinos_q300);
+                st.last_bancalinos_q300 = bancalinos_q300;
+
+                st.acc_bancalinos_comb1 += diff_counter(bancalinos_comb1, st.last_bancalinos_comb1);
+                st.last_bancalinos_comb1 = bancalinos_comb1;
+
+                st.acc_bancalinos_comb2 += diff_counter(bancalinos_comb2, st.last_bancalinos_comb2);
+                st.last_bancalinos_comb2 = bancalinos_comb2;
+
+                st.acc_bancalinos_total += diff_counter(bancalinos_total, st.last_bancalinos_total);
+                st.last_bancalinos_total = bancalinos_total;
+
+                st.acc_parada_escolha_cantidad += diff_counter(parada_escolha_cantidad, st.last_parada_escolha_cantidad);
+                st.last_parada_escolha_cantidad = parada_escolha_cantidad;
+
+                st.acc_parada_escolha_tempo += diff_timer(parada_escolha_tempo, st.last_parada_escolha_tempo);
+                st.last_parada_escolha_tempo = parada_escolha_tempo;
+
+                st.acc_sentido_escolha_cantidad += diff_counter(sentido_escolha_cantidad, st.last_sentido_escolha_cantidad);
+                st.last_sentido_escolha_cantidad = sentido_escolha_cantidad;
+
+                st.acc_sentido_escolha_tiempo += diff_timer(sentido_escolha_tiempo, st.last_sentido_escolha_tiempo);
+                st.last_sentido_escolha_tiempo = sentido_escolha_tiempo;
+
+                st.acc_barreira1_cantidad += diff_counter(barreira1_cantidad, st.last_barreira1_cantidad);
+                st.last_barreira1_cantidad = barreira1_cantidad;
+
+                st.acc_barreira1_tiempo += diff_timer(barreira1_tiempo, st.last_barreira1_tiempo);
+                st.last_barreira1_tiempo = barreira1_tiempo;
             }
 
-            acc_bancalinos0_out = st.acc_bancalinos0;
-            acc_bancalinos1_out = st.acc_bancalinos1;
-            acc_bancalinosComb1_out = st.acc_bancalinosComb1;
-            acc_bancalinosComb2_out = st.acc_bancalinosComb2;
-            acc_bancalinosTotal_out = st.acc_bancalinosTotal;
-            acc_cambioBarrera_out = st.acc_cambioBarrera;
-            acc_cambioBarreraTotal_out = st.acc_cambioBarreraTotal;
-            acc_cambioSentido_out = st.acc_cambioSentido;
-            acc_cambioSentidoTotal_out = st.acc_cambioSentidoTotal;
-            acc_cantidad_out = st.acc_cantidad;
-            acc_cantidad_total_out = st.acc_cantidad_total;
-            acc_paradas_1_out = st.acc_paradas_1;
-            acc_paradas_2_out = st.acc_paradas_2;
+            // Copy accumulated values to output
+            acc_timer1Hz_out = st.acc_timer1Hz;
             acc_tiempo_operacion_s_out = st.acc_tiempo_operacion_s;
+            acc_paradas_cantidad_out = st.acc_paradas_cantidad;
+            acc_paradas_tempo_out = st.acc_paradas_tempo;
+            acc_metrica_ciclos_out = st.acc_metrica_ciclos;
+            acc_metrica_tiempo_out = st.acc_metrica_tiempo;
+            acc_bancalinos_q301_out = st.acc_bancalinos_q301;
+            acc_bancalinos_q300_out = st.acc_bancalinos_q300;
+            acc_bancalinos_comb1_out = st.acc_bancalinos_comb1;
+            acc_bancalinos_comb2_out = st.acc_bancalinos_comb2;
+            acc_bancalinos_total_out = st.acc_bancalinos_total;
+            acc_parada_escolha_cantidad_out = st.acc_parada_escolha_cantidad;
+            acc_parada_escolha_tempo_out = st.acc_parada_escolha_tempo;
+            acc_sentido_escolha_cantidad_out = st.acc_sentido_escolha_cantidad;
+            acc_sentido_escolha_tiempo_out = st.acc_sentido_escolha_tiempo;
+            acc_barreira1_cantidad_out = st.acc_barreira1_cantidad;
+            acc_barreira1_tiempo_out = st.acc_barreira1_tiempo;
         }
 
+        // === Build output JSON with BACKWARD COMPATIBLE field names ===
         json prod;
         prod["maquina_id"] = 7;
         prod["turno"] = shiftNum;
@@ -1357,51 +1775,75 @@ public:
         prod["lineID"] = line;
         prod["checksum"] = checksum;
 
-        prod["bancalinos0_instantaneo"] = bancalinos0;
-        prod["bancalinos0_turno"] = acc_bancalinos0_out;
-
-        prod["bancalinos1_instantaneo"] = bancalinos1;
-        prod["bancalinos1_turno"] = acc_bancalinos1_out;
-
-        prod["bancalinosComb1_instantaneo"] = bancalinosComb1;
-        prod["bancalinosComb1_turno"] = acc_bancalinosComb1_out;
-
-        prod["bancalinosComb2_instantaneo"] = bancalinosComb2;
-        prod["bancalinosComb2_turno"] = acc_bancalinosComb2_out;
-
-        prod["bancalinosTotal_raw"] = bancalinosTotal_raw;
-        prod["bancalinosTotal_turno"] = acc_bancalinosTotal_out;
-
-        prod["cambioBarrera_instantaneo"] = cambioBarrera;
-        prod["cambioBarrera_turno"] = acc_cambioBarrera_out;
-
-        prod["cambioBarreraTotal_raw"] = cambioBarreraTotal_raw;
-        prod["cambioBarreraTotal_turno"] = acc_cambioBarreraTotal_out;
-
-        prod["cambioSentido_instantaneo"] = cambioSentido;
-        prod["cambioSentido_turno"] = acc_cambioSentido_out;
-
-        prod["cambioSentidoTotal_raw"] = cambioSentidoTotal_raw;
-        prod["cambioSentidoTotal_turno"] = acc_cambioSentidoTotal_out;
-
-        prod["cantidad_instantanea"] = cantidad;
-        prod["cantidad_raw"] = cantidad_raw;
-        prod["cantidad_produccion_turno"] = acc_cantidad_out;
-
-        prod["cantidad_total_raw"] = cantidad_total_raw;
-        prod["cantidad_total_turno"] = acc_cantidad_total_out;
-
-        prod["paradas_1_instantaneo"] = paradas_1;
-        prod["paradas_1_turno"] = acc_paradas_1_out;
-
-        prod["paradas_2_instantaneo"] = paradas_2;
-        prod["paradas_2_turno"] = acc_paradas_2_out;
-
+        // Timer/operation time
         prod["timer1Hz_instantaneo"] = timer1Hz;
         prod["tiempo_operacion_turno_s"] = acc_tiempo_operacion_s_out;
 
+        // Main production counter (D25005 - metrica MDF ciclos)
+        // OLD: cantidad â†’ NEW: metrica_mdf_ciclos
+        prod["cantidad_instantanea"] = metrica_ciclos;
+        prod["cantidad_produccion_turno"] = acc_metrica_ciclos_out;
+
+        // Cycle time accumulator (D25006 - metrica MDF tiempo)
+        // OLD: cantidad_total â†’ NEW: metrica_mdf_tiempo
+        prod["cantidad_total_instantanea"] = metrica_tiempo;
+        prod["cantidad_total_turno"] = acc_metrica_tiempo_out;
+
+        // Paradas cantidad (D25003)
+        // OLD: paradas_1 â†’ NEW: paradas_cantidad
+        prod["paradas_1_instantaneo"] = paradas_cantidad;
+        prod["paradas_1_turno"] = acc_paradas_cantidad_out;
+
+        // Paradas tempo (D25004)
+        // OLD: paradas_2 â†’ NEW: paradas_tempo
+        prod["paradas_2_instantaneo"] = paradas_tempo;
+        prod["paradas_2_turno"] = acc_paradas_tempo_out;
+
+        // Bancalinos Q:3.01 (D25007)
+        // OLD: bancalinos0 â†’ NEW: bancalinos_q301
+        prod["bancalinos0_instantaneo"] = bancalinos_q301;
+        prod["bancalinos0_turno"] = acc_bancalinos_q301_out;
+
+        // Bancalinos Q:3.00 (D25008)
+        // OLD: bancalinos1 â†’ NEW: bancalinos_q300
+        prod["bancalinos1_instantaneo"] = bancalinos_q300;
+        prod["bancalinos1_turno"] = acc_bancalinos_q300_out;
+
+        // Bancalinos Comb1: Q:3.01 AND I:1.09 (D25009)
+        prod["bancalinosComb1_instantaneo"] = bancalinos_comb1;
+        prod["bancalinosComb1_turno"] = acc_bancalinos_comb1_out;
+
+        // Bancalinos Comb2: Q:3.01 AND Q:2.10 (D25016) - NOW INCLUDED!
+        prod["bancalinosComb2_instantaneo"] = bancalinos_comb2;
+        prod["bancalinosComb2_turno"] = acc_bancalinos_comb2_out;
+
+        // Bancalinos Total: Q:3.00 AND Q:2.10 (D25017) - NOW INCLUDED!
+        prod["bancalinosTotal_instantaneo"] = bancalinos_total;
+        prod["bancalinosTotal_turno"] = acc_bancalinos_total_out;
+
+        // Sentido Escolha (D25012, D25013)
+        // OLD: cambioSentido â†’ NEW: sentido_escolha
+        prod["cambioSentido_instantaneo"] = sentido_escolha_cantidad;
+        prod["cambioSentido_turno"] = acc_sentido_escolha_cantidad_out;
+        prod["cambioSentidoTotal_instantaneo"] = sentido_escolha_tiempo;
+        prod["cambioSentidoTotal_turno"] = acc_sentido_escolha_tiempo_out;
+
+        // Barreira 1 (D25014, D25015)
+        // OLD: cambioBarrera â†’ NEW: barreira1
+        prod["cambioBarrera_instantaneo"] = barreira1_cantidad;
+        prod["cambioBarrera_turno"] = acc_barreira1_cantidad_out;
+        prod["cambioBarreraTotal_instantaneo"] = barreira1_tiempo;
+        prod["cambioBarreraTotal_turno"] = acc_barreira1_tiempo_out;
+
+        // Parada Escolha (D25010, D25011) - NEW FIELDS
+        prod["paradaEscolha_instantaneo"] = parada_escolha_cantidad;
+        prod["paradaEscolha_turno"] = acc_parada_escolha_cantidad_out;
+        prod["paradaEscolhaTempo_instantaneo"] = parada_escolha_tempo;
+        prod["paradaEscolhaTempo_turno"] = acc_parada_escolha_tempo_out;
+
         prod["timestamp_device"] = iso8601_utc_now();
 
+        // Alarms
         json qual;
         qual["alarms"] = alarms;
         qual["timestamp_device"] = iso8601_utc_now();
@@ -1413,10 +1855,9 @@ public:
     }
 };
 
+// Static definitions
 std::mutex SalidaHornoProcessor::mtx_;
-std::unordered_map<int, SalidaHornoProcessor::State>
-    SalidaHornoProcessor::states_;
-
+std::unordered_map<int, SalidaHornoProcessor::State> SalidaHornoProcessor::states_;
 
 // ============================================================================
 // Factory functions
