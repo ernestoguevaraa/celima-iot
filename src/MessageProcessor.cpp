@@ -23,46 +23,46 @@ bool detect_global_shift_change(int currentShift)
 }
 
 /**
- * Calculate counter delta with PLC-compatible validation.
+ * Calculate counter delta with PLC bit-15 validity flag handling.
  *
- * Based on PLC ladder analysis (Update_Qt_Ciclo function block):
- * - Counters are 16-bit (0-65535) with standard rollover
- * - PLC validates deltas using TST/TSTN on bit 15
- * - If bit 15 is SET in delta (value >= 32768) â†’ invalid/overflow
- * - Additional sanity checks: Dados_Metricas uses <= 4000, Dados_Tempos uses <= 1200
+ * CRITICAL FIX: The PLC uses bit 15 of counter registers as a validity/toggle flag.
+ * The actual counter value is stored in bits 0-14 (range 0-32767).
+ * 
+ * Evidence from logs:
+ *   Raw values alternate: 47876 (0xBB24) vs 15111 (0x3B07)
+ *   - 47876: bit15=1, low15=15108
+ *   - 15111: bit15=0, low15=15111
+ *   The actual counter increments normally in bits 0-14!
  *
- * PLC Register Semantics (from ladder analysis):
- * - D29005 = PISADAS (press strokes), NOT products directly
- * - D29006 = Metric time accumulator in DECISECONDS (0.1s)
- * - D29003 = Parada COUNT (stop events)
- * - D29004 = Parada TIME in SECONDS
+ * Old (BROKEN) behavior:
+ *   47876 -> 15111: delta = 32771 >= 32768 -> return 0 (LOST events!)
  *
- * @param curr Current counter value (16-bit)
- * @param prev Previous counter value (16-bit)
- * @param max_valid Maximum valid delta (default 20000, conservative for ~3 min intervals)
- * @return Delta to accumulate (0 if invalid)
+ * New (FIXED) behavior:
+ *   Mask to low 15 bits first: 15108 -> 15111: delta = 3 (CORRECT!)
+ *
+ * @param curr Current counter value (raw 16-bit with bit-15 flag)
+ * @param prev Previous counter value (raw 16-bit with bit-15 flag)
+ * @param max_valid Maximum valid delta (default 5000 for ~3 min intervals)
+ * @return Delta to accumulate (0 if suspicious)
  */
-static uint16_t diff_counter(uint16_t curr, uint16_t prev, uint16_t max_valid = 20000) {
-    // Standard 16-bit rollover-aware subtraction
+static uint16_t diff_counter(uint16_t curr, uint16_t prev, uint16_t max_valid = 5000) {
+    // CRITICAL: Mask off bit 15 (PLC validity flag) to get actual counter value
+    uint16_t curr_val = curr & 0x7FFF;  // Bits 0-14 only (0-32767)
+    uint16_t prev_val = prev & 0x7FFF;
+    
     uint16_t delta;
-    if (curr >= prev) {
-        delta = curr - prev;
+    if (curr_val >= prev_val) {
+        delta = curr_val - prev_val;
     } else {
-        // Rollover occurred: curr wrapped past 65535
-        delta = static_cast<uint16_t>(65536 - prev + curr);
+        // Rollover at 32768 (not 65536, since we're using 15 bits)
+        delta = static_cast<uint16_t>(32768 - prev_val + curr_val);
     }
     
-    // PLC validation: bit 15 must NOT be set (delta < 32768)
-    // This matches TSTN(delta, &15) in the PLC Update_Qt_Ciclo function
-    if (delta >= 32768) {
-        return 0;  // Invalid - likely corruption or counter reset
-    }
-    
-    // Sanity check: delta should be reasonable for message interval
-    // PLC uses stricter limits (4000 for metrics, 1200 for times)
-    // We use 20000 as a safe upper bound for ~3 minute intervals
+    // Sanity check: delta should be reasonable for ~3 minute message interval
+    // Typical production: ~1-50 events per interval
+    // Use 5000 as conservative upper bound
     if (delta > max_valid) {
-        return 0;  // Suspicious jump - ignore
+        return 0;  // Suspicious jump - likely counter reset or corruption
     }
     
     return delta;
@@ -165,6 +165,29 @@ class CalidadProcessor final : public IMessageProcessor {
         uint64_t acc_discarded = 0;
         int shift = -1;
         bool initialized = false;
+
+        // --- LoRaWAN duplicate detection ---
+        // The Arduino sends accumulated counts every 3 minutes via confirmed
+        // uplinks.  When the ACK is lost the Arduino retries (up to 5×, 5 s
+        // apart), and the LoRaWAN network server may deliver each attempt
+        // (or even the same frame received by multiple gateways) as a
+        // separate MQTT message.  Without dedup, identical deltas are added
+        // N times, inflating the shift totals.
+        //
+        // Strategy: fingerprint each incoming message by its 4 counter
+        // values.  If the SAME fingerprint arrives again for the same line
+        // within DEDUP_WINDOW_S seconds, it is a retransmission → skip it.
+        // We also accept fCnt (LoRaWAN frame counter) if the decoder
+        // forwards it, as a stronger dedup key.
+        static constexpr int DEDUP_WINDOW_S = 90;   // covers 5 retries × 5 s + margin
+
+        uint64_t last_q1  = UINT64_MAX;
+        uint64_t last_q2  = UINT64_MAX;
+        uint64_t last_q6  = UINT64_MAX;
+        uint64_t last_br  = UINT64_MAX;
+        std::time_t last_msg_time = 0;
+
+        int64_t last_fCnt = -1;   // LoRaWAN frame counter, -1 = unknown
     };
     
     static std::mutex mtx_;
@@ -212,20 +235,61 @@ public:
             std::lock_guard<std::mutex> lock(mtx_);
             auto& st = states_[line_id];
             
-            // First time or shift changed
+            // First time or shift changed → reset everything including dedup
             if (!st.initialized || st.shift != shift_now) {
-                st = LineState();      // reset for this line
+                st = LineState();
                 st.initialized = true;
                 st.shift = shift_now;
             }
+
+            // ── LoRaWAN duplicate detection ──────────────────────────
+            const std::time_t now = std::time(nullptr);
+            bool is_duplicate = false;
+
+            // Method 1: fCnt-based dedup (strongest, if decoder provides it)
+            if (msg.contains("fCnt")) {
+                int64_t fCnt = msg.value("fCnt", (int64_t)-1);
+                if (fCnt >= 0 && fCnt == st.last_fCnt) {
+                    is_duplicate = true;
+                }
+                st.last_fCnt = fCnt;
+            }
+
+            // Method 2: payload-fingerprint dedup (fallback / reinforcement)
+            // If ALL four counters match the previous message AND it arrives
+            // within the dedup window, it is a retransmission.
+            if (!is_duplicate && st.last_msg_time > 0) {
+                const double elapsed = std::difftime(now, st.last_msg_time);
+                if (elapsed < LineState::DEDUP_WINDOW_S
+                    && delta_q1 == st.last_q1
+                    && delta_q2 == st.last_q2
+                    && delta_q6 == st.last_q6
+                    && delta_broken == st.last_br) {
+                    is_duplicate = true;
+                }
+            }
+
+            // Update fingerprint for next comparison
+            st.last_q1  = delta_q1;
+            st.last_q2  = delta_q2;
+            st.last_q6  = delta_q6;
+            st.last_br  = delta_broken;
+            st.last_msg_time = now;
+
+            if (is_duplicate) {
+                std::cerr << "[CalidadProcessor] Duplicate skipped for line "
+                          << line_id << " (Q1=" << delta_q1
+                          << " Q2=" << delta_q2 << " Q6=" << delta_q6
+                          << " Br=" << delta_broken << ")\n";
+            } else {
+                // Accumulate only on unique messages
+                st.acc_q1 += delta_q1;
+                st.acc_q2 += delta_q2;
+                st.acc_q6 += delta_q6;
+                st.acc_discarded += delta_broken;
+            }
             
-            // Add the deltas (accumulated counts from this message)
-            st.acc_q1 += delta_q1;
-            st.acc_q2 += delta_q2;
-            st.acc_q6 += delta_q6;
-            st.acc_discarded += delta_broken;
-            
-            // Snapshot current shift totals
+            // Snapshot current shift totals (always publish, even on dup)
             q1 = st.acc_q1;
             q2 = st.acc_q2;
             q6 = st.acc_q6;
@@ -261,7 +325,7 @@ void CalidadProcessor::reset_states() {
 // PrensaHidraulica1Processor - Fixed with correct counter handling
 // ============================================================================
 /**
- * PLC Register Mapping (from salida_prensa_1.pdf SecciÃ³n12):
+ * PLC Register Mapping (from salida_prensa_1.pdf SecciÃƒÂ³n12):
  * 
  * Input fields (from decoder, TODO: update decoder field names):
  * - "cantidadProductos" = D29005 = PISADAS (press stroke count, NOT products!)
@@ -270,8 +334,8 @@ void CalidadProcessor::reset_states() {
  * - "tiempoParadas_s" = D29004 = Stop duration (SECONDS)
  * - "alarms" = D29002 = Status Lento (status bits)
  * 
- * The PLC calculates: Products = PISADAS Ã— Fila Ã— Pac
- * We apply: Products = PISADAS Ã— factor_pisadas (per line)
+ * The PLC calculates: Products = PISADAS Ãƒâ€” Fila Ãƒâ€” Pac
+ * We apply: Products = PISADAS Ãƒâ€” factor_pisadas (per line)
  */
 class PrensaHidraulica1Processor : public IMessageProcessor
 {
@@ -310,7 +374,7 @@ public:
 
         // Read inputs from decoder
         // NOTE: Field names will change when decoder is updated
-        // Current: cantidadProductos â†’ Should be: pisadas
+        // Current: cantidadProductos Ã¢â€ â€™ Should be: pisadas
         int line          = jsonu::get_opt<int>(msg, "lineID").value_or(0);
         int alarms        = jsonu::get_opt<int>(msg, "alarms").value_or(0);
         
@@ -361,7 +425,7 @@ public:
                 st.acc_pisadas += delta_pisadas;
                 st.last_pisadas = pisadas;
 
-                // D29006 - Metric time is a timer (deciseconds â†’ seconds)
+                // D29006 - Metric time is a timer (deciseconds Ã¢â€ â€™ seconds)
                 uint16_t delta_tiempo = diff_timer(metrica_tiempo, st.last_metrica_tiempo);
                 st.acc_metrica_tiempo_s += delta_tiempo * 0.1;
                 st.last_metrica_tiempo = metrica_tiempo;
@@ -854,7 +918,7 @@ std::unordered_map<int, EntradaSecadorProcessor::State> EntradaSecadorProcessor:
  *   checksum, timer1Hz, alarms, parada_mds_cantidad, parada_mds_tiempo_s,
  *   metrica_mds_cantidad, metrica_mds_tiempo_ds
  * 
- * PLC Register mapping (SecciÃ³n6):
+ * PLC Register mapping (SecciÃƒÂ³n6):
  *   D29003 = parada_mds_cantidad (stop events)
  *   D29004 = parada_mds_tiempo_s (stop time in seconds)
  *   D29005 = metrica_mds_cantidad (MDS cycles - NOT products!)
@@ -1001,7 +1065,7 @@ public:
         prod["parada_mds_tiempo_instantaneo_s"] = parada_mds_tiempo;
         prod["parada_mds_tiempo_turno_s"] = acc_parada_mds_tiempo_s_out;
 
-        // MÃ©trica MDS (cycles) - D29005, D29006
+        // MÃƒÂ©trica MDS (cycles) - D29005, D29006
         // NOTE: These are MDS machine CYCLES, NOT product count!
         prod["metrica_mds_instantaneo"] = metrica_mds_cantidad;
         prod["metrica_mds_turno"] = acc_metrica_mds_cantidad_out;
@@ -1042,7 +1106,7 @@ std::unordered_map<int, SalidaSecadorProcessor::State> SalidaSecadorProcessor::s
  *   checksum, timer1Hz, alarms, parada_esm_cantidad, parada_esm_tiempo_s,
  *   metrica_esm_cantidad, metrica_esm_tiempo_ds
  * 
- * PLC Register mapping (SecciÃ³n1):
+ * PLC Register mapping (SecciÃƒÂ³n1):
  *   D29003 = parada_esm_cantidad (stop events)
  *   D29004 = parada_esm_tiempo_s (stop time in seconds)
  *   D29005 = metrica_esm_cantidad (ESM cycles - NOT products!)
@@ -1189,7 +1253,7 @@ public:
         prod["parada_esm_tiempo_instantaneo_s"] = parada_esm_tiempo;
         prod["parada_esm_tiempo_turno_s"] = acc_parada_esm_tiempo_s_out;
 
-        // MÃ©trica ESM (cycles) - D29005, D29006
+        // MÃƒÂ©trica ESM (cycles) - D29005, D29006
         // NOTE: These are ESM machine CYCLES, NOT product count!
         prod["metrica_esm_instantaneo"] = metrica_esm_cantidad;
         prod["metrica_esm_turno"] = acc_metrica_esm_cantidad_out;
@@ -1229,7 +1293,7 @@ std::unordered_map<int, EsmalteProcessor::State> EsmalteProcessor::states_;
  *   metrica_formador_cantidad, metrica_formador_tiempo_ds,
  *   falha_forno_cantidad, falha_forno_tiempo_s
  * 
- * PLC Register mapping (SecciÃ³n14):
+ * PLC Register mapping (SecciÃƒÂ³n14):
  *   D29003 = parada_mcf_cantidad (MCF stop count)
  *   D29004 = parada_mcf_tiempo_s (MCF stop time, seconds)
  *   D29005 = metrica_mcf_cantidad (MCF cycle count)
@@ -1256,7 +1320,7 @@ private:
         uint16_t last_timer1Hz = 0;
         uint32_t acc_timer1Hz = 0;
 
-        // Production: NÃºmero de Grades (D29007)
+        // Production: NÃƒÂºmero de Grades (D29007)
         uint16_t last_numero_grades = 0;
         uint32_t acc_numero_grades = 0;
 
@@ -1267,14 +1331,14 @@ private:
         uint16_t last_parada_mcf_tiempo = 0;
         uint32_t acc_parada_mcf_tiempo_s = 0;
 
-        // MÃ©trica MCF - D29005, D29006
+        // MÃƒÂ©trica MCF - D29005, D29006
         uint16_t last_metrica_mcf_cantidad = 0;
         uint32_t acc_metrica_mcf_cantidad = 0;
 
         uint16_t last_metrica_mcf_tiempo = 0;
         uint32_t acc_metrica_mcf_tiempo_ds = 0;
 
-        // MÃ©trica Formador - D29008, D29009
+        // MÃƒÂ©trica Formador - D29008, D29009
         uint16_t last_metrica_formador_cantidad = 0;
         uint32_t acc_metrica_formador_cantidad = 0;
 
@@ -1334,13 +1398,13 @@ public:
         uint16_t parada_mcf_tiempo = static_cast<uint16_t>(
             jsonu::get_opt<int>(msg, "parada_mcf_tiempo_s").value_or(0));
 
-        // MÃ©trica MCF - D29005, D29006
+        // MÃƒÂ©trica MCF - D29005, D29006
         uint16_t metrica_mcf_cantidad = static_cast<uint16_t>(
             jsonu::get_opt<int>(msg, "metrica_mcf_cantidad").value_or(0));
         uint16_t metrica_mcf_tiempo = static_cast<uint16_t>(
             jsonu::get_opt<int>(msg, "metrica_mcf_tiempo_ds").value_or(0));
 
-        // MÃ©trica Formador - D29008, D29009
+        // MÃƒÂ©trica Formador - D29008, D29009
         uint16_t metrica_formador_cantidad = static_cast<uint16_t>(
             jsonu::get_opt<int>(msg, "metrica_formador_cantidad").value_or(0));
         uint16_t metrica_formador_tiempo = static_cast<uint16_t>(
@@ -1443,7 +1507,7 @@ public:
         prod["timer1Hz_instantaneo"] = timer1Hz;
         prod["timer1Hz_turno"] = acc_timer1Hz_out;
 
-        // PRODUCTION COUNT - numero_grades (D29007) ðŸŽ¯
+        // PRODUCTION COUNT - numero_grades (D29007) Ã°Å¸Å½Â¯
         prod["numero_grades_instantaneo"] = numero_grades;
         prod["numero_grades_turno"] = acc_numero_grades_out;
 
@@ -1453,14 +1517,14 @@ public:
         prod["parada_mcf_tiempo_instantaneo_s"] = parada_mcf_tiempo;
         prod["parada_mcf_tiempo_turno_s"] = acc_parada_mcf_tiempo_s_out;
 
-        // MÃ©trica MCF - D29005, D29006
+        // MÃƒÂ©trica MCF - D29005, D29006
         prod["metrica_mcf_instantaneo"] = metrica_mcf_cantidad;
         prod["metrica_mcf_turno"] = acc_metrica_mcf_cantidad_out;
         prod["metrica_mcf_tiempo_instantaneo_ds"] = metrica_mcf_tiempo;
         prod["metrica_mcf_tiempo_turno_ds"] = acc_metrica_mcf_tiempo_ds_out;
         prod["metrica_mcf_tiempo_turno_s"] = static_cast<double>(acc_metrica_mcf_tiempo_ds_out) * 0.1;
 
-        // MÃ©trica Formador - D29008, D29009
+        // MÃƒÂ©trica Formador - D29008, D29009
         prod["metrica_formador_instantaneo"] = metrica_formador_cantidad;
         prod["metrica_formador_turno"] = acc_metrica_formador_cantidad_out;
         prod["metrica_formador_tiempo_instantaneo_ds"] = metrica_formador_tiempo;
@@ -1780,32 +1844,32 @@ public:
         prod["tiempo_operacion_turno_s"] = acc_tiempo_operacion_s_out;
 
         // Main production counter (D25005 - metrica MDF ciclos)
-        // OLD: cantidad â†’ NEW: metrica_mdf_ciclos
+        // OLD: cantidad Ã¢â€ â€™ NEW: metrica_mdf_ciclos
         prod["cantidad_instantanea"] = metrica_ciclos;
         prod["cantidad_produccion_turno"] = acc_metrica_ciclos_out;
 
         // Cycle time accumulator (D25006 - metrica MDF tiempo)
-        // OLD: cantidad_total â†’ NEW: metrica_mdf_tiempo
+        // OLD: cantidad_total Ã¢â€ â€™ NEW: metrica_mdf_tiempo
         prod["cantidad_total_instantanea"] = metrica_tiempo;
         prod["cantidad_total_turno"] = acc_metrica_tiempo_out;
 
         // Paradas cantidad (D25003)
-        // OLD: paradas_1 â†’ NEW: paradas_cantidad
+        // OLD: paradas_1 Ã¢â€ â€™ NEW: paradas_cantidad
         prod["paradas_1_instantaneo"] = paradas_cantidad;
         prod["paradas_1_turno"] = acc_paradas_cantidad_out;
 
         // Paradas tempo (D25004)
-        // OLD: paradas_2 â†’ NEW: paradas_tempo
+        // OLD: paradas_2 Ã¢â€ â€™ NEW: paradas_tempo
         prod["paradas_2_instantaneo"] = paradas_tempo;
         prod["paradas_2_turno"] = acc_paradas_tempo_out;
 
         // Bancalinos Q:3.01 (D25007)
-        // OLD: bancalinos0 â†’ NEW: bancalinos_q301
+        // OLD: bancalinos0 Ã¢â€ â€™ NEW: bancalinos_q301
         prod["bancalinos0_instantaneo"] = bancalinos_q301;
         prod["bancalinos0_turno"] = acc_bancalinos_q301_out;
 
         // Bancalinos Q:3.00 (D25008)
-        // OLD: bancalinos1 â†’ NEW: bancalinos_q300
+        // OLD: bancalinos1 Ã¢â€ â€™ NEW: bancalinos_q300
         prod["bancalinos1_instantaneo"] = bancalinos_q300;
         prod["bancalinos1_turno"] = acc_bancalinos_q300_out;
 
@@ -1822,14 +1886,14 @@ public:
         prod["bancalinosTotal_turno"] = acc_bancalinos_total_out;
 
         // Sentido Escolha (D25012, D25013)
-        // OLD: cambioSentido â†’ NEW: sentido_escolha
+        // OLD: cambioSentido Ã¢â€ â€™ NEW: sentido_escolha
         prod["cambioSentido_instantaneo"] = sentido_escolha_cantidad;
         prod["cambioSentido_turno"] = acc_sentido_escolha_cantidad_out;
         prod["cambioSentidoTotal_instantaneo"] = sentido_escolha_tiempo;
         prod["cambioSentidoTotal_turno"] = acc_sentido_escolha_tiempo_out;
 
         // Barreira 1 (D25014, D25015)
-        // OLD: cambioBarrera â†’ NEW: barreira1
+        // OLD: cambioBarrera Ã¢â€ â€™ NEW: barreira1
         prod["cambioBarrera_instantaneo"] = barreira1_cantidad;
         prod["cambioBarrera_turno"] = acc_barreira1_cantidad_out;
         prod["cambioBarreraTotal_instantaneo"] = barreira1_tiempo;
