@@ -23,26 +23,30 @@ bool detect_global_shift_change(int currentShift)
 }
 
 /**
- * Calculate counter delta with PLC bit-15 validity flag handling.
+ * Calculate delta for ANY PLC register with bit-15 validity flag handling.
  *
- * CRITICAL FIX: The PLC uses bit 15 of counter registers as a validity/toggle flag.
- * The actual counter value is stored in bits 0-14 (range 0-32767).
- * 
- * Evidence from logs:
- *   Raw values alternate: 47876 (0xBB24) vs 15111 (0x3B07)
- *   - 47876: bit15=1, low15=15108
- *   - 15111: bit15=0, low15=15111
- *   The actual counter increments normally in bits 0-14!
+ * CRITICAL: The PLC uses bit 15 of ALL D290xx registers as a validity/toggle
+ * flag. The actual value is stored in bits 0-14 (range 0-32767).
+ * This applies to BOTH counter fields (*_cantidad) AND timer fields
+ * (*_tiempo_ds, *_tiempo_s, timer1Hz).
  *
- * Old (BROKEN) behavior:
- *   47876 -> 15111: delta = 32771 >= 32768 -> return 0 (LOST events!)
+ * Evidence from production logs (all 3 PLC types — secador, esmalte, horno):
+ *   - Raw values toggle bit-15 every few messages on ALL registers
+ *   - Example: paradas_tempo_s alternates 54311 (b15=1, low15=21543)
+ *              vs 21543 (b15=0, low15=21543) with zero actual change
+ *   - Without masking, diff_timer() accumulated +32768 per toggle, inflating
+ *     turno values by orders of magnitude (e.g. 163,865s reported vs 25s real)
+ *   - timer1Hz does NOT toggle bit-15 on observed devices, but we mask it
+ *     uniformly for safety since the 15-bit math is still correct
  *
- * New (FIXED) behavior:
- *   Mask to low 15 bits first: 15108 -> 15111: delta = 3 (CORRECT!)
+ * Algorithm:
+ *   1. Mask both values to bits 0-14 (& 0x7FFF)
+ *   2. Compute delta with 15-bit rollover (at 32768)
+ *   3. Reject if delta > max_valid (corruption/reset guard)
  *
- * @param curr Current counter value (raw 16-bit with bit-15 flag)
- * @param prev Previous counter value (raw 16-bit with bit-15 flag)
- * @param max_valid Maximum valid delta (default 5000 for ~3 min intervals)
+ * @param curr Current register value (raw 16-bit with bit-15 flag)
+ * @param prev Previous register value (raw 16-bit with bit-15 flag)
+ * @param max_valid Maximum valid delta (default 5000, ~83 min at 1Hz)
  * @return Delta to accumulate (0 if suspicious)
  */
 static uint16_t diff_counter(uint16_t curr, uint16_t prev, uint16_t max_valid = 5000) {
@@ -68,24 +72,7 @@ static uint16_t diff_counter(uint16_t curr, uint16_t prev, uint16_t max_valid = 
     return delta;
 }
 
-/**
- * Timer delta calculation for time accumulators.
- * 
- * Timers don't have the bit-15 validity issue since they increment
- * monotonically with time. Just handle 16-bit rollover.
- *
- * @param curr Current timer value (16-bit)
- * @param prev Previous timer value (16-bit)
- * @return Delta in timer units
- */
-static uint16_t diff_timer(uint16_t curr, uint16_t prev) {
-    if (curr >= prev) {
-        return curr - prev;
-    } else {
-        // Rollover at 65536
-        return static_cast<uint16_t>(65536 - prev + curr);
-    }
-}
+
 
 
 
@@ -165,29 +152,6 @@ class CalidadProcessor final : public IMessageProcessor {
         uint64_t acc_discarded = 0;
         int shift = -1;
         bool initialized = false;
-
-        // --- LoRaWAN duplicate detection ---
-        // The Arduino sends accumulated counts every 3 minutes via confirmed
-        // uplinks.  When the ACK is lost the Arduino retries (up to 5×, 5 s
-        // apart), and the LoRaWAN network server may deliver each attempt
-        // (or even the same frame received by multiple gateways) as a
-        // separate MQTT message.  Without dedup, identical deltas are added
-        // N times, inflating the shift totals.
-        //
-        // Strategy: fingerprint each incoming message by its 4 counter
-        // values.  If the SAME fingerprint arrives again for the same line
-        // within DEDUP_WINDOW_S seconds, it is a retransmission → skip it.
-        // We also accept fCnt (LoRaWAN frame counter) if the decoder
-        // forwards it, as a stronger dedup key.
-        static constexpr int DEDUP_WINDOW_S = 90;   // covers 5 retries × 5 s + margin
-
-        uint64_t last_q1  = UINT64_MAX;
-        uint64_t last_q2  = UINT64_MAX;
-        uint64_t last_q6  = UINT64_MAX;
-        uint64_t last_br  = UINT64_MAX;
-        std::time_t last_msg_time = 0;
-
-        int64_t last_fCnt = -1;   // LoRaWAN frame counter, -1 = unknown
     };
     
     static std::mutex mtx_;
@@ -235,61 +199,20 @@ public:
             std::lock_guard<std::mutex> lock(mtx_);
             auto& st = states_[line_id];
             
-            // First time or shift changed → reset everything including dedup
+            // First time or shift changed
             if (!st.initialized || st.shift != shift_now) {
-                st = LineState();
+                st = LineState();      // reset for this line
                 st.initialized = true;
                 st.shift = shift_now;
             }
-
-            // ── LoRaWAN duplicate detection ──────────────────────────
-            const std::time_t now = std::time(nullptr);
-            bool is_duplicate = false;
-
-            // Method 1: fCnt-based dedup (strongest, if decoder provides it)
-            if (msg.contains("fCnt")) {
-                int64_t fCnt = msg.value("fCnt", (int64_t)-1);
-                if (fCnt >= 0 && fCnt == st.last_fCnt) {
-                    is_duplicate = true;
-                }
-                st.last_fCnt = fCnt;
-            }
-
-            // Method 2: payload-fingerprint dedup (fallback / reinforcement)
-            // If ALL four counters match the previous message AND it arrives
-            // within the dedup window, it is a retransmission.
-            if (!is_duplicate && st.last_msg_time > 0) {
-                const double elapsed = std::difftime(now, st.last_msg_time);
-                if (elapsed < LineState::DEDUP_WINDOW_S
-                    && delta_q1 == st.last_q1
-                    && delta_q2 == st.last_q2
-                    && delta_q6 == st.last_q6
-                    && delta_broken == st.last_br) {
-                    is_duplicate = true;
-                }
-            }
-
-            // Update fingerprint for next comparison
-            st.last_q1  = delta_q1;
-            st.last_q2  = delta_q2;
-            st.last_q6  = delta_q6;
-            st.last_br  = delta_broken;
-            st.last_msg_time = now;
-
-            if (is_duplicate) {
-                std::cerr << "[CalidadProcessor] Duplicate skipped for line "
-                          << line_id << " (Q1=" << delta_q1
-                          << " Q2=" << delta_q2 << " Q6=" << delta_q6
-                          << " Br=" << delta_broken << ")\n";
-            } else {
-                // Accumulate only on unique messages
-                st.acc_q1 += delta_q1;
-                st.acc_q2 += delta_q2;
-                st.acc_q6 += delta_q6;
-                st.acc_discarded += delta_broken;
-            }
             
-            // Snapshot current shift totals (always publish, even on dup)
+            // Add the deltas (accumulated counts from this message)
+            st.acc_q1 += delta_q1;
+            st.acc_q2 += delta_q2;
+            st.acc_q6 += delta_q6;
+            st.acc_discarded += delta_broken;
+            
+            // Snapshot current shift totals
             q1 = st.acc_q1;
             q2 = st.acc_q2;
             q6 = st.acc_q6;
@@ -425,8 +348,8 @@ public:
                 st.acc_pisadas += delta_pisadas;
                 st.last_pisadas = pisadas;
 
-                // D29006 - Metric time is a timer (deciseconds Ã¢â€ â€™ seconds)
-                uint16_t delta_tiempo = diff_timer(metrica_tiempo, st.last_metrica_tiempo);
+                // D29006 - Metric time (deciseconds, bit-15 masked)
+                uint16_t delta_tiempo = diff_counter(metrica_tiempo, st.last_metrica_tiempo);
                 st.acc_metrica_tiempo_s += delta_tiempo * 0.1;
                 st.last_metrica_tiempo = metrica_tiempo;
 
@@ -583,7 +506,7 @@ public:
                 st.acc_pisadas += delta_pisadas;
                 st.last_pisadas = pisadas;
 
-                uint16_t delta_tiempo = diff_timer(metrica_tiempo, st.last_metrica_tiempo);
+                uint16_t delta_tiempo = diff_counter(metrica_tiempo, st.last_metrica_tiempo);
                 st.acc_metrica_tiempo_s += delta_tiempo * 0.1;
                 st.last_metrica_tiempo = metrica_tiempo;
 
@@ -660,7 +583,7 @@ std::unordered_map<int, PrensaHidraulica2Processor::PH2State>
  * 
  * Changes from original:
  * 1. Reads NEW semantic field names from LoRaWAN decoder v2
- * 2. ALL counters are 16-bit (removed clean15 misuse)
+ * 2. ALL registers use bit-15 flag — diff_counter for everything
  * 3. Tracks ALL fields from PLC (not just 2)
  * 4. Output JSON uses correct semantic names
  * 
@@ -720,15 +643,6 @@ private:
 
     static std::mutex mtx_;
     static std::unordered_map<int, State> states_;
-
-    // 16-bit counter delta with rollover handling
-    static uint16_t diff16(uint16_t curr, uint16_t prev) {
-        if (curr >= prev) {
-            return curr - prev;
-        } else {
-            return static_cast<uint16_t>(65536 + curr - prev);
-        }
-    }
 
 public:
     static void reset_states() {
@@ -808,32 +722,32 @@ public:
                 st.last_bancalino_l2_tiempo = bancalino_l2_tiempo;
             }
             else {
-                // Accumulate deltas using diff_counter with validation (ALL counters are 16-bit)
-                st.acc_timer1Hz += diff_timer(timer1Hz, st.last_timer1Hz);
+                // Accumulate deltas — ALL PLC registers have bit-15 flag, use diff_counter for everything
+                st.acc_timer1Hz += diff_counter(timer1Hz, st.last_timer1Hz);
                 st.last_timer1Hz = timer1Hz;
 
                 st.acc_paradas_cantidad += diff_counter(paradas_cantidad, st.last_paradas_cantidad);
                 st.last_paradas_cantidad = paradas_cantidad;
 
-                st.acc_paradas_tempo_s += diff_timer(paradas_tempo, st.last_paradas_tempo);
+                st.acc_paradas_tempo_s += diff_counter(paradas_tempo, st.last_paradas_tempo);
                 st.last_paradas_tempo = paradas_tempo;
 
                 st.acc_ingreso_elevador_cantidad += diff_counter(ingreso_elevador_cantidad, st.last_ingreso_elevador_cantidad);
                 st.last_ingreso_elevador_cantidad = ingreso_elevador_cantidad;
 
-                st.acc_ingreso_elevador_tiempo_ds += diff_timer(ingreso_elevador_tiempo, st.last_ingreso_elevador_tiempo);
+                st.acc_ingreso_elevador_tiempo_ds += diff_counter(ingreso_elevador_tiempo, st.last_ingreso_elevador_tiempo);
                 st.last_ingreso_elevador_tiempo = ingreso_elevador_tiempo;
 
                 st.acc_bancalino_l1_cantidad += diff_counter(bancalino_l1_cantidad, st.last_bancalino_l1_cantidad);
                 st.last_bancalino_l1_cantidad = bancalino_l1_cantidad;
 
-                st.acc_bancalino_l1_tiempo_ds += diff_timer(bancalino_l1_tiempo, st.last_bancalino_l1_tiempo);
+                st.acc_bancalino_l1_tiempo_ds += diff_counter(bancalino_l1_tiempo, st.last_bancalino_l1_tiempo);
                 st.last_bancalino_l1_tiempo = bancalino_l1_tiempo;
 
                 st.acc_bancalino_l2_cantidad += diff_counter(bancalino_l2_cantidad, st.last_bancalino_l2_cantidad);
                 st.last_bancalino_l2_cantidad = bancalino_l2_cantidad;
 
-                st.acc_bancalino_l2_tiempo_ds += diff_timer(bancalino_l2_tiempo, st.last_bancalino_l2_tiempo);
+                st.acc_bancalino_l2_tiempo_ds += diff_counter(bancalino_l2_tiempo, st.last_bancalino_l2_tiempo);
                 st.last_bancalino_l2_tiempo = bancalino_l2_tiempo;
             }
 
@@ -910,8 +824,8 @@ std::unordered_map<int, EntradaSecadorProcessor::State> EntradaSecadorProcessor:
  * 
  * Changes from original:
  * 1. Reads NEW semantic field names from LoRaWAN decoder v2
- * 2. ALL counters are 16-bit (removed 15-bit MASK misuse)
- * 3. Uses diff16() for all delta calculations (rollover at 65535)
+ * 2. ALL registers use bit-15 flag — diff_counter for everything
+ * 3. Uses diff_counter() for ALL fields (bit-15 mask + 15-bit rollover)
  * 4. Output JSON uses correct semantic names
  * 
  * Input fields (from decoder v2):
@@ -954,15 +868,6 @@ private:
 
     static std::mutex mtx_;
     static std::unordered_map<int, State> states_;
-
-    // 16-bit counter delta with rollover handling
-    static uint16_t diff16(uint16_t curr, uint16_t prev) {
-        if (curr >= prev) {
-            return curr - prev;
-        } else {
-            return static_cast<uint16_t>(65536 + curr - prev);
-        }
-    }
 
 public:
     static void reset_states() {
@@ -1022,20 +927,20 @@ public:
                 st.last_metrica_mds_tiempo = metrica_mds_tiempo;
             }
             else {
-                // Accumulate deltas using diff_counter with validation (ALL counters are 16-bit)
-                st.acc_timer1Hz += diff_timer(timer1Hz, st.last_timer1Hz);
+                // Accumulate deltas — ALL PLC registers have bit-15 flag, use diff_counter for everything
+                st.acc_timer1Hz += diff_counter(timer1Hz, st.last_timer1Hz);
                 st.last_timer1Hz = timer1Hz;
 
                 st.acc_parada_mds_cantidad += diff_counter(parada_mds_cantidad, st.last_parada_mds_cantidad);
                 st.last_parada_mds_cantidad = parada_mds_cantidad;
 
-                st.acc_parada_mds_tiempo_s += diff_timer(parada_mds_tiempo, st.last_parada_mds_tiempo);
+                st.acc_parada_mds_tiempo_s += diff_counter(parada_mds_tiempo, st.last_parada_mds_tiempo);
                 st.last_parada_mds_tiempo = parada_mds_tiempo;
 
                 st.acc_metrica_mds_cantidad += diff_counter(metrica_mds_cantidad, st.last_metrica_mds_cantidad);
                 st.last_metrica_mds_cantidad = metrica_mds_cantidad;
 
-                st.acc_metrica_mds_tiempo_ds += diff_timer(metrica_mds_tiempo, st.last_metrica_mds_tiempo);
+                st.acc_metrica_mds_tiempo_ds += diff_counter(metrica_mds_tiempo, st.last_metrica_mds_tiempo);
                 st.last_metrica_mds_tiempo = metrica_mds_tiempo;
             }
 
@@ -1098,8 +1003,8 @@ std::unordered_map<int, SalidaSecadorProcessor::State> SalidaSecadorProcessor::s
  * 
  * Changes from original:
  * 1. Reads NEW semantic field names from LoRaWAN decoder v2
- * 2. ALL counters are 16-bit (removed 15-bit MASK misuse)
- * 3. Uses diff16() for all delta calculations (rollover at 65535)
+ * 2. ALL registers use bit-15 flag — diff_counter for everything
+ * 3. Uses diff_counter() for ALL fields (bit-15 mask + 15-bit rollover)
  * 4. Output JSON uses correct semantic names
  * 
  * Input fields (from decoder v2):
@@ -1142,15 +1047,6 @@ private:
 
     static std::mutex mtx_;
     static std::unordered_map<int, State> states_;
-
-    // 16-bit counter delta with rollover handling
-    static uint16_t diff16(uint16_t curr, uint16_t prev) {
-        if (curr >= prev) {
-            return curr - prev;
-        } else {
-            return static_cast<uint16_t>(65536 + curr - prev);
-        }
-    }
 
 public:
     static void reset_states() {
@@ -1210,20 +1106,20 @@ public:
                 st.last_metrica_esm_tiempo = metrica_esm_tiempo;
             }
             else {
-                // Accumulate deltas using diff_counter with validation (ALL counters are 16-bit)
-                st.acc_timer1Hz += diff_timer(timer1Hz, st.last_timer1Hz);
+                // Accumulate deltas — ALL PLC registers have bit-15 flag, use diff_counter for everything
+                st.acc_timer1Hz += diff_counter(timer1Hz, st.last_timer1Hz);
                 st.last_timer1Hz = timer1Hz;
 
                 st.acc_parada_esm_cantidad += diff_counter(parada_esm_cantidad, st.last_parada_esm_cantidad);
                 st.last_parada_esm_cantidad = parada_esm_cantidad;
 
-                st.acc_parada_esm_tiempo_s += diff_timer(parada_esm_tiempo, st.last_parada_esm_tiempo);
+                st.acc_parada_esm_tiempo_s += diff_counter(parada_esm_tiempo, st.last_parada_esm_tiempo);
                 st.last_parada_esm_tiempo = parada_esm_tiempo;
 
                 st.acc_metrica_esm_cantidad += diff_counter(metrica_esm_cantidad, st.last_metrica_esm_cantidad);
                 st.last_metrica_esm_cantidad = metrica_esm_cantidad;
 
-                st.acc_metrica_esm_tiempo_ds += diff_timer(metrica_esm_tiempo, st.last_metrica_esm_tiempo);
+                st.acc_metrica_esm_tiempo_ds += diff_counter(metrica_esm_tiempo, st.last_metrica_esm_tiempo);
                 st.last_metrica_esm_tiempo = metrica_esm_tiempo;
             }
 
@@ -1356,15 +1252,6 @@ private:
     static std::mutex mtx_;
     static std::unordered_map<int, State> states_;
 
-    // 16-bit counter delta with rollover handling
-    static uint16_t diff16(uint16_t curr, uint16_t prev) {
-        if (curr >= prev) {
-            return curr - prev;
-        } else {
-            return static_cast<uint16_t>(65536 + curr - prev);
-        }
-    }
-
 public:
     static void reset_states() {
         std::lock_guard<std::mutex> lock(mtx_);
@@ -1450,8 +1337,8 @@ public:
                 st.last_falha_forno_tiempo = falha_forno_tiempo;
             }
             else {
-                // Accumulate deltas using diff_counter with validation (ALL counters are 16-bit)
-                st.acc_timer1Hz += diff_timer(timer1Hz, st.last_timer1Hz);
+                // Accumulate deltas — ALL PLC registers have bit-15 flag, use diff_counter for everything
+                st.acc_timer1Hz += diff_counter(timer1Hz, st.last_timer1Hz);
                 st.last_timer1Hz = timer1Hz;
 
                 st.acc_numero_grades += diff_counter(numero_grades, st.last_numero_grades);
@@ -1460,25 +1347,25 @@ public:
                 st.acc_parada_mcf_cantidad += diff_counter(parada_mcf_cantidad, st.last_parada_mcf_cantidad);
                 st.last_parada_mcf_cantidad = parada_mcf_cantidad;
 
-                st.acc_parada_mcf_tiempo_s += diff_timer(parada_mcf_tiempo, st.last_parada_mcf_tiempo);
+                st.acc_parada_mcf_tiempo_s += diff_counter(parada_mcf_tiempo, st.last_parada_mcf_tiempo);
                 st.last_parada_mcf_tiempo = parada_mcf_tiempo;
 
                 st.acc_metrica_mcf_cantidad += diff_counter(metrica_mcf_cantidad, st.last_metrica_mcf_cantidad);
                 st.last_metrica_mcf_cantidad = metrica_mcf_cantidad;
 
-                st.acc_metrica_mcf_tiempo_ds += diff_timer(metrica_mcf_tiempo, st.last_metrica_mcf_tiempo);
+                st.acc_metrica_mcf_tiempo_ds += diff_counter(metrica_mcf_tiempo, st.last_metrica_mcf_tiempo);
                 st.last_metrica_mcf_tiempo = metrica_mcf_tiempo;
 
                 st.acc_metrica_formador_cantidad += diff_counter(metrica_formador_cantidad, st.last_metrica_formador_cantidad);
                 st.last_metrica_formador_cantidad = metrica_formador_cantidad;
 
-                st.acc_metrica_formador_tiempo_ds += diff_timer(metrica_formador_tiempo, st.last_metrica_formador_tiempo);
+                st.acc_metrica_formador_tiempo_ds += diff_counter(metrica_formador_tiempo, st.last_metrica_formador_tiempo);
                 st.last_metrica_formador_tiempo = metrica_formador_tiempo;
 
                 st.acc_falha_forno_cantidad += diff_counter(falha_forno_cantidad, st.last_falha_forno_cantidad);
                 st.last_falha_forno_cantidad = falha_forno_cantidad;
 
-                st.acc_falha_forno_tiempo_s += diff_timer(falha_forno_tiempo, st.last_falha_forno_tiempo);
+                st.acc_falha_forno_tiempo_s += diff_counter(falha_forno_tiempo, st.last_falha_forno_tiempo);
                 st.last_falha_forno_tiempo = falha_forno_tiempo;
             }
 
@@ -1560,7 +1447,7 @@ std::unordered_map<int, EntradaHornoProcessor::State> EntradaHornoProcessor::sta
  * 
  * Changes from original:
  * 1. Reads NEW semantic field names from LoRaWAN decoder
- * 2. ALL counters are 16-bit (removed clean15/diff15 misuse)
+ * 2. ALL registers use bit-15 flag — diff_counter for everything
  * 3. Outputs OLD field names in JSON for backward compatibility
  * 
  * Input fields (from decoder v3):
@@ -1635,15 +1522,6 @@ private:
 
     static std::mutex mtx_;
     static std::unordered_map<int, State> states_;
-
-    // 16-bit counter delta with rollover handling
-    static uint16_t diff16(uint16_t curr, uint16_t prev) {
-        if (curr >= prev) {
-            return curr - prev;
-        } else {
-            return static_cast<uint16_t>(65536 + curr - prev);
-        }
-    }
 
 public:
     static void reset_states() {
@@ -1759,8 +1637,8 @@ public:
                 st.last_barreira1_tiempo = barreira1_tiempo;
             }
             else {
-                // Accumulate deltas using diff_counter with validation (ALL counters are 16-bit)
-                uint16_t delta_timer = diff_timer(timer1Hz, st.last_timer1Hz);
+                // Accumulate deltas — ALL PLC registers have bit-15 flag, use diff_counter for everything
+                uint16_t delta_timer = diff_counter(timer1Hz, st.last_timer1Hz);
                 st.acc_timer1Hz += delta_timer;
                 st.acc_tiempo_operacion_s += delta_timer;
                 st.last_timer1Hz = timer1Hz;
@@ -1768,13 +1646,13 @@ public:
                 st.acc_paradas_cantidad += diff_counter(paradas_cantidad, st.last_paradas_cantidad);
                 st.last_paradas_cantidad = paradas_cantidad;
 
-                st.acc_paradas_tempo += diff_timer(paradas_tempo, st.last_paradas_tempo);
+                st.acc_paradas_tempo += diff_counter(paradas_tempo, st.last_paradas_tempo);
                 st.last_paradas_tempo = paradas_tempo;
 
                 st.acc_metrica_ciclos += diff_counter(metrica_ciclos, st.last_metrica_ciclos);
                 st.last_metrica_ciclos = metrica_ciclos;
 
-                st.acc_metrica_tiempo += diff_timer(metrica_tiempo, st.last_metrica_tiempo);
+                st.acc_metrica_tiempo += diff_counter(metrica_tiempo, st.last_metrica_tiempo);
                 st.last_metrica_tiempo = metrica_tiempo;
 
                 st.acc_bancalinos_q301 += diff_counter(bancalinos_q301, st.last_bancalinos_q301);
@@ -1795,19 +1673,19 @@ public:
                 st.acc_parada_escolha_cantidad += diff_counter(parada_escolha_cantidad, st.last_parada_escolha_cantidad);
                 st.last_parada_escolha_cantidad = parada_escolha_cantidad;
 
-                st.acc_parada_escolha_tempo += diff_timer(parada_escolha_tempo, st.last_parada_escolha_tempo);
+                st.acc_parada_escolha_tempo += diff_counter(parada_escolha_tempo, st.last_parada_escolha_tempo);
                 st.last_parada_escolha_tempo = parada_escolha_tempo;
 
                 st.acc_sentido_escolha_cantidad += diff_counter(sentido_escolha_cantidad, st.last_sentido_escolha_cantidad);
                 st.last_sentido_escolha_cantidad = sentido_escolha_cantidad;
 
-                st.acc_sentido_escolha_tiempo += diff_timer(sentido_escolha_tiempo, st.last_sentido_escolha_tiempo);
+                st.acc_sentido_escolha_tiempo += diff_counter(sentido_escolha_tiempo, st.last_sentido_escolha_tiempo);
                 st.last_sentido_escolha_tiempo = sentido_escolha_tiempo;
 
                 st.acc_barreira1_cantidad += diff_counter(barreira1_cantidad, st.last_barreira1_cantidad);
                 st.last_barreira1_cantidad = barreira1_cantidad;
 
-                st.acc_barreira1_tiempo += diff_timer(barreira1_tiempo, st.last_barreira1_tiempo);
+                st.acc_barreira1_tiempo += diff_counter(barreira1_tiempo, st.last_barreira1_tiempo);
                 st.last_barreira1_tiempo = barreira1_tiempo;
             }
 
