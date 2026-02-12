@@ -30,7 +30,7 @@ bool detect_global_shift_change(int currentShift)
  * This applies to BOTH counter fields (*_cantidad) AND timer fields
  * (*_tiempo_ds, *_tiempo_s, timer1Hz).
  *
- * Evidence from production logs (all 3 PLC types — secador, esmalte, horno):
+ * Evidence from production logs (all 3 PLC types â€” secador, esmalte, horno):
  *   - Raw values toggle bit-15 every few messages on ALL registers
  *   - Example: paradas_tempo_s alternates 54311 (b15=1, low15=21543)
  *              vs 21543 (b15=0, low15=21543) with zero actual change
@@ -70,6 +70,18 @@ static uint16_t diff_counter(uint16_t curr, uint16_t prev, uint16_t max_valid = 
     }
     
     return delta;
+}
+
+// FIX: Safe wrapper that only updates 'last' when delta is valid.
+// When LoRa devices intermittently send data from alternate PLC register banks,
+// the raw value jumps to a completely different range. diff_counter correctly
+// rejects these (delta > max_valid), but if we unconditionally update 'last'
+// to the anomalous value, the NEXT valid reading also produces a huge delta
+// and gets rejected too — losing two intervals of real counts per anomaly.
+static uint16_t diff_counter_safe(uint16_t curr, uint16_t &prev_ref, uint16_t max_valid = 5000) {
+    uint16_t d = diff_counter(curr, prev_ref, max_valid);
+    if (d > 0) prev_ref = curr;  // Only update reference on valid delta
+    return d;
 }
 
 
@@ -248,7 +260,7 @@ void CalidadProcessor::reset_states() {
 // PrensaHidraulica1Processor - Fixed with correct counter handling
 // ============================================================================
 /**
- * PLC Register Mapping (from salida_prensa_1.pdf SecciÃƒÂ³n12):
+ * PLC Register Mapping (from salida_prensa_1.pdf SecciÃƒÆ’Ã‚Â³n12):
  * 
  * Input fields (from decoder, TODO: update decoder field names):
  * - "cantidadProductos" = D29005 = PISADAS (press stroke count, NOT products!)
@@ -257,8 +269,8 @@ void CalidadProcessor::reset_states() {
  * - "tiempoParadas_s" = D29004 = Stop duration (SECONDS)
  * - "alarms" = D29002 = Status Lento (status bits)
  * 
- * The PLC calculates: Products = PISADAS Ãƒâ€” Fila Ãƒâ€” Pac
- * We apply: Products = PISADAS Ãƒâ€” factor_pisadas (per line)
+ * The PLC calculates: Products = PISADAS ÃƒÆ’Ã¢â‚¬â€ Fila ÃƒÆ’Ã¢â‚¬â€ Pac
+ * We apply: Products = PISADAS ÃƒÆ’Ã¢â‚¬â€ factor_pisadas (per line)
  */
 class PrensaHidraulica1Processor : public IMessageProcessor
 {
@@ -297,7 +309,7 @@ public:
 
         // Read inputs from decoder
         // NOTE: Field names will change when decoder is updated
-        // Current: cantidadProductos Ã¢â€ â€™ Should be: pisadas
+        // Current: cantidadProductos ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ Should be: pisadas
         int line          = jsonu::get_opt<int>(msg, "lineID").value_or(0);
         int alarms        = jsonu::get_opt<int>(msg, "alarms").value_or(0);
         
@@ -344,24 +356,20 @@ public:
                 // Accumulate deltas using PLC-compatible validation
 
                 // D29005 - PISADAS counter (use diff_counter with bit-15 validation)
-                uint16_t delta_pisadas = diff_counter(pisadas, st.last_pisadas);
+                uint16_t delta_pisadas = diff_counter_safe(pisadas, st.last_pisadas);
                 st.acc_pisadas += delta_pisadas;
-                st.last_pisadas = pisadas;
 
                 // D29006 - Metric time (deciseconds, bit-15 masked)
-                uint16_t delta_tiempo = diff_counter(metrica_tiempo, st.last_metrica_tiempo);
+                uint16_t delta_tiempo = diff_counter_safe(metrica_tiempo, st.last_metrica_tiempo);
                 st.acc_metrica_tiempo_s += delta_tiempo * 0.1;
-                st.last_metrica_tiempo = metrica_tiempo;
 
                 // D29003 - Stop count counter
-                uint16_t delta_paradas = diff_counter(paradas_count, st.last_paradas_count);
+                uint16_t delta_paradas = diff_counter_safe(paradas_count, st.last_paradas_count);
                 st.acc_paradas_count += delta_paradas;
-                st.last_paradas_count = paradas_count;
 
                 // D29004 - Stop time counter (seconds)
-                uint16_t delta_tiempo_paradas = diff_counter(paradas_tiempo, st.last_paradas_tiempo);
+                uint16_t delta_tiempo_paradas = diff_counter_safe(paradas_tiempo, st.last_paradas_tiempo);
                 st.acc_paradas_tiempo_s += delta_tiempo_paradas;
-                st.last_paradas_tiempo = paradas_tiempo;
             }
 
             // Copy out accumulated values
@@ -502,21 +510,17 @@ public:
             }
             else {
                 // Use PLC-compatible counter validation
-                uint16_t delta_pisadas = diff_counter(pisadas, st.last_pisadas);
+                uint16_t delta_pisadas = diff_counter_safe(pisadas, st.last_pisadas);
                 st.acc_pisadas += delta_pisadas;
-                st.last_pisadas = pisadas;
 
-                uint16_t delta_tiempo = diff_counter(metrica_tiempo, st.last_metrica_tiempo);
+                uint16_t delta_tiempo = diff_counter_safe(metrica_tiempo, st.last_metrica_tiempo);
                 st.acc_metrica_tiempo_s += delta_tiempo * 0.1;
-                st.last_metrica_tiempo = metrica_tiempo;
 
-                uint16_t delta_paradas = diff_counter(paradas_count, st.last_paradas_count);
+                uint16_t delta_paradas = diff_counter_safe(paradas_count, st.last_paradas_count);
                 st.acc_paradas_count += delta_paradas;
-                st.last_paradas_count = paradas_count;
 
-                uint16_t delta_tiempo_paradas = diff_counter(paradas_tiempo, st.last_paradas_tiempo);
+                uint16_t delta_tiempo_paradas = diff_counter_safe(paradas_tiempo, st.last_paradas_tiempo);
                 st.acc_paradas_tiempo_s += delta_tiempo_paradas;
-                st.last_paradas_tiempo = paradas_tiempo;
             }
 
             acc_pisadas_out = st.acc_pisadas;
@@ -583,7 +587,7 @@ std::unordered_map<int, PrensaHidraulica2Processor::PH2State>
  * 
  * Changes from original:
  * 1. Reads NEW semantic field names from LoRaWAN decoder v2
- * 2. ALL registers use bit-15 flag — diff_counter for everything
+ * 2. ALL registers use bit-15 flag â€” diff_counter for everything
  * 3. Tracks ALL fields from PLC (not just 2)
  * 4. Output JSON uses correct semantic names
  * 
@@ -722,33 +726,24 @@ public:
                 st.last_bancalino_l2_tiempo = bancalino_l2_tiempo;
             }
             else {
-                // Accumulate deltas — ALL PLC registers have bit-15 flag, use diff_counter for everything
-                st.acc_timer1Hz += diff_counter(timer1Hz, st.last_timer1Hz);
-                st.last_timer1Hz = timer1Hz;
+                // Accumulate deltas â€” ALL PLC registers have bit-15 flag, use diff_counter for everything
+                st.acc_timer1Hz += diff_counter_safe(timer1Hz, st.last_timer1Hz);
 
-                st.acc_paradas_cantidad += diff_counter(paradas_cantidad, st.last_paradas_cantidad);
-                st.last_paradas_cantidad = paradas_cantidad;
+                st.acc_paradas_cantidad += diff_counter_safe(paradas_cantidad, st.last_paradas_cantidad);
 
-                st.acc_paradas_tempo_s += diff_counter(paradas_tempo, st.last_paradas_tempo);
-                st.last_paradas_tempo = paradas_tempo;
+                st.acc_paradas_tempo_s += diff_counter_safe(paradas_tempo, st.last_paradas_tempo);
 
-                st.acc_ingreso_elevador_cantidad += diff_counter(ingreso_elevador_cantidad, st.last_ingreso_elevador_cantidad);
-                st.last_ingreso_elevador_cantidad = ingreso_elevador_cantidad;
+                st.acc_ingreso_elevador_cantidad += diff_counter_safe(ingreso_elevador_cantidad, st.last_ingreso_elevador_cantidad);
 
-                st.acc_ingreso_elevador_tiempo_ds += diff_counter(ingreso_elevador_tiempo, st.last_ingreso_elevador_tiempo);
-                st.last_ingreso_elevador_tiempo = ingreso_elevador_tiempo;
+                st.acc_ingreso_elevador_tiempo_ds += diff_counter_safe(ingreso_elevador_tiempo, st.last_ingreso_elevador_tiempo);
 
-                st.acc_bancalino_l1_cantidad += diff_counter(bancalino_l1_cantidad, st.last_bancalino_l1_cantidad);
-                st.last_bancalino_l1_cantidad = bancalino_l1_cantidad;
+                st.acc_bancalino_l1_cantidad += diff_counter_safe(bancalino_l1_cantidad, st.last_bancalino_l1_cantidad);
 
-                st.acc_bancalino_l1_tiempo_ds += diff_counter(bancalino_l1_tiempo, st.last_bancalino_l1_tiempo);
-                st.last_bancalino_l1_tiempo = bancalino_l1_tiempo;
+                st.acc_bancalino_l1_tiempo_ds += diff_counter_safe(bancalino_l1_tiempo, st.last_bancalino_l1_tiempo);
 
-                st.acc_bancalino_l2_cantidad += diff_counter(bancalino_l2_cantidad, st.last_bancalino_l2_cantidad);
-                st.last_bancalino_l2_cantidad = bancalino_l2_cantidad;
+                st.acc_bancalino_l2_cantidad += diff_counter_safe(bancalino_l2_cantidad, st.last_bancalino_l2_cantidad);
 
-                st.acc_bancalino_l2_tiempo_ds += diff_counter(bancalino_l2_tiempo, st.last_bancalino_l2_tiempo);
-                st.last_bancalino_l2_tiempo = bancalino_l2_tiempo;
+                st.acc_bancalino_l2_tiempo_ds += diff_counter_safe(bancalino_l2_tiempo, st.last_bancalino_l2_tiempo);
             }
 
             // Copy accumulated values to output
@@ -824,7 +819,7 @@ std::unordered_map<int, EntradaSecadorProcessor::State> EntradaSecadorProcessor:
  * 
  * Changes from original:
  * 1. Reads NEW semantic field names from LoRaWAN decoder v2
- * 2. ALL registers use bit-15 flag — diff_counter for everything
+ * 2. ALL registers use bit-15 flag â€” diff_counter for everything
  * 3. Uses diff_counter() for ALL fields (bit-15 mask + 15-bit rollover)
  * 4. Output JSON uses correct semantic names
  * 
@@ -832,7 +827,7 @@ std::unordered_map<int, EntradaSecadorProcessor::State> EntradaSecadorProcessor:
  *   checksum, timer1Hz, alarms, parada_mds_cantidad, parada_mds_tiempo_s,
  *   metrica_mds_cantidad, metrica_mds_tiempo_ds
  * 
- * PLC Register mapping (SecciÃƒÂ³n6):
+ * PLC Register mapping (SecciÃƒÆ’Ã‚Â³n6):
  *   D29003 = parada_mds_cantidad (stop events)
  *   D29004 = parada_mds_tiempo_s (stop time in seconds)
  *   D29005 = metrica_mds_cantidad (MDS cycles - NOT products!)
@@ -927,21 +922,16 @@ public:
                 st.last_metrica_mds_tiempo = metrica_mds_tiempo;
             }
             else {
-                // Accumulate deltas — ALL PLC registers have bit-15 flag, use diff_counter for everything
-                st.acc_timer1Hz += diff_counter(timer1Hz, st.last_timer1Hz);
-                st.last_timer1Hz = timer1Hz;
+                // Accumulate deltas â€” ALL PLC registers have bit-15 flag, use diff_counter for everything
+                st.acc_timer1Hz += diff_counter_safe(timer1Hz, st.last_timer1Hz);
 
-                st.acc_parada_mds_cantidad += diff_counter(parada_mds_cantidad, st.last_parada_mds_cantidad);
-                st.last_parada_mds_cantidad = parada_mds_cantidad;
+                st.acc_parada_mds_cantidad += diff_counter_safe(parada_mds_cantidad, st.last_parada_mds_cantidad);
 
-                st.acc_parada_mds_tiempo_s += diff_counter(parada_mds_tiempo, st.last_parada_mds_tiempo);
-                st.last_parada_mds_tiempo = parada_mds_tiempo;
+                st.acc_parada_mds_tiempo_s += diff_counter_safe(parada_mds_tiempo, st.last_parada_mds_tiempo);
 
-                st.acc_metrica_mds_cantidad += diff_counter(metrica_mds_cantidad, st.last_metrica_mds_cantidad);
-                st.last_metrica_mds_cantidad = metrica_mds_cantidad;
+                st.acc_metrica_mds_cantidad += diff_counter_safe(metrica_mds_cantidad, st.last_metrica_mds_cantidad);
 
-                st.acc_metrica_mds_tiempo_ds += diff_counter(metrica_mds_tiempo, st.last_metrica_mds_tiempo);
-                st.last_metrica_mds_tiempo = metrica_mds_tiempo;
+                st.acc_metrica_mds_tiempo_ds += diff_counter_safe(metrica_mds_tiempo, st.last_metrica_mds_tiempo);
             }
 
             // Copy accumulated values to output
@@ -970,7 +960,7 @@ public:
         prod["parada_mds_tiempo_instantaneo_s"] = parada_mds_tiempo;
         prod["parada_mds_tiempo_turno_s"] = acc_parada_mds_tiempo_s_out;
 
-        // MÃƒÂ©trica MDS (cycles) - D29005, D29006
+        // MÃƒÆ’Ã‚Â©trica MDS (cycles) - D29005, D29006
         // NOTE: These are MDS machine CYCLES, NOT product count!
         prod["metrica_mds_instantaneo"] = metrica_mds_cantidad;
         prod["metrica_mds_turno"] = acc_metrica_mds_cantidad_out;
@@ -1003,7 +993,7 @@ std::unordered_map<int, SalidaSecadorProcessor::State> SalidaSecadorProcessor::s
  * 
  * Changes from original:
  * 1. Reads NEW semantic field names from LoRaWAN decoder v2
- * 2. ALL registers use bit-15 flag — diff_counter for everything
+ * 2. ALL registers use bit-15 flag â€” diff_counter for everything
  * 3. Uses diff_counter() for ALL fields (bit-15 mask + 15-bit rollover)
  * 4. Output JSON uses correct semantic names
  * 
@@ -1011,7 +1001,7 @@ std::unordered_map<int, SalidaSecadorProcessor::State> SalidaSecadorProcessor::s
  *   checksum, timer1Hz, alarms, parada_esm_cantidad, parada_esm_tiempo_s,
  *   metrica_esm_cantidad, metrica_esm_tiempo_ds
  * 
- * PLC Register mapping (SecciÃƒÂ³n1):
+ * PLC Register mapping (SecciÃƒÆ’Ã‚Â³n1):
  *   D29003 = parada_esm_cantidad (stop events)
  *   D29004 = parada_esm_tiempo_s (stop time in seconds)
  *   D29005 = metrica_esm_cantidad (ESM cycles - NOT products!)
@@ -1106,21 +1096,16 @@ public:
                 st.last_metrica_esm_tiempo = metrica_esm_tiempo;
             }
             else {
-                // Accumulate deltas — ALL PLC registers have bit-15 flag, use diff_counter for everything
-                st.acc_timer1Hz += diff_counter(timer1Hz, st.last_timer1Hz);
-                st.last_timer1Hz = timer1Hz;
+                // Accumulate deltas â€” ALL PLC registers have bit-15 flag, use diff_counter for everything
+                st.acc_timer1Hz += diff_counter_safe(timer1Hz, st.last_timer1Hz);
 
-                st.acc_parada_esm_cantidad += diff_counter(parada_esm_cantidad, st.last_parada_esm_cantidad);
-                st.last_parada_esm_cantidad = parada_esm_cantidad;
+                st.acc_parada_esm_cantidad += diff_counter_safe(parada_esm_cantidad, st.last_parada_esm_cantidad);
 
-                st.acc_parada_esm_tiempo_s += diff_counter(parada_esm_tiempo, st.last_parada_esm_tiempo);
-                st.last_parada_esm_tiempo = parada_esm_tiempo;
+                st.acc_parada_esm_tiempo_s += diff_counter_safe(parada_esm_tiempo, st.last_parada_esm_tiempo);
 
-                st.acc_metrica_esm_cantidad += diff_counter(metrica_esm_cantidad, st.last_metrica_esm_cantidad);
-                st.last_metrica_esm_cantidad = metrica_esm_cantidad;
+                st.acc_metrica_esm_cantidad += diff_counter_safe(metrica_esm_cantidad, st.last_metrica_esm_cantidad);
 
-                st.acc_metrica_esm_tiempo_ds += diff_counter(metrica_esm_tiempo, st.last_metrica_esm_tiempo);
-                st.last_metrica_esm_tiempo = metrica_esm_tiempo;
+                st.acc_metrica_esm_tiempo_ds += diff_counter_safe(metrica_esm_tiempo, st.last_metrica_esm_tiempo);
             }
 
             // Copy accumulated values to output
@@ -1149,7 +1134,7 @@ public:
         prod["parada_esm_tiempo_instantaneo_s"] = parada_esm_tiempo;
         prod["parada_esm_tiempo_turno_s"] = acc_parada_esm_tiempo_s_out;
 
-        // MÃƒÂ©trica ESM (cycles) - D29005, D29006
+        // MÃƒÆ’Ã‚Â©trica ESM (cycles) - D29005, D29006
         // NOTE: These are ESM machine CYCLES, NOT product count!
         prod["metrica_esm_instantaneo"] = metrica_esm_cantidad;
         prod["metrica_esm_turno"] = acc_metrica_esm_cantidad_out;
@@ -1189,7 +1174,7 @@ std::unordered_map<int, EsmalteProcessor::State> EsmalteProcessor::states_;
  *   metrica_formador_cantidad, metrica_formador_tiempo_ds,
  *   falha_forno_cantidad, falha_forno_tiempo_s
  * 
- * PLC Register mapping (SecciÃƒÂ³n14):
+ * PLC Register mapping (SecciÃƒÆ’Ã‚Â³n14):
  *   D29003 = parada_mcf_cantidad (MCF stop count)
  *   D29004 = parada_mcf_tiempo_s (MCF stop time, seconds)
  *   D29005 = metrica_mcf_cantidad (MCF cycle count)
@@ -1216,7 +1201,7 @@ private:
         uint16_t last_timer1Hz = 0;
         uint32_t acc_timer1Hz = 0;
 
-        // Production: NÃƒÂºmero de Grades (D29007)
+        // Production: NÃƒÆ’Ã‚Âºmero de Grades (D29007)
         uint16_t last_numero_grades = 0;
         uint32_t acc_numero_grades = 0;
 
@@ -1227,14 +1212,14 @@ private:
         uint16_t last_parada_mcf_tiempo = 0;
         uint32_t acc_parada_mcf_tiempo_s = 0;
 
-        // MÃƒÂ©trica MCF - D29005, D29006
+        // MÃƒÆ’Ã‚Â©trica MCF - D29005, D29006
         uint16_t last_metrica_mcf_cantidad = 0;
         uint32_t acc_metrica_mcf_cantidad = 0;
 
         uint16_t last_metrica_mcf_tiempo = 0;
         uint32_t acc_metrica_mcf_tiempo_ds = 0;
 
-        // MÃƒÂ©trica Formador - D29008, D29009
+        // MÃƒÆ’Ã‚Â©trica Formador - D29008, D29009
         uint16_t last_metrica_formador_cantidad = 0;
         uint32_t acc_metrica_formador_cantidad = 0;
 
@@ -1285,13 +1270,13 @@ public:
         uint16_t parada_mcf_tiempo = static_cast<uint16_t>(
             jsonu::get_opt<int>(msg, "parada_mcf_tiempo_s").value_or(0));
 
-        // MÃƒÂ©trica MCF - D29005, D29006
+        // MÃƒÆ’Ã‚Â©trica MCF - D29005, D29006
         uint16_t metrica_mcf_cantidad = static_cast<uint16_t>(
             jsonu::get_opt<int>(msg, "metrica_mcf_cantidad").value_or(0));
         uint16_t metrica_mcf_tiempo = static_cast<uint16_t>(
             jsonu::get_opt<int>(msg, "metrica_mcf_tiempo_ds").value_or(0));
 
-        // MÃƒÂ©trica Formador - D29008, D29009
+        // MÃƒÆ’Ã‚Â©trica Formador - D29008, D29009
         uint16_t metrica_formador_cantidad = static_cast<uint16_t>(
             jsonu::get_opt<int>(msg, "metrica_formador_cantidad").value_or(0));
         uint16_t metrica_formador_tiempo = static_cast<uint16_t>(
@@ -1337,36 +1322,26 @@ public:
                 st.last_falha_forno_tiempo = falha_forno_tiempo;
             }
             else {
-                // Accumulate deltas — ALL PLC registers have bit-15 flag, use diff_counter for everything
-                st.acc_timer1Hz += diff_counter(timer1Hz, st.last_timer1Hz);
-                st.last_timer1Hz = timer1Hz;
+                // Accumulate deltas â€” ALL PLC registers have bit-15 flag, use diff_counter for everything
+                st.acc_timer1Hz += diff_counter_safe(timer1Hz, st.last_timer1Hz);
 
-                st.acc_numero_grades += diff_counter(numero_grades, st.last_numero_grades);
-                st.last_numero_grades = numero_grades;
+                st.acc_numero_grades += diff_counter_safe(numero_grades, st.last_numero_grades);
 
-                st.acc_parada_mcf_cantidad += diff_counter(parada_mcf_cantidad, st.last_parada_mcf_cantidad);
-                st.last_parada_mcf_cantidad = parada_mcf_cantidad;
+                st.acc_parada_mcf_cantidad += diff_counter_safe(parada_mcf_cantidad, st.last_parada_mcf_cantidad);
 
-                st.acc_parada_mcf_tiempo_s += diff_counter(parada_mcf_tiempo, st.last_parada_mcf_tiempo);
-                st.last_parada_mcf_tiempo = parada_mcf_tiempo;
+                st.acc_parada_mcf_tiempo_s += diff_counter_safe(parada_mcf_tiempo, st.last_parada_mcf_tiempo);
 
-                st.acc_metrica_mcf_cantidad += diff_counter(metrica_mcf_cantidad, st.last_metrica_mcf_cantidad);
-                st.last_metrica_mcf_cantidad = metrica_mcf_cantidad;
+                st.acc_metrica_mcf_cantidad += diff_counter_safe(metrica_mcf_cantidad, st.last_metrica_mcf_cantidad);
 
-                st.acc_metrica_mcf_tiempo_ds += diff_counter(metrica_mcf_tiempo, st.last_metrica_mcf_tiempo);
-                st.last_metrica_mcf_tiempo = metrica_mcf_tiempo;
+                st.acc_metrica_mcf_tiempo_ds += diff_counter_safe(metrica_mcf_tiempo, st.last_metrica_mcf_tiempo);
 
-                st.acc_metrica_formador_cantidad += diff_counter(metrica_formador_cantidad, st.last_metrica_formador_cantidad);
-                st.last_metrica_formador_cantidad = metrica_formador_cantidad;
+                st.acc_metrica_formador_cantidad += diff_counter_safe(metrica_formador_cantidad, st.last_metrica_formador_cantidad);
 
-                st.acc_metrica_formador_tiempo_ds += diff_counter(metrica_formador_tiempo, st.last_metrica_formador_tiempo);
-                st.last_metrica_formador_tiempo = metrica_formador_tiempo;
+                st.acc_metrica_formador_tiempo_ds += diff_counter_safe(metrica_formador_tiempo, st.last_metrica_formador_tiempo);
 
-                st.acc_falha_forno_cantidad += diff_counter(falha_forno_cantidad, st.last_falha_forno_cantidad);
-                st.last_falha_forno_cantidad = falha_forno_cantidad;
+                st.acc_falha_forno_cantidad += diff_counter_safe(falha_forno_cantidad, st.last_falha_forno_cantidad);
 
-                st.acc_falha_forno_tiempo_s += diff_counter(falha_forno_tiempo, st.last_falha_forno_tiempo);
-                st.last_falha_forno_tiempo = falha_forno_tiempo;
+                st.acc_falha_forno_tiempo_s += diff_counter_safe(falha_forno_tiempo, st.last_falha_forno_tiempo);
             }
 
             // Copy accumulated values to output
@@ -1394,7 +1369,7 @@ public:
         prod["timer1Hz_instantaneo"] = timer1Hz;
         prod["timer1Hz_turno"] = acc_timer1Hz_out;
 
-        // PRODUCTION COUNT - numero_grades (D29007) Ã°Å¸Å½Â¯
+        // PRODUCTION COUNT - numero_grades (D29007) ÃƒÂ°Ã…Â¸Ã…Â½Ã‚Â¯
         prod["numero_grades_instantaneo"] = numero_grades;
         prod["numero_grades_turno"] = acc_numero_grades_out;
 
@@ -1404,14 +1379,14 @@ public:
         prod["parada_mcf_tiempo_instantaneo_s"] = parada_mcf_tiempo;
         prod["parada_mcf_tiempo_turno_s"] = acc_parada_mcf_tiempo_s_out;
 
-        // MÃƒÂ©trica MCF - D29005, D29006
+        // MÃƒÆ’Ã‚Â©trica MCF - D29005, D29006
         prod["metrica_mcf_instantaneo"] = metrica_mcf_cantidad;
         prod["metrica_mcf_turno"] = acc_metrica_mcf_cantidad_out;
         prod["metrica_mcf_tiempo_instantaneo_ds"] = metrica_mcf_tiempo;
         prod["metrica_mcf_tiempo_turno_ds"] = acc_metrica_mcf_tiempo_ds_out;
         prod["metrica_mcf_tiempo_turno_s"] = static_cast<double>(acc_metrica_mcf_tiempo_ds_out) * 0.1;
 
-        // MÃƒÂ©trica Formador - D29008, D29009
+        // MÃƒÆ’Ã‚Â©trica Formador - D29008, D29009
         prod["metrica_formador_instantaneo"] = metrica_formador_cantidad;
         prod["metrica_formador_turno"] = acc_metrica_formador_cantidad_out;
         prod["metrica_formador_tiempo_instantaneo_ds"] = metrica_formador_tiempo;
@@ -1447,7 +1422,7 @@ std::unordered_map<int, EntradaHornoProcessor::State> EntradaHornoProcessor::sta
  * 
  * Changes from original:
  * 1. Reads NEW semantic field names from LoRaWAN decoder
- * 2. ALL registers use bit-15 flag — diff_counter for everything
+ * 2. ALL registers use bit-15 flag â€” diff_counter for everything
  * 3. Outputs OLD field names in JSON for backward compatibility
  * 
  * Input fields (from decoder v3):
@@ -1637,56 +1612,40 @@ public:
                 st.last_barreira1_tiempo = barreira1_tiempo;
             }
             else {
-                // Accumulate deltas — ALL PLC registers have bit-15 flag, use diff_counter for everything
-                uint16_t delta_timer = diff_counter(timer1Hz, st.last_timer1Hz);
+                // Accumulate deltas â€” ALL PLC registers have bit-15 flag, use diff_counter for everything
+                uint16_t delta_timer = diff_counter_safe(timer1Hz, st.last_timer1Hz);
                 st.acc_timer1Hz += delta_timer;
                 st.acc_tiempo_operacion_s += delta_timer;
-                st.last_timer1Hz = timer1Hz;
 
-                st.acc_paradas_cantidad += diff_counter(paradas_cantidad, st.last_paradas_cantidad);
-                st.last_paradas_cantidad = paradas_cantidad;
+                st.acc_paradas_cantidad += diff_counter_safe(paradas_cantidad, st.last_paradas_cantidad);
 
-                st.acc_paradas_tempo += diff_counter(paradas_tempo, st.last_paradas_tempo);
-                st.last_paradas_tempo = paradas_tempo;
+                st.acc_paradas_tempo += diff_counter_safe(paradas_tempo, st.last_paradas_tempo);
 
-                st.acc_metrica_ciclos += diff_counter(metrica_ciclos, st.last_metrica_ciclos);
-                st.last_metrica_ciclos = metrica_ciclos;
+                st.acc_metrica_ciclos += diff_counter_safe(metrica_ciclos, st.last_metrica_ciclos);
 
-                st.acc_metrica_tiempo += diff_counter(metrica_tiempo, st.last_metrica_tiempo);
-                st.last_metrica_tiempo = metrica_tiempo;
+                st.acc_metrica_tiempo += diff_counter_safe(metrica_tiempo, st.last_metrica_tiempo);
 
-                st.acc_bancalinos_q301 += diff_counter(bancalinos_q301, st.last_bancalinos_q301);
-                st.last_bancalinos_q301 = bancalinos_q301;
+                st.acc_bancalinos_q301 += diff_counter_safe(bancalinos_q301, st.last_bancalinos_q301);
 
-                st.acc_bancalinos_q300 += diff_counter(bancalinos_q300, st.last_bancalinos_q300);
-                st.last_bancalinos_q300 = bancalinos_q300;
+                st.acc_bancalinos_q300 += diff_counter_safe(bancalinos_q300, st.last_bancalinos_q300);
 
-                st.acc_bancalinos_comb1 += diff_counter(bancalinos_comb1, st.last_bancalinos_comb1);
-                st.last_bancalinos_comb1 = bancalinos_comb1;
+                st.acc_bancalinos_comb1 += diff_counter_safe(bancalinos_comb1, st.last_bancalinos_comb1);
 
-                st.acc_bancalinos_comb2 += diff_counter(bancalinos_comb2, st.last_bancalinos_comb2);
-                st.last_bancalinos_comb2 = bancalinos_comb2;
+                st.acc_bancalinos_comb2 += diff_counter_safe(bancalinos_comb2, st.last_bancalinos_comb2);
 
-                st.acc_bancalinos_total += diff_counter(bancalinos_total, st.last_bancalinos_total);
-                st.last_bancalinos_total = bancalinos_total;
+                st.acc_bancalinos_total += diff_counter_safe(bancalinos_total, st.last_bancalinos_total);
 
-                st.acc_parada_escolha_cantidad += diff_counter(parada_escolha_cantidad, st.last_parada_escolha_cantidad);
-                st.last_parada_escolha_cantidad = parada_escolha_cantidad;
+                st.acc_parada_escolha_cantidad += diff_counter_safe(parada_escolha_cantidad, st.last_parada_escolha_cantidad);
 
-                st.acc_parada_escolha_tempo += diff_counter(parada_escolha_tempo, st.last_parada_escolha_tempo);
-                st.last_parada_escolha_tempo = parada_escolha_tempo;
+                st.acc_parada_escolha_tempo += diff_counter_safe(parada_escolha_tempo, st.last_parada_escolha_tempo);
 
-                st.acc_sentido_escolha_cantidad += diff_counter(sentido_escolha_cantidad, st.last_sentido_escolha_cantidad);
-                st.last_sentido_escolha_cantidad = sentido_escolha_cantidad;
+                st.acc_sentido_escolha_cantidad += diff_counter_safe(sentido_escolha_cantidad, st.last_sentido_escolha_cantidad);
 
-                st.acc_sentido_escolha_tiempo += diff_counter(sentido_escolha_tiempo, st.last_sentido_escolha_tiempo);
-                st.last_sentido_escolha_tiempo = sentido_escolha_tiempo;
+                st.acc_sentido_escolha_tiempo += diff_counter_safe(sentido_escolha_tiempo, st.last_sentido_escolha_tiempo);
 
-                st.acc_barreira1_cantidad += diff_counter(barreira1_cantidad, st.last_barreira1_cantidad);
-                st.last_barreira1_cantidad = barreira1_cantidad;
+                st.acc_barreira1_cantidad += diff_counter_safe(barreira1_cantidad, st.last_barreira1_cantidad);
 
-                st.acc_barreira1_tiempo += diff_counter(barreira1_tiempo, st.last_barreira1_tiempo);
-                st.last_barreira1_tiempo = barreira1_tiempo;
+                st.acc_barreira1_tiempo += diff_counter_safe(barreira1_tiempo, st.last_barreira1_tiempo);
             }
 
             // Copy accumulated values to output
@@ -1722,32 +1681,32 @@ public:
         prod["tiempo_operacion_turno_s"] = acc_tiempo_operacion_s_out;
 
         // Main production counter (D25005 - metrica MDF ciclos)
-        // OLD: cantidad Ã¢â€ â€™ NEW: metrica_mdf_ciclos
+        // OLD: cantidad ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ NEW: metrica_mdf_ciclos
         prod["cantidad_instantanea"] = metrica_ciclos;
         prod["cantidad_produccion_turno"] = acc_metrica_ciclos_out;
 
         // Cycle time accumulator (D25006 - metrica MDF tiempo)
-        // OLD: cantidad_total Ã¢â€ â€™ NEW: metrica_mdf_tiempo
+        // OLD: cantidad_total ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ NEW: metrica_mdf_tiempo
         prod["cantidad_total_instantanea"] = metrica_tiempo;
         prod["cantidad_total_turno"] = acc_metrica_tiempo_out;
 
         // Paradas cantidad (D25003)
-        // OLD: paradas_1 Ã¢â€ â€™ NEW: paradas_cantidad
+        // OLD: paradas_1 ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ NEW: paradas_cantidad
         prod["paradas_1_instantaneo"] = paradas_cantidad;
         prod["paradas_1_turno"] = acc_paradas_cantidad_out;
 
         // Paradas tempo (D25004)
-        // OLD: paradas_2 Ã¢â€ â€™ NEW: paradas_tempo
+        // OLD: paradas_2 ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ NEW: paradas_tempo
         prod["paradas_2_instantaneo"] = paradas_tempo;
         prod["paradas_2_turno"] = acc_paradas_tempo_out;
 
         // Bancalinos Q:3.01 (D25007)
-        // OLD: bancalinos0 Ã¢â€ â€™ NEW: bancalinos_q301
+        // OLD: bancalinos0 ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ NEW: bancalinos_q301
         prod["bancalinos0_instantaneo"] = bancalinos_q301;
         prod["bancalinos0_turno"] = acc_bancalinos_q301_out;
 
         // Bancalinos Q:3.00 (D25008)
-        // OLD: bancalinos1 Ã¢â€ â€™ NEW: bancalinos_q300
+        // OLD: bancalinos1 ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ NEW: bancalinos_q300
         prod["bancalinos1_instantaneo"] = bancalinos_q300;
         prod["bancalinos1_turno"] = acc_bancalinos_q300_out;
 
@@ -1764,14 +1723,14 @@ public:
         prod["bancalinosTotal_turno"] = acc_bancalinos_total_out;
 
         // Sentido Escolha (D25012, D25013)
-        // OLD: cambioSentido Ã¢â€ â€™ NEW: sentido_escolha
+        // OLD: cambioSentido ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ NEW: sentido_escolha
         prod["cambioSentido_instantaneo"] = sentido_escolha_cantidad;
         prod["cambioSentido_turno"] = acc_sentido_escolha_cantidad_out;
         prod["cambioSentidoTotal_instantaneo"] = sentido_escolha_tiempo;
         prod["cambioSentidoTotal_turno"] = acc_sentido_escolha_tiempo_out;
 
         // Barreira 1 (D25014, D25015)
-        // OLD: cambioBarrera Ã¢â€ â€™ NEW: barreira1
+        // OLD: cambioBarrera ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ NEW: barreira1
         prod["cambioBarrera_instantaneo"] = barreira1_cantidad;
         prod["cambioBarrera_turno"] = acc_barreira1_cantidad_out;
         prod["cambioBarreraTotal_instantaneo"] = barreira1_tiempo;
