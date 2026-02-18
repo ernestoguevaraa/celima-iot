@@ -30,7 +30,7 @@ bool detect_global_shift_change(int currentShift)
  * This applies to BOTH counter fields (*_cantidad) AND timer fields
  * (*_tiempo_ds, *_tiempo_s, timer1Hz).
  *
- * Evidence from production logs (all 3 PLC types  secador, esmalte, horno):
+ * Evidence from production logs (all 3 PLC types Ã¢â‚¬â€ secador, esmalte, horno):
  *   - Raw values toggle bit-15 every few messages on ALL registers
  *   - Example: paradas_tempo_s alternates 54311 (b15=1, low15=21543)
  *              vs 21543 (b15=0, low15=21543) with zero actual change
@@ -300,8 +300,8 @@ void CalidadProcessor::reset_states() {
  * - "tiempoParadas_s" = D29004 = Stop duration (SECONDS)
  * - "alarms" = D29002 = Status Lento (status bits)
  * 
- * The PLC calculates: Products = PISADAS 
- * We apply: Products = PISADAS factor_pisadas (per line)
+ * The PLC calculates: Products = PISADAS ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â Fila ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â Pac
+ * We apply: Products = PISADAS ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â factor_pisadas (per line)
  */
 class PrensaHidraulica1Processor : public IMessageProcessor
 {
@@ -396,7 +396,7 @@ public:
 
                 // D29006 - Metric time (deciseconds, bit-15 masked)
                 uint16_t delta_tiempo = diff_counter_safe(metrica_tiempo, st.last_metrica_tiempo, st.rc_metrica_tiempo);
-                st.acc_metrica_tiempo_s += delta_tiempo * 0.2;  // CF100 P_0_1s: period=0.2s per tick
+                st.acc_metrica_tiempo_s += delta_tiempo * 0.1;  // CF100 P_0_1s: 0.1s per tick (validated)
 
                 // D29003 - Stop count counter
                 uint16_t delta_paradas = diff_counter_safe(paradas_count, st.last_paradas_count, st.rc_paradas_count);
@@ -553,7 +553,7 @@ public:
                 st.acc_pisadas += delta_pisadas;
 
                 uint16_t delta_tiempo = diff_counter_safe(metrica_tiempo, st.last_metrica_tiempo, st.rc_metrica_tiempo);
-                st.acc_metrica_tiempo_s += delta_tiempo * 0.2;  // CF100 P_0_1s: period=0.2s per tick
+                st.acc_metrica_tiempo_s += delta_tiempo * 0.1;  // CF100 P_0_1s: 0.1s per tick (validated)
 
                 uint16_t delta_paradas = diff_counter_safe(paradas_count, st.last_paradas_count, st.rc_paradas_count);
                 st.acc_paradas_count += delta_paradas;
@@ -828,19 +828,19 @@ public:
         prod["ingreso_elevador_instantaneo"] = ingreso_elevador_cantidad;
         prod["ingreso_elevador_turno"] = acc_ingreso_elevador_cantidad_out;
         prod["ingreso_elevador_tiempo_instantaneo_ds"] = ingreso_elevador_tiempo;
-        prod["ingreso_elevador_tiempo_turno_ds"] = acc_ingreso_elevador_tiempo_ds_out * 2;  // CF100: 0.2s per tick -> real ds
+        prod["ingreso_elevador_tiempo_turno_ds"] = acc_ingreso_elevador_tiempo_ds_out;  // CF100: 1 tick = 0.1s = 1ds (validated, no ×2)
 
         // Bancalino Linea 1 - D29007, D29008
         prod["bancalino_l1_instantaneo"] = bancalino_l1_cantidad;
         prod["bancalino_l1_turno"] = acc_bancalino_l1_cantidad_out;
         prod["bancalino_l1_tiempo_instantaneo_ds"] = bancalino_l1_tiempo;
-        prod["bancalino_l1_tiempo_turno_ds"] = acc_bancalino_l1_tiempo_ds_out * 2;  // CF100: 0.2s per tick -> real ds
+        prod["bancalino_l1_tiempo_turno_ds"] = acc_bancalino_l1_tiempo_ds_out;  // CF100: 1 tick = 0.1s = 1ds (validated, no ×2)
 
         // Bancalino Linea 2 - D29009, D29010
         prod["bancalino_l2_instantaneo"] = bancalino_l2_cantidad;
         prod["bancalino_l2_turno"] = acc_bancalino_l2_cantidad_out;
         prod["bancalino_l2_tiempo_instantaneo_ds"] = bancalino_l2_tiempo;
-        prod["bancalino_l2_tiempo_turno_ds"] = acc_bancalino_l2_tiempo_ds_out * 2;  // CF100: 0.2s per tick -> real ds
+        prod["bancalino_l2_tiempo_turno_ds"] = acc_bancalino_l2_tiempo_ds_out;  // CF100: 1 tick = 0.1s = 1ds (validated, no ×2)
 
         prod["timestamp_device"] = iso8601_utc_now();
 
@@ -975,7 +975,7 @@ public:
                 st.last_metrica_mds_tiempo = metrica_mds_tiempo;
             }
             else {
-                // Accumulate deltas  ALL PLC registers have bit-15 flag, use diff_counter for everything
+                // Accumulate deltas Ã¢â‚¬â€ ALL PLC registers have bit-15 flag, use diff_counter for everything
                 st.acc_timer1Hz += diff_counter_safe(timer1Hz, st.last_timer1Hz, st.rc_timer1Hz);
 
                 st.acc_parada_mds_cantidad += diff_counter_safe(parada_mds_cantidad, st.last_parada_mds_cantidad, st.rc_parada_mds_cantidad);
@@ -1013,15 +1013,15 @@ public:
         prod["parada_mds_tiempo_instantaneo_s"] = parada_mds_tiempo;
         prod["parada_mds_tiempo_turno_s"] = acc_parada_mds_tiempo_s_out * 2;  // CF102: 2s per tick
 
-        // Metrica MDS (cycles) - D29005, D29006
+        // MÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â©trica MDS (cycles) - D29005, D29006
         // NOTE: These are MDS machine CYCLES, NOT product count!
         prod["metrica_mds_instantaneo"] = metrica_mds_cantidad;
         prod["metrica_mds_turno"] = acc_metrica_mds_cantidad_out * 2;  // Validated: PLC counts 50% of physical (Lines 1&2 confirmed)
         prod["metrica_mds_tiempo_instantaneo_ds"] = metrica_mds_tiempo;
-        prod["metrica_mds_tiempo_turno_ds"] = acc_metrica_mds_tiempo_ds_out * 2;  // CF100: 0.2s per tick -> real ds
+        prod["metrica_mds_tiempo_turno_ds"] = acc_metrica_mds_tiempo_ds_out;  // CF100: 1 tick = 0.1s = 1ds (validated, no ×2)
         
         // Convert deciseconds to seconds for convenience
-        prod["metrica_mds_tiempo_turno_s"] = static_cast<double>(acc_metrica_mds_tiempo_ds_out) * 0.2;  // CF100: each tick = 0.2s
+        prod["metrica_mds_tiempo_turno_s"] = static_cast<double>(acc_metrica_mds_tiempo_ds_out) * 0.1;  // CF100: each tick = 0.1s (validated)
 
         prod["timestamp_device"] = iso8601_utc_now();
 
@@ -1046,7 +1046,7 @@ std::unordered_map<int, SalidaSecadorProcessor::State> SalidaSecadorProcessor::s
  * 
  * Changes from original:
  * 1. Reads NEW semantic field names from LoRaWAN decoder v2
- * 2. ALL registers use bit-15 flag diff_counter for everything
+ * 2. ALL registers use bit-15 flag Ã¢â‚¬â€ diff_counter for everything
  * 3. Uses diff_counter() for ALL fields (bit-15 mask + 15-bit rollover)
  * 4. Output JSON uses correct semantic names
  * 
@@ -1054,7 +1054,7 @@ std::unordered_map<int, SalidaSecadorProcessor::State> SalidaSecadorProcessor::s
  *   checksum, timer1Hz, alarms, parada_esm_cantidad, parada_esm_tiempo_s,
  *   metrica_esm_cantidad, metrica_esm_tiempo_ds
  * 
- * PLC Register mapping 
+ * PLC Register mapping (SecciÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â³n1):
  *   D29003 = parada_esm_cantidad (stop events)
  *   D29004 = parada_esm_tiempo_s (stop time in seconds)
  *   D29005 = metrica_esm_cantidad (ESM cycles - NOT products!)
@@ -1197,10 +1197,10 @@ public:
         prod["metrica_esm_instantaneo"] = metrica_esm_cantidad;
         prod["metrica_esm_turno"] = acc_metrica_esm_cantidad_out * 2;  // Validated: PLC counts 50% of physical (Lines 1&2 confirmed)
         prod["metrica_esm_tiempo_instantaneo_ds"] = metrica_esm_tiempo;
-        prod["metrica_esm_tiempo_turno_ds"] = acc_metrica_esm_tiempo_ds_out * 2;  // CF100: 0.2s per tick -> real ds
+        prod["metrica_esm_tiempo_turno_ds"] = acc_metrica_esm_tiempo_ds_out;  // CF100: 1 tick = 0.1s = 1ds (validated, no ×2)
         
         // Convert deciseconds to seconds for convenience
-        prod["metrica_esm_tiempo_turno_s"] = static_cast<double>(acc_metrica_esm_tiempo_ds_out) * 0.2;  // CF100: each tick = 0.2s
+        prod["metrica_esm_tiempo_turno_s"] = static_cast<double>(acc_metrica_esm_tiempo_ds_out) * 0.1;  // CF100: each tick = 0.1s (validated)
 
         prod["timestamp_device"] = iso8601_utc_now();
 
@@ -1300,6 +1300,9 @@ private:
         uint16_t last_falha_forno_tiempo = 0;
         uint8_t  rc_falha_forno_tiempo = 0;
         uint32_t acc_falha_forno_tiempo_s = 0;
+
+        // Void detection: accumulated seconds where no units entered the furnace
+        uint32_t acc_sin_entrada_s = 0;
     };
 
     static std::mutex mtx_;
@@ -1367,6 +1370,7 @@ public:
         uint32_t acc_metrica_formador_tiempo_ds_out = 0;
         uint32_t acc_falha_forno_cantidad_out = 0;
         uint32_t acc_falha_forno_tiempo_s_out = 0;
+        uint32_t acc_sin_entrada_s_out = 0;
 
         {
             std::lock_guard<std::mutex> lock(mtx_);
@@ -1391,7 +1395,8 @@ public:
             }
             else {
                 // Accumulate deltas Ã¢â‚¬â€ ALL PLC registers have bit-15 flag, use diff_counter for everything
-                st.acc_timer1Hz += diff_counter_safe(timer1Hz, st.last_timer1Hz, st.rc_timer1Hz);
+                uint32_t delta_timer = diff_counter_safe(timer1Hz, st.last_timer1Hz, st.rc_timer1Hz);
+                st.acc_timer1Hz += delta_timer;
 
                 st.acc_numero_grades += diff_counter_safe(numero_grades, st.last_numero_grades, st.rc_numero_grades);
 
@@ -1399,7 +1404,8 @@ public:
 
                 st.acc_parada_mcf_tiempo_s += diff_counter_safe(parada_mcf_tiempo, st.last_parada_mcf_tiempo, st.rc_parada_mcf_tiempo);
 
-                st.acc_metrica_mcf_cantidad += diff_counter_safe(metrica_mcf_cantidad, st.last_metrica_mcf_cantidad, st.rc_metrica_mcf_cantidad);
+                uint32_t delta_mcf = diff_counter_safe(metrica_mcf_cantidad, st.last_metrica_mcf_cantidad, st.rc_metrica_mcf_cantidad);
+                st.acc_metrica_mcf_cantidad += delta_mcf;
 
                 st.acc_metrica_mcf_tiempo_ds += diff_counter_safe(metrica_mcf_tiempo, st.last_metrica_mcf_tiempo, st.rc_metrica_mcf_tiempo);
 
@@ -1410,6 +1416,12 @@ public:
                 st.acc_falha_forno_cantidad += diff_counter_safe(falha_forno_cantidad, st.last_falha_forno_cantidad, st.rc_falha_forno_cantidad);
 
                 st.acc_falha_forno_tiempo_s += diff_counter_safe(falha_forno_tiempo, st.last_falha_forno_tiempo, st.rc_falha_forno_tiempo);
+
+                // Void detection: if no units entered this interval, count elapsed time as void
+                // delta_mcf == 0 means sensor saw zero new pieces since last message
+                if (delta_mcf == 0 && delta_timer > 0) {
+                    st.acc_sin_entrada_s += delta_timer * 2;  // CF102: 2s per tick -> real seconds
+                }
             }
 
             // Copy accumulated values to output
@@ -1423,6 +1435,7 @@ public:
             acc_metrica_formador_tiempo_ds_out = st.acc_metrica_formador_tiempo_ds;
             acc_falha_forno_cantidad_out = st.acc_falha_forno_cantidad;
             acc_falha_forno_tiempo_s_out = st.acc_falha_forno_tiempo_s;
+            acc_sin_entrada_s_out = st.acc_sin_entrada_s;
         }
 
         // === Build output JSON with CORRECT semantic field names ===
@@ -1437,7 +1450,7 @@ public:
         prod["timer1Hz_instantaneo"] = timer1Hz;
         prod["timer1Hz_turno"] = acc_timer1Hz_out * 2;  // CF102: 2s per tick -> real seconds
 
-        // PRODUCTION COUNT - numero_grades (D29007) 
+        // PRODUCTION COUNT - numero_grades (D29007) ÃƒÆ’Ã‚Â°Ãƒâ€¦Ã‚Â¸Ãƒâ€¦Ã‚Â½Ãƒâ€šÃ‚Â¯
         prod["numero_grades_instantaneo"] = numero_grades;
         prod["numero_grades_turno"] = acc_numero_grades_out;
 
@@ -1451,21 +1464,26 @@ public:
         prod["metrica_mcf_instantaneo"] = metrica_mcf_cantidad;
         prod["metrica_mcf_turno"] = acc_metrica_mcf_cantidad_out * 2;  // Validated: PLC counts 50% of physical (bit-15 toggle confirmed)
         prod["metrica_mcf_tiempo_instantaneo_ds"] = metrica_mcf_tiempo;
-        prod["metrica_mcf_tiempo_turno_ds"] = acc_metrica_mcf_tiempo_ds_out * 2;  // CF100: 0.2s per tick -> real ds
-        prod["metrica_mcf_tiempo_turno_s"] = static_cast<double>(acc_metrica_mcf_tiempo_ds_out) * 0.2;  // CF100: each tick = 0.2s
+        prod["metrica_mcf_tiempo_turno_ds"] = acc_metrica_mcf_tiempo_ds_out;  // CF100: 1 tick = 0.1s = 1ds (validated, no ×2)
+        prod["metrica_mcf_tiempo_turno_s"] = static_cast<double>(acc_metrica_mcf_tiempo_ds_out) * 0.1;  // CF100: each tick = 0.1s (validated)
 
         // MÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â©trica Formador - D29008, D29009
         prod["metrica_formador_instantaneo"] = metrica_formador_cantidad;
         prod["metrica_formador_turno"] = acc_metrica_formador_cantidad_out * 2;  // Validated: PLC counts 50% of physical (bit-15 toggle confirmed)
         prod["metrica_formador_tiempo_instantaneo_ds"] = metrica_formador_tiempo;
-        prod["metrica_formador_tiempo_turno_ds"] = acc_metrica_formador_tiempo_ds_out * 2;  // CF100: 0.2s per tick -> real ds
-        prod["metrica_formador_tiempo_turno_s"] = static_cast<double>(acc_metrica_formador_tiempo_ds_out) * 0.2;  // CF100: each tick = 0.2s
+        prod["metrica_formador_tiempo_turno_ds"] = acc_metrica_formador_tiempo_ds_out;  // CF100: 1 tick = 0.1s = 1ds (validated, no ×2)
+        prod["metrica_formador_tiempo_turno_s"] = static_cast<double>(acc_metrica_formador_tiempo_ds_out) * 0.1;  // CF100: each tick = 0.1s (validated)
 
         // Falha Forno - D29013, D29014
         prod["falha_forno_instantaneo"] = falha_forno_cantidad;
         prod["falha_forno_turno"] = acc_falha_forno_cantidad_out;
         prod["falha_forno_tiempo_instantaneo_s"] = falha_forno_tiempo;
         prod["falha_forno_tiempo_turno_s"] = acc_falha_forno_tiempo_s_out * 2;  // CF102: 2s per tick
+
+        // Void time: accumulated seconds where metrica_mcf_cantidad delta was 0
+        // (no new units detected entering the furnace during that message interval)
+        // Resets on shift change along with all other accumulators
+        prod["sin_entrada_turno_s"] = acc_sin_entrada_s_out;
 
         prod["timestamp_device"] = iso8601_utc_now();
 
@@ -1772,7 +1790,7 @@ public:
         // Cycle time accumulator (D25006 - metrica MDF tiempo)
         // OLD: cantidad_total ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ NEW: metrica_mdf_tiempo
         prod["cantidad_total_instantanea"] = metrica_tiempo;
-        prod["cantidad_total_turno"] = acc_metrica_tiempo_out * 2;  // CF100: 0.2s per tick -> real ds
+        prod["cantidad_total_turno"] = acc_metrica_tiempo_out;  // CF100: 1 tick = 0.1s = 1ds (validated, no ×2)
 
         // Paradas cantidad (D25003)
         // OLD: paradas_1 ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ NEW: paradas_cantidad
@@ -1811,14 +1829,14 @@ public:
         prod["cambioSentido_instantaneo"] = sentido_escolha_cantidad;
         prod["cambioSentido_turno"] = acc_sentido_escolha_cantidad_out;
         prod["cambioSentidoTotal_instantaneo"] = sentido_escolha_tiempo;
-        prod["cambioSentidoTotal_turno"] = acc_sentido_escolha_tiempo_out * 2;  // CF100: 0.2s per tick -> real ds
+        prod["cambioSentidoTotal_turno"] = acc_sentido_escolha_tiempo_out;  // CF100: 1 tick = 0.1s = 1ds (validated, no ×2)
 
         // Barreira 1 (D25014, D25015)
         // OLD: cambioBarrera ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ NEW: barreira1
         prod["cambioBarrera_instantaneo"] = barreira1_cantidad;
         prod["cambioBarrera_turno"] = acc_barreira1_cantidad_out * 2;  // Validated: PLC counts 50% of physical
         prod["cambioBarreraTotal_instantaneo"] = barreira1_tiempo;
-        prod["cambioBarreraTotal_turno"] = acc_barreira1_tiempo_out * 2;  // CF100: 0.2s per tick -> real ds
+        prod["cambioBarreraTotal_turno"] = acc_barreira1_tiempo_out;  // CF100: 1 tick = 0.1s = 1ds (validated, no ×2)
 
         // Parada Escolha (D25010, D25011) - NEW FIELDS
         prod["paradaEscolha_instantaneo"] = parada_escolha_cantidad;
