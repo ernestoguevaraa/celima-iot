@@ -15,7 +15,7 @@
  */
 class MqttApp : public virtual mqtt::callback, public virtual mqtt::iaction_listener {
 public:
-    MqttApp(std::string broker_uri, std::string client_id, std::string isa95_prefix);
+    MqttApp(std::string broker_uri, std::string client_id, std::string isa95_prefix, int shift_mode = 3);
     ~MqttApp();
 
     void start();
@@ -35,6 +35,7 @@ private:
     std::string broker_;
     std::string client_id_;
     std::string isa95_prefix_;
+    int shift_mode_;
     mqtt::async_client cli_;
     mqtt::connect_options connopts_;
     std::atomic<bool> running_{false};

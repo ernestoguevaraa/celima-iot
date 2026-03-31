@@ -16,17 +16,26 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, handle_sigint);
     std::signal(SIGTERM, handle_sigint);
 
-    //Default values when no arguments 
+    //Default values when no arguments
     std::string broker = env_or("MQTT_BROKER", "tcp://localhost:1883");
     std::string client = env_or("MQTT_CLIENT_ID", "celima-integration");
     std::string isa95  = env_or("ISA95_PREFIX", "celima/punta_hermosa/planta/linea/");
+
+    int shift_mode = 3;
+    {
+        std::string sm = env_or("SHIFT_MODE", "3");
+        if (sm == "2") shift_mode = 2;
+        else if (sm != "3")
+            std::cerr << "[WARN] SHIFT_MODE inválido '" << sm << "', usando 3.\n";
+    }
+    std::cout << "[CONFIG] Modo de turnos: " << shift_mode << "\n";
 
     if (argc > 1) broker = argv[1];
     if (argc > 2) client = argv[2];
     if (argc > 3) isa95  = argv[3];
 
     try {
-        MqttApp app(broker, client, isa95);
+        MqttApp app(broker, client, isa95, shift_mode);
         app.start();
 
         while (!g_stop) {

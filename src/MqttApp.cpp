@@ -20,10 +20,11 @@ static const std::vector<std::string> TOPICS = {
 };
 static const std::vector<int> QOS = {1,1,1,1};
 
-MqttApp::MqttApp(std::string broker_uri, std::string client_id, std::string isa95_prefix)
+MqttApp::MqttApp(std::string broker_uri, std::string client_id, std::string isa95_prefix, int shift_mode)
     : broker_(std::move(broker_uri))
     , client_id_(std::move(client_id))
     , isa95_prefix_(std::move(isa95_prefix))
+    , shift_mode_(shift_mode)
     , cli_(broker_, client_id_)
 {
     connopts_.set_clean_session(false);
@@ -140,7 +141,7 @@ void MqttApp::handle_celima_data(const std::string& payload) {
     std::unique_ptr<IMessageProcessor> proc = dt ? createProcessor(*dt)
                                                  : createDefaultProcessor();
 
-    Shift sh  = current_shift_localtime();
+    Shift sh  = current_shift_localtime(shift_mode_);
     int shiftNum = static_cast<int>(sh);
 
     if (detect_global_shift_change(shiftNum)) {
