@@ -149,7 +149,7 @@ void MqttApp::handle_celima_data(const std::string& payload) {
         reset_all_processor_states();
     }
 
-    auto pubs = proc->process(j, isa95_prefix_);
+    auto pubs = proc->process(j, isa95_prefix_, shift_mode_);
     for (auto& p : pubs) {
         publish_qos1(p.topic, p.payload);
     }

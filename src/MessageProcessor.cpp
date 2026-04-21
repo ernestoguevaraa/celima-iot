@@ -128,7 +128,7 @@ static Publication make_pub(const std::string &topic, const json &j)
 class DefaultProcessor : public IMessageProcessor
 {
 public:
-    std::vector<Publication> process(const json &msg, const std::string &isa95_prefix) override
+    std::vector<Publication> process(const json &msg, const std::string &isa95_prefix, int shift_mode = 3) override
     {
         json out;
         out["source"] = "celima/data";
@@ -204,8 +204,9 @@ public:
     static void reset_states();
     
     std::vector<Publication> process(const json& msg,
-                                     const std::string& isa95_prefix) override {
-        const int shift_now = static_cast<int>(current_shift_localtime());
+                                     const std::string& isa95_prefix,
+                                     int shift_mode = 3) override {
+        const int shift_now = static_cast<int>(current_shift_localtime(shift_mode));
         const int line_id   = msg.value("lineID", 0);
         
         // Extract accumulated counts from new payload format
@@ -337,9 +338,10 @@ public:
     }
 
     std::vector<Publication> process(const json &msg,
-                                     const std::string &isa95_prefix) override
+                                     const std::string &isa95_prefix,
+                                     int shift_mode = 3) override
     {
-        auto sh = current_shift_localtime();
+        auto sh = current_shift_localtime(shift_mode);
         int shiftNum = (sh == Shift::S1 ? 1 : (sh == Shift::S2 ? 2 : 3));
 
         // Read inputs from decoder
@@ -511,9 +513,10 @@ public:
     }
 
     std::vector<Publication> process(const json &msg,
-                                     const std::string &isa95_prefix) override
+                                     const std::string &isa95_prefix,
+                                     int shift_mode = 3) override
     {
-        auto sh = current_shift_localtime();
+        auto sh = current_shift_localtime(shift_mode);
         int shiftNum = (sh == Shift::S1 ? 1 : (sh == Shift::S2 ? 2 : 3));
 
         int line          = jsonu::get_opt<int>(msg, "lineID").value_or(0);
@@ -703,9 +706,10 @@ public:
     }
 
     std::vector<Publication> process(const json &msg,
-                                     const std::string &isa95_prefix) override
+                                     const std::string &isa95_prefix,
+                                     int shift_mode = 3) override
     {
-        auto sh = current_shift_localtime();
+        auto sh = current_shift_localtime(shift_mode);
         int shiftNum = (sh == Shift::S1 ? 1 : (sh == Shift::S2 ? 2 : 3));
 
         // === Read header fields ===
@@ -832,13 +836,13 @@ public:
 
         // Bancalino Linea 1 - D29007, D29008
         prod["bancalino_l1_instantaneo"] = bancalino_l1_cantidad;
-        prod["bancalino_l1_turno"] = acc_bancalino_l1_cantidad_out;
+        prod["bancalino_l1_turno"] = acc_bancalino_l1_cantidad_out * 2;  // PLC counts 50% of physical (same as salida_horno)
         prod["bancalino_l1_tiempo_instantaneo_ds"] = bancalino_l1_tiempo;
         prod["bancalino_l1_tiempo_turno_ds"] = acc_bancalino_l1_tiempo_ds_out;  // CF100: 1 tick = 0.1s = 1ds (validated, no ×2)
 
         // Bancalino Linea 2 - D29009, D29010
         prod["bancalino_l2_instantaneo"] = bancalino_l2_cantidad;
-        prod["bancalino_l2_turno"] = acc_bancalino_l2_cantidad_out;
+        prod["bancalino_l2_turno"] = acc_bancalino_l2_cantidad_out * 2;  // PLC counts 50% of physical (same as salida_horno)
         prod["bancalino_l2_tiempo_instantaneo_ds"] = bancalino_l2_tiempo;
         prod["bancalino_l2_tiempo_turno_ds"] = acc_bancalino_l2_tiempo_ds_out;  // CF100: 1 tick = 0.1s = 1ds (validated, no ×2)
 
@@ -924,9 +928,10 @@ public:
     }
 
     std::vector<Publication> process(const json &msg,
-                                     const std::string &isa95_prefix) override
+                                     const std::string &isa95_prefix,
+                                     int shift_mode = 3) override
     {
-        auto sh = current_shift_localtime();
+        auto sh = current_shift_localtime(shift_mode);
         int shiftNum = (sh == Shift::S1 ? 1 : (sh == Shift::S2 ? 2 : 3));
 
         // === Read header fields ===
@@ -1103,9 +1108,10 @@ public:
     }
 
     std::vector<Publication> process(const json &msg,
-                                     const std::string &isa95_prefix) override
+                                     const std::string &isa95_prefix,
+                                     int shift_mode = 3) override
     {
-        auto sh = current_shift_localtime();
+        auto sh = current_shift_localtime(shift_mode);
         int shiftNum = (sh == Shift::S1 ? 1 : (sh == Shift::S2 ? 2 : 3));
 
         // === Read header fields ===
@@ -1315,9 +1321,10 @@ public:
     }
 
     std::vector<Publication> process(const json &msg,
-                                     const std::string &isa95_prefix) override
+                                     const std::string &isa95_prefix,
+                                     int shift_mode = 3) override
     {
-        auto sh = current_shift_localtime();
+        auto sh = current_shift_localtime(shift_mode);
         int shiftNum = (sh == Shift::S1 ? 1 : (sh == Shift::S2 ? 2 : 3));
 
         // === Read header fields ===
@@ -1607,9 +1614,10 @@ public:
     }
 
     std::vector<Publication> process(const json &msg,
-                                     const std::string &isa95_prefix) override
+                                     const std::string &isa95_prefix,
+                                     int shift_mode = 3) override
     {
-        auto sh = current_shift_localtime();
+        auto sh = current_shift_localtime(shift_mode);
         int shiftNum = (sh == Shift::S1 ? 1 : (sh == Shift::S2 ? 2 : 3));
 
         // === Read header fields ===

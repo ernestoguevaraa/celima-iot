@@ -24,7 +24,8 @@ class IMessageProcessor {
 public:
     virtual ~IMessageProcessor() = default;
     virtual std::vector<Publication> process(const nlohmann::json& msg,
-                                             const std::string& isa95_prefix) = 0;
+                                             const std::string& isa95_prefix,
+                                             int shift_mode = 3) = 0;
 };
 
 /**
