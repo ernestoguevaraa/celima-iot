@@ -22,53 +22,19 @@ bool detect_global_shift_change(int currentShift)
     return true;
 }
 
-/**
- * Calculate delta for ANY PLC register with bit-15 validity flag handling.
- *
- * CRITICAL: The PLC uses bit 15 of ALL D290xx registers as a validity/toggle
- * flag. The actual value is stored in bits 0-14 (range 0-32767).
- * This applies to BOTH counter fields (*_cantidad) AND timer fields
- * (*_tiempo_ds, *_tiempo_s, timer1Hz).
- *
- * Evidence from production logs (all 3 PLC types Ã¢â‚¬â€ secador, esmalte, horno):
- *   - Raw values toggle bit-15 every few messages on ALL registers
- *   - Example: paradas_tempo_s alternates 54311 (b15=1, low15=21543)
- *              vs 21543 (b15=0, low15=21543) with zero actual change
- *   - Without masking, diff_timer() accumulated +32768 per toggle, inflating
- *     turno values by orders of magnitude (e.g. 163,865s reported vs 25s real)
- *   - timer1Hz does NOT toggle bit-15 on observed devices, but we mask it
- *     uniformly for safety since the 15-bit math is still correct
- *
- * Algorithm:
- *   1. Mask both values to bits 0-14 (& 0x7FFF)
- *   2. Compute delta with 15-bit rollover (at 32768)
- *   3. Reject if delta > max_valid (corruption/reset guard)
- *
- * @param curr Current register value (raw 16-bit with bit-15 flag)
- * @param prev Previous register value (raw 16-bit with bit-15 flag)
- * @param max_valid Maximum valid delta (default 5000, ~83 min at 1Hz)
- * @return Delta to accumulate (0 if suspicious)
- */
+// Firmware note: the previous Arduino firmware read pseudo-I2C words with a
+// 1-bit right shift, halving all values. A workaround masked bit 15 and used
+// 15-bit rollover (32768). With the corrected firmware, counters are full
+// uint16_t — no masking, rollover at 65536.
+// Example: prev=65530, curr=12 → delta=(uint16_t)(12-65530)=18  ✓
 static uint16_t diff_counter(uint16_t curr, uint16_t prev, uint16_t max_valid = 5000) {
-    // CRITICAL: Mask off bit 15 (PLC validity flag) to get actual counter value
-    uint16_t curr_val = curr & 0x7FFF;  // Bits 0-14 only (0-32767)
-    uint16_t prev_val = prev & 0x7FFF;
-    
-    uint16_t delta;
-    if (curr_val >= prev_val) {
-        delta = curr_val - prev_val;
-    } else {
-        // Rollover at 32768 (not 65536, since we're using 15 bits)
-        delta = static_cast<uint16_t>(32768 - prev_val + curr_val);
-    }
-    
-    // Sanity check: delta should be reasonable for ~3 minute message interval
-    // Typical production: ~1-50 events per interval
-    // Use 5000 as conservative upper bound
+    // Full 16-bit unsigned subtraction handles rollover at 65536 automatically.
+    uint16_t delta = static_cast<uint16_t>(curr - prev);
+
     if (delta > max_valid) {
-        return 0;  // Suspicious jump - likely counter reset or corruption
+        return 0;  // Implausible jump — likely counter reset or corruption
     }
-    
+
     return delta;
 }
 
@@ -83,7 +49,7 @@ static uint16_t diff_counter(uint16_t curr, uint16_t prev, uint16_t max_valid = 
 // rejected deltas (delta > max_valid), force-reset prev_ref to curr.
 // This prevents permanent lockout where a single corrupted reading poisons
 // prev_ref into a range that makes ALL subsequent valid readings appear as
-// huge deltas (via 15-bit wraparound), freezing the accumulator forever.
+// huge deltas (via 16-bit wraparound), freezing the accumulator forever.
 static uint16_t diff_counter_safe(uint16_t curr, uint16_t &prev_ref,
                                    uint8_t &reject_count,
                                    uint16_t max_valid = 5000,
@@ -95,15 +61,9 @@ static uint16_t diff_counter_safe(uint16_t curr, uint16_t &prev_ref,
         return d;
     }
     // d == 0: either genuinely unchanged, or rejected by max_valid check
-    // Distinguish: compute raw delta to see if it was a rejection
-    uint16_t curr_val = curr & 0x7FFF;
-    uint16_t prev_val = prev_ref & 0x7FFF;
-    uint16_t raw_delta;
-    if (curr_val >= prev_val) {
-        raw_delta = curr_val - prev_val;
-    } else {
-        raw_delta = static_cast<uint16_t>(32768 - prev_val + curr_val);
-    }
+    // Distinguish: compute raw delta to see if it was a rejection.
+    // Same unsigned-wrap arithmetic as diff_counter — no bit masking needed.
+    uint16_t raw_delta = static_cast<uint16_t>(curr - prev_ref);
     if (raw_delta > max_valid) {
         // This was a rejection, not a genuine zero
         reject_count++;
@@ -292,7 +252,7 @@ void CalidadProcessor::reset_states() {
 // PrensaHidraulica1Processor - Fixed with correct counter handling
 // ============================================================================
 /**
- * PLC Register Mapping (from salida_prensa_1.pdf SecciÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â³n12):
+ * PLC Register Mapping (from salida_prensa_1.pdf Sección12):
  * 
  * Input fields (from decoder, TODO: update decoder field names):
  * - "cantidadProductos" = D29005 = PISADAS (press stroke count, NOT products!)
@@ -301,8 +261,8 @@ void CalidadProcessor::reset_states() {
  * - "tiempoParadas_s" = D29004 = Stop duration (SECONDS)
  * - "alarms" = D29002 = Status Lento (status bits)
  * 
- * The PLC calculates: Products = PISADAS ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â Fila ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â Pac
- * We apply: Products = PISADAS ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â factor_pisadas (per line)
+ * The PLC calculates: Products = PISADAS × Fila × Pac
+ * We apply: Products = PISADAS × factor_pisadas (per line)
  */
 class PrensaHidraulica1Processor : public IMessageProcessor
 {
@@ -346,7 +306,7 @@ public:
 
         // Read inputs from decoder
         // NOTE: Field names will change when decoder is updated
-        // Current: cantidadProductos ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ Should be: pisadas
+        // Current: cantidadProductos → Should be: pisadas
         int line          = jsonu::get_opt<int>(msg, "lineID").value_or(0);
         int alarms        = jsonu::get_opt<int>(msg, "alarms").value_or(0);
         
@@ -406,7 +366,7 @@ public:
 
                 // D29004 - Stop time counter (seconds)
                 uint16_t delta_tiempo_paradas = diff_counter_safe(paradas_tiempo, st.last_paradas_tiempo, st.rc_paradas_tiempo);
-                st.acc_paradas_tiempo_s += delta_tiempo_paradas * 2;  // CF102 P_1s: period=2s per tick
+                st.acc_paradas_tiempo_s += delta_tiempo_paradas;  // firmware Arduino ya corrige alineamiento de bit
             }
 
             // Copy out accumulated values
@@ -562,7 +522,7 @@ public:
                 st.acc_paradas_count += delta_paradas;
 
                 uint16_t delta_tiempo_paradas = diff_counter_safe(paradas_tiempo, st.last_paradas_tiempo, st.rc_paradas_tiempo);
-                st.acc_paradas_tiempo_s += delta_tiempo_paradas * 2;  // CF102 P_1s: period=2s per tick
+                st.acc_paradas_tiempo_s += delta_tiempo_paradas;  // firmware Arduino ya corrige alineamiento de bit
             }
 
             acc_pisadas_out = st.acc_pisadas;
@@ -629,7 +589,7 @@ std::unordered_map<int, PrensaHidraulica2Processor::PH2State>
  * 
  * Changes from original:
  * 1. Reads NEW semantic field names from LoRaWAN decoder v2
- * 2. ALL registers use bit-15 flag Ã¢â‚¬â€ diff_counter for everything
+ * 2. ALL registers use bit-15 flag — diff_counter for everything
  * 3. Tracks ALL fields from PLC (not just 2)
  * 4. Output JSON uses correct semantic names
  * 
@@ -778,7 +738,7 @@ public:
                 st.last_bancalino_l2_tiempo = bancalino_l2_tiempo;
             }
             else {
-                // Accumulate deltas Ã¢â‚¬â€ ALL PLC registers have bit-15 flag, use diff_counter for everything
+                // Accumulate deltas — ALL PLC registers have bit-15 flag, use diff_counter for everything
                 st.acc_timer1Hz += diff_counter_safe(timer1Hz, st.last_timer1Hz, st.rc_timer1Hz);
 
                 st.acc_paradas_cantidad += diff_counter_safe(paradas_cantidad, st.last_paradas_cantidad, st.rc_paradas_cantidad);
@@ -820,13 +780,13 @@ public:
 
         // Timer/validation
         prod["timer1Hz_instantaneo"] = timer1Hz;
-        prod["timer1Hz_turno"] = acc_timer1Hz_out * 2;  // CF102: 2s per tick -> real seconds
+        prod["timer1Hz_turno"] = acc_timer1Hz_out;  // firmware Arduino ya corrige alineamiento de bit
 
         // Paradas (stops) - D29003, D29004
         prod["paradas_instantaneo"] = paradas_cantidad;
         prod["paradas_turno"] = acc_paradas_cantidad_out;
         prod["paradas_tiempo_instantaneo_s"] = paradas_tempo;
-        prod["paradas_tiempo_turno_s"] = acc_paradas_tempo_s_out * 2;  // CF102: 2s per tick
+        prod["paradas_tiempo_turno_s"] = acc_paradas_tempo_s_out;  // firmware Arduino ya corrige alineamiento de bit
 
         // Ingreso Elevador - D29005, D29006
         prod["ingreso_elevador_instantaneo"] = ingreso_elevador_cantidad;
@@ -836,13 +796,13 @@ public:
 
         // Bancalino Linea 1 - D29007, D29008
         prod["bancalino_l1_instantaneo"] = bancalino_l1_cantidad;
-        prod["bancalino_l1_turno"] = acc_bancalino_l1_cantidad_out * 2;  // PLC counts 50% of physical (same as salida_horno)
+        prod["bancalino_l1_turno"] = acc_bancalino_l1_cantidad_out;  // firmware Arduino ya corrige alineamiento de bit
         prod["bancalino_l1_tiempo_instantaneo_ds"] = bancalino_l1_tiempo;
         prod["bancalino_l1_tiempo_turno_ds"] = acc_bancalino_l1_tiempo_ds_out;  // CF100: 1 tick = 0.1s = 1ds (validated, no ×2)
 
         // Bancalino Linea 2 - D29009, D29010
         prod["bancalino_l2_instantaneo"] = bancalino_l2_cantidad;
-        prod["bancalino_l2_turno"] = acc_bancalino_l2_cantidad_out * 2;  // PLC counts 50% of physical (same as salida_horno)
+        prod["bancalino_l2_turno"] = acc_bancalino_l2_cantidad_out;  // firmware Arduino ya corrige alineamiento de bit
         prod["bancalino_l2_tiempo_instantaneo_ds"] = bancalino_l2_tiempo;
         prod["bancalino_l2_tiempo_turno_ds"] = acc_bancalino_l2_tiempo_ds_out;  // CF100: 1 tick = 0.1s = 1ds (validated, no ×2)
 
@@ -871,7 +831,7 @@ std::unordered_map<int, EntradaSecadorProcessor::State> EntradaSecadorProcessor:
  * 
  * Changes from original:
  * 1. Reads NEW semantic field names from LoRaWAN decoder v2
- * 2. ALL registers use bit-15 flag Ã¢â‚¬â€ diff_counter for everything
+ * 2. ALL registers use bit-15 flag — diff_counter for everything
  * 3. Uses diff_counter() for ALL fields (bit-15 mask + 15-bit rollover)
  * 4. Output JSON uses correct semantic names
  * 
@@ -879,7 +839,7 @@ std::unordered_map<int, EntradaSecadorProcessor::State> EntradaSecadorProcessor:
  *   checksum, timer1Hz, alarms, parada_mds_cantidad, parada_mds_tiempo_s,
  *   metrica_mds_cantidad, metrica_mds_tiempo_ds
  * 
- * PLC Register mapping (SecciÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â³n6):
+ * PLC Register mapping (Sección6):
  *   D29003 = parada_mds_cantidad (stop events)
  *   D29004 = parada_mds_tiempo_s (stop time in seconds)
  *   D29005 = metrica_mds_cantidad (MDS cycles - NOT products!)
@@ -980,7 +940,7 @@ public:
                 st.last_metrica_mds_tiempo = metrica_mds_tiempo;
             }
             else {
-                // Accumulate deltas Ã¢â‚¬â€ ALL PLC registers have bit-15 flag, use diff_counter for everything
+                // Accumulate deltas — ALL PLC registers have bit-15 flag, use diff_counter for everything
                 st.acc_timer1Hz += diff_counter_safe(timer1Hz, st.last_timer1Hz, st.rc_timer1Hz);
 
                 st.acc_parada_mds_cantidad += diff_counter_safe(parada_mds_cantidad, st.last_parada_mds_cantidad, st.rc_parada_mds_cantidad);
@@ -1010,18 +970,18 @@ public:
 
         // Timer/validation
         prod["timer1Hz_instantaneo"] = timer1Hz;
-        prod["timer1Hz_turno"] = acc_timer1Hz_out * 2;  // CF102: 2s per tick -> real seconds
+        prod["timer1Hz_turno"] = acc_timer1Hz_out;  // firmware Arduino ya corrige alineamiento de bit
 
         // Parada MDS (stops) - D29003, D29004
         prod["parada_mds_instantaneo"] = parada_mds_cantidad;
         prod["parada_mds_turno"] = acc_parada_mds_cantidad_out;
         prod["parada_mds_tiempo_instantaneo_s"] = parada_mds_tiempo;
-        prod["parada_mds_tiempo_turno_s"] = acc_parada_mds_tiempo_s_out * 2;  // CF102: 2s per tick
+        prod["parada_mds_tiempo_turno_s"] = acc_parada_mds_tiempo_s_out;  // firmware Arduino ya corrige alineamiento de bit
 
-        // MÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â©trica MDS (cycles) - D29005, D29006
+        // Métrica MDS (cycles) - D29005, D29006
         // NOTE: These are MDS machine CYCLES, NOT product count!
         prod["metrica_mds_instantaneo"] = metrica_mds_cantidad;
-        prod["metrica_mds_turno"] = acc_metrica_mds_cantidad_out * 2;  // Validated: PLC counts 50% of physical (Lines 1&2 confirmed)
+        prod["metrica_mds_turno"] = acc_metrica_mds_cantidad_out;  // firmware Arduino ya corrige alineamiento de bit
         prod["metrica_mds_tiempo_instantaneo_ds"] = metrica_mds_tiempo;
         prod["metrica_mds_tiempo_turno_ds"] = acc_metrica_mds_tiempo_ds_out;  // CF100: 1 tick = 0.1s = 1ds (validated, no ×2)
         
@@ -1051,7 +1011,7 @@ std::unordered_map<int, SalidaSecadorProcessor::State> SalidaSecadorProcessor::s
  * 
  * Changes from original:
  * 1. Reads NEW semantic field names from LoRaWAN decoder v2
- * 2. ALL registers use bit-15 flag Ã¢â‚¬â€ diff_counter for everything
+ * 2. ALL registers use bit-15 flag — diff_counter for everything
  * 3. Uses diff_counter() for ALL fields (bit-15 mask + 15-bit rollover)
  * 4. Output JSON uses correct semantic names
  * 
@@ -1059,7 +1019,7 @@ std::unordered_map<int, SalidaSecadorProcessor::State> SalidaSecadorProcessor::s
  *   checksum, timer1Hz, alarms, parada_esm_cantidad, parada_esm_tiempo_s,
  *   metrica_esm_cantidad, metrica_esm_tiempo_ds
  * 
- * PLC Register mapping (SecciÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â³n1):
+ * PLC Register mapping (Sección1):
  *   D29003 = parada_esm_cantidad (stop events)
  *   D29004 = parada_esm_tiempo_s (stop time in seconds)
  *   D29005 = metrica_esm_cantidad (ESM cycles - NOT products!)
@@ -1160,7 +1120,7 @@ public:
                 st.last_metrica_esm_tiempo = metrica_esm_tiempo;
             }
             else {
-                // Accumulate deltas Ã¢â‚¬â€ ALL PLC registers have bit-15 flag, use diff_counter for everything
+                // Accumulate deltas — ALL PLC registers have bit-15 flag, use diff_counter for everything
                 st.acc_timer1Hz += diff_counter_safe(timer1Hz, st.last_timer1Hz, st.rc_timer1Hz);
 
                 st.acc_parada_esm_cantidad += diff_counter_safe(parada_esm_cantidad, st.last_parada_esm_cantidad, st.rc_parada_esm_cantidad);
@@ -1188,25 +1148,35 @@ public:
         prod["lineID"] = line;
         prod["checksum"] = checksum;
 
-        // Timer/validation
+        // Timer/validation (D29001)
         prod["timer1Hz_instantaneo"] = timer1Hz;
-        prod["timer1Hz_turno"] = acc_timer1Hz_out * 2;  // CF102: 2s per tick -> real seconds
+        prod["timer1Hz_turno"] = acc_timer1Hz_out;  // firmware Arduino ya corrige alineamiento de bit
 
         // Parada ESM (stops) - D29003, D29004
         prod["parada_esm_instantaneo"] = parada_esm_cantidad;
         prod["parada_esm_turno"] = acc_parada_esm_cantidad_out;
         prod["parada_esm_tiempo_instantaneo_s"] = parada_esm_tiempo;
-        prod["parada_esm_tiempo_turno_s"] = acc_parada_esm_tiempo_s_out * 2;  // CF102: 2s per tick
+        prod["parada_esm_tiempo_turno_s"] = acc_parada_esm_tiempo_s_out;  // firmware Arduino ya corrige alineamiento de bit
 
-        // MÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â©trica ESM (cycles) - D29005, D29006
+        // Métrica ESM (cycles) - D29005, D29006
         // NOTE: These are ESM machine CYCLES, NOT product count!
         prod["metrica_esm_instantaneo"] = metrica_esm_cantidad;
-        prod["metrica_esm_turno"] = acc_metrica_esm_cantidad_out * 2;  // Validated: PLC counts 50% of physical (Lines 1&2 confirmed)
+        prod["metrica_esm_turno"] = acc_metrica_esm_cantidad_out;  // firmware Arduino ya corrige alineamiento de bit
         prod["metrica_esm_tiempo_instantaneo_ds"] = metrica_esm_tiempo;
         prod["metrica_esm_tiempo_turno_ds"] = acc_metrica_esm_tiempo_ds_out;  // CF100: 1 tick = 0.1s = 1ds (validated, no ×2)
-        
+
         // Convert deciseconds to seconds for convenience
         prod["metrica_esm_tiempo_turno_s"] = static_cast<double>(acc_metrica_esm_tiempo_ds_out) * 0.1;  // CF100: each tick = 0.1s (validated)
+
+        // Diagnostic log: confirm delta semantics after Arduino firmware fix
+        std::cerr << "[ESM diag] line=" << line
+                  << " metrica_esm_raw=" << metrica_esm_cantidad
+                  << " acc_metrica_turno=" << acc_metrica_esm_cantidad_out
+                  << " timer1Hz_raw=" << timer1Hz
+                  << " acc_timer1Hz_turno=" << acc_timer1Hz_out
+                  << " parada_esm_raw=" << parada_esm_cantidad
+                  << " acc_parada_turno=" << acc_parada_esm_cantidad_out
+                  << "\n";
 
         prod["timestamp_device"] = iso8601_utc_now();
 
@@ -1238,7 +1208,7 @@ std::unordered_map<int, EsmalteProcessor::State> EsmalteProcessor::states_;
  *   metrica_formador_cantidad, metrica_formador_tiempo_ds,
  *   falha_forno_cantidad, falha_forno_tiempo_s
  * 
- * PLC Register mapping (SecciÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â³n14):
+ * PLC Register mapping (Sección14):
  *   D29003 = parada_mcf_cantidad (MCF stop count)
  *   D29004 = parada_mcf_tiempo_s (MCF stop time, seconds)
  *   D29005 = metrica_mcf_cantidad (MCF cycle count)
@@ -1266,7 +1236,7 @@ private:
         uint8_t  rc_timer1Hz = 0;
         uint32_t acc_timer1Hz = 0;
 
-        // Production: NÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Âºmero de Grades (D29007)
+        // Production: Número de Grades (D29007)
         uint16_t last_numero_grades = 0;
         uint8_t  rc_numero_grades = 0;
         uint32_t acc_numero_grades = 0;
@@ -1280,7 +1250,7 @@ private:
         uint8_t  rc_parada_mcf_tiempo = 0;
         uint32_t acc_parada_mcf_tiempo_s = 0;
 
-        // MÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â©trica MCF - D29005, D29006
+        // Métrica MCF - D29005, D29006
         uint16_t last_metrica_mcf_cantidad = 0;
         uint8_t  rc_metrica_mcf_cantidad = 0;
         uint32_t acc_metrica_mcf_cantidad = 0;
@@ -1289,7 +1259,7 @@ private:
         uint8_t  rc_metrica_mcf_tiempo = 0;
         uint32_t acc_metrica_mcf_tiempo_ds = 0;
 
-        // MÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â©trica Formador - D29008, D29009
+        // Métrica Formador - D29008, D29009
         uint16_t last_metrica_formador_cantidad = 0;
         uint8_t  rc_metrica_formador_cantidad = 0;
         uint32_t acc_metrica_formador_cantidad = 0;
@@ -1348,13 +1318,13 @@ public:
         uint16_t parada_mcf_tiempo = static_cast<uint16_t>(
             jsonu::get_opt<int>(msg, "parada_mcf_tiempo_s").value_or(0));
 
-        // MÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â©trica MCF - D29005, D29006
+        // Métrica MCF - D29005, D29006
         uint16_t metrica_mcf_cantidad = static_cast<uint16_t>(
             jsonu::get_opt<int>(msg, "metrica_mcf_cantidad").value_or(0));
         uint16_t metrica_mcf_tiempo = static_cast<uint16_t>(
             jsonu::get_opt<int>(msg, "metrica_mcf_tiempo_ds").value_or(0));
 
-        // MÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â©trica Formador - D29008, D29009
+        // Métrica Formador - D29008, D29009
         uint16_t metrica_formador_cantidad = static_cast<uint16_t>(
             jsonu::get_opt<int>(msg, "metrica_formador_cantidad").value_or(0));
         uint16_t metrica_formador_tiempo = static_cast<uint16_t>(
@@ -1401,7 +1371,7 @@ public:
                 st.last_falha_forno_tiempo = falha_forno_tiempo;
             }
             else {
-                // Accumulate deltas Ã¢â‚¬â€ ALL PLC registers have bit-15 flag, use diff_counter for everything
+                // Accumulate deltas — ALL PLC registers have bit-15 flag, use diff_counter for everything
                 uint32_t delta_timer = diff_counter_safe(timer1Hz, st.last_timer1Hz, st.rc_timer1Hz);
                 st.acc_timer1Hz += delta_timer;
 
@@ -1427,7 +1397,7 @@ public:
                 // Void detection: if no units entered this interval, count elapsed time as void
                 // delta_mcf == 0 means sensor saw zero new pieces since last message
                 if (delta_mcf == 0 && delta_timer > 0) {
-                    st.acc_sin_entrada_s += delta_timer * 2;  // CF102: 2s per tick -> real seconds
+                    st.acc_sin_entrada_s += delta_timer;  // firmware Arduino ya corrige alineamiento de bit
                 }
             }
 
@@ -1455,9 +1425,9 @@ public:
 
         // Timer/validation
         prod["timer1Hz_instantaneo"] = timer1Hz;
-        prod["timer1Hz_turno"] = acc_timer1Hz_out * 2;  // CF102: 2s per tick -> real seconds
+        prod["timer1Hz_turno"] = acc_timer1Hz_out;  // firmware Arduino ya corrige alineamiento de bit
 
-        // PRODUCTION COUNT - numero_grades (D29007) ÃƒÆ’Ã‚Â°Ãƒâ€¦Ã‚Â¸Ãƒâ€¦Ã‚Â½Ãƒâ€šÃ‚Â¯
+        // PRODUCTION COUNT - numero_grades (D29007)
         prod["numero_grades_instantaneo"] = numero_grades;
         prod["numero_grades_turno"] = acc_numero_grades_out;
 
@@ -1465,18 +1435,18 @@ public:
         prod["parada_mcf_instantaneo"] = parada_mcf_cantidad;
         prod["parada_mcf_turno"] = acc_parada_mcf_cantidad_out;
         prod["parada_mcf_tiempo_instantaneo_s"] = parada_mcf_tiempo;
-        prod["parada_mcf_tiempo_turno_s"] = acc_parada_mcf_tiempo_s_out * 2;  // CF102: 2s per tick
+        prod["parada_mcf_tiempo_turno_s"] = acc_parada_mcf_tiempo_s_out;  // firmware Arduino ya corrige alineamiento de bit
 
-        // MÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â©trica MCF - D29005, D29006
+        // Métrica MCF - D29005, D29006
         prod["metrica_mcf_instantaneo"] = metrica_mcf_cantidad;
-        prod["metrica_mcf_turno"] = acc_metrica_mcf_cantidad_out * 2;  // Validated: PLC counts 50% of physical (bit-15 toggle confirmed)
+        prod["metrica_mcf_turno"] = acc_metrica_mcf_cantidad_out;  // firmware Arduino ya corrige alineamiento de bit
         prod["metrica_mcf_tiempo_instantaneo_ds"] = metrica_mcf_tiempo;
         prod["metrica_mcf_tiempo_turno_ds"] = acc_metrica_mcf_tiempo_ds_out;  // CF100: 1 tick = 0.1s = 1ds (validated, no ×2)
         prod["metrica_mcf_tiempo_turno_s"] = static_cast<double>(acc_metrica_mcf_tiempo_ds_out) * 0.1;  // CF100: each tick = 0.1s (validated)
 
-        // MÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â©trica Formador - D29008, D29009
+        // Métrica Formador - D29008, D29009
         prod["metrica_formador_instantaneo"] = metrica_formador_cantidad;
-        prod["metrica_formador_turno"] = acc_metrica_formador_cantidad_out * 2;  // Validated: PLC counts 50% of physical (bit-15 toggle confirmed)
+        prod["metrica_formador_turno"] = acc_metrica_formador_cantidad_out;  // firmware Arduino ya corrige alineamiento de bit
         prod["metrica_formador_tiempo_instantaneo_ds"] = metrica_formador_tiempo;
         prod["metrica_formador_tiempo_turno_ds"] = acc_metrica_formador_tiempo_ds_out;  // CF100: 1 tick = 0.1s = 1ds (validated, no ×2)
         prod["metrica_formador_tiempo_turno_s"] = static_cast<double>(acc_metrica_formador_tiempo_ds_out) * 0.1;  // CF100: each tick = 0.1s (validated)
@@ -1485,7 +1455,7 @@ public:
         prod["falha_forno_instantaneo"] = falha_forno_cantidad;
         prod["falha_forno_turno"] = acc_falha_forno_cantidad_out;
         prod["falha_forno_tiempo_instantaneo_s"] = falha_forno_tiempo;
-        prod["falha_forno_tiempo_turno_s"] = acc_falha_forno_tiempo_s_out * 2;  // CF102: 2s per tick
+        prod["falha_forno_tiempo_turno_s"] = acc_falha_forno_tiempo_s_out;  // firmware Arduino ya corrige alineamiento de bit
 
         // Void time: accumulated seconds where metrica_mcf_cantidad delta was 0
         // (no new units detected entering the furnace during that message interval)
@@ -1515,7 +1485,7 @@ std::unordered_map<int, EntradaHornoProcessor::State> EntradaHornoProcessor::sta
  * 
  * Changes from original:
  * 1. Reads NEW semantic field names from LoRaWAN decoder
- * 2. ALL registers use bit-15 flag Ã¢â‚¬â€ diff_counter for everything
+ * 2. ALL registers use bit-15 flag — diff_counter for everything
  * 3. Outputs OLD field names in JSON for backward compatibility
  * 
  * Input fields (from decoder v3):
@@ -1722,7 +1692,7 @@ public:
                 st.last_barreira1_tiempo = barreira1_tiempo;
             }
             else {
-                // Accumulate deltas Ã¢â‚¬â€ ALL PLC registers have bit-15 flag, use diff_counter for everything
+                // Accumulate deltas — ALL PLC registers have bit-15 flag, use diff_counter for everything
                 uint16_t delta_timer = diff_counter_safe(timer1Hz, st.last_timer1Hz, st.rc_timer1Hz);
                 st.acc_timer1Hz += delta_timer;
                 st.acc_tiempo_operacion_s += delta_timer;
@@ -1788,61 +1758,61 @@ public:
 
         // Timer/operation time
         prod["timer1Hz_instantaneo"] = timer1Hz;
-        prod["tiempo_operacion_turno_s"] = acc_tiempo_operacion_s_out * 2;  // CF102: 2s per tick -> real seconds
+        prod["tiempo_operacion_turno_s"] = acc_tiempo_operacion_s_out;  // firmware Arduino ya corrige alineamiento de bit
 
         // Main production counter (D25005 - metrica MDF ciclos)
-        // OLD: cantidad ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ NEW: metrica_mdf_ciclos
+        // OLD: cantidad → NEW: metrica_mdf_ciclos
         prod["cantidad_instantanea"] = metrica_ciclos;
-        prod["cantidad_produccion_turno"] = acc_metrica_ciclos_out * 2;  // Validated: PLC counts 50% of physical
+        prod["cantidad_produccion_turno"] = acc_metrica_ciclos_out;  // firmware Arduino ya corrige alineamiento de bit
 
         // Cycle time accumulator (D25006 - metrica MDF tiempo)
-        // OLD: cantidad_total ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ NEW: metrica_mdf_tiempo
+        // OLD: cantidad_total → NEW: metrica_mdf_tiempo
         prod["cantidad_total_instantanea"] = metrica_tiempo;
         prod["cantidad_total_turno"] = acc_metrica_tiempo_out;  // CF100: 1 tick = 0.1s = 1ds (validated, no ×2)
 
         // Paradas cantidad (D25003)
-        // OLD: paradas_1 ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ NEW: paradas_cantidad
+        // OLD: paradas_1 → NEW: paradas_cantidad
         prod["paradas_1_instantaneo"] = paradas_cantidad;
         prod["paradas_1_turno"] = acc_paradas_cantidad_out;
 
         // Paradas tempo (D25004)
-        // OLD: paradas_2 ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ NEW: paradas_tempo
+        // OLD: paradas_2 → NEW: paradas_tempo
         prod["paradas_2_instantaneo"] = paradas_tempo;
-        prod["paradas_2_turno"] = acc_paradas_tempo_out * 2;  // CF102: 2s per tick
+        prod["paradas_2_turno"] = acc_paradas_tempo_out;  // firmware Arduino ya corrige alineamiento de bit
 
         // Bancalinos Q:3.01 (D25007)
-        // OLD: bancalinos0 ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ NEW: bancalinos_q301
+        // OLD: bancalinos0 → NEW: bancalinos_q301
         prod["bancalinos0_instantaneo"] = bancalinos_q301;
-        prod["bancalinos0_turno"] = acc_bancalinos_q301_out * 2;  // Validated: PLC counts 50% of physical
+        prod["bancalinos0_turno"] = acc_bancalinos_q301_out;  // firmware Arduino ya corrige alineamiento de bit
 
         // Bancalinos Q:3.00 (D25008)
-        // OLD: bancalinos1 ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ NEW: bancalinos_q300
+        // OLD: bancalinos1 → NEW: bancalinos_q300
         prod["bancalinos1_instantaneo"] = bancalinos_q300;
-        prod["bancalinos1_turno"] = acc_bancalinos_q300_out * 2;  // Validated: PLC counts 50% of physical (Line 1 confirmed)
+        prod["bancalinos1_turno"] = acc_bancalinos_q300_out;  // firmware Arduino ya corrige alineamiento de bit
 
         // Bancalinos Comb1: Q:3.01 AND I:1.09 (D25009)
         prod["bancalinosComb1_instantaneo"] = bancalinos_comb1;
-        prod["bancalinosComb1_turno"] = acc_bancalinos_comb1_out * 2;  // Validated: PLC counts 50% of physical
+        prod["bancalinosComb1_turno"] = acc_bancalinos_comb1_out;  // firmware Arduino ya corrige alineamiento de bit
 
         // Bancalinos Comb2: Q:3.01 AND Q:2.10 (D25016) - NOW INCLUDED!
         prod["bancalinosComb2_instantaneo"] = bancalinos_comb2;
-        prod["bancalinosComb2_turno"] = acc_bancalinos_comb2_out * 2;  // Validated: PLC counts 50% of physical
+        prod["bancalinosComb2_turno"] = acc_bancalinos_comb2_out;  // firmware Arduino ya corrige alineamiento de bit
 
         // Bancalinos Total: Q:3.00 AND Q:2.10 (D25017) - NOW INCLUDED!
         prod["bancalinosTotal_instantaneo"] = bancalinos_total;
-        prod["bancalinosTotal_turno"] = acc_bancalinos_total_out * 2;  // Validated: PLC counts 50% of physical
+        prod["bancalinosTotal_turno"] = acc_bancalinos_total_out;  // firmware Arduino ya corrige alineamiento de bit
 
         // Sentido Escolha (D25012, D25013)
-        // OLD: cambioSentido ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ NEW: sentido_escolha
+        // OLD: cambioSentido → NEW: sentido_escolha
         prod["cambioSentido_instantaneo"] = sentido_escolha_cantidad;
         prod["cambioSentido_turno"] = acc_sentido_escolha_cantidad_out;
         prod["cambioSentidoTotal_instantaneo"] = sentido_escolha_tiempo;
         prod["cambioSentidoTotal_turno"] = acc_sentido_escolha_tiempo_out;  // CF100: 1 tick = 0.1s = 1ds (validated, no ×2)
 
         // Barreira 1 (D25014, D25015)
-        // OLD: cambioBarrera ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ NEW: barreira1
+        // OLD: cambioBarrera → NEW: barreira1
         prod["cambioBarrera_instantaneo"] = barreira1_cantidad;
-        prod["cambioBarrera_turno"] = acc_barreira1_cantidad_out * 2;  // Validated: PLC counts 50% of physical
+        prod["cambioBarrera_turno"] = acc_barreira1_cantidad_out;  // firmware Arduino ya corrige alineamiento de bit
         prod["cambioBarreraTotal_instantaneo"] = barreira1_tiempo;
         prod["cambioBarreraTotal_turno"] = acc_barreira1_tiempo_out;  // CF100: 1 tick = 0.1s = 1ds (validated, no ×2)
 
@@ -1850,7 +1820,7 @@ public:
         prod["paradaEscolha_instantaneo"] = parada_escolha_cantidad;
         prod["paradaEscolha_turno"] = acc_parada_escolha_cantidad_out;
         prod["paradaEscolhaTempo_instantaneo"] = parada_escolha_tempo;
-        prod["paradaEscolhaTempo_turno"] = acc_parada_escolha_tempo_out * 2;  // CF102: 2s per tick
+        prod["paradaEscolhaTempo_turno"] = acc_parada_escolha_tempo_out;  // firmware Arduino ya corrige alineamiento de bit
 
         prod["timestamp_device"] = iso8601_utc_now();
 
