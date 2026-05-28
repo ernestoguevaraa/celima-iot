@@ -749,11 +749,17 @@ public:
 
                 st.acc_ingreso_elevador_tiempo_ds += diff_counter_safe(ingreso_elevador_tiempo, st.last_ingreso_elevador_tiempo, st.rc_ingreso_elevador_tiempo);
 
-                st.acc_bancalino_l1_cantidad += diff_counter_safe(bancalino_l1_cantidad, st.last_bancalino_l1_cantidad, st.rc_bancalino_l1_cantidad);
+                {
+                    uint16_t d = diff_counter_safe(bancalino_l1_cantidad, st.last_bancalino_l1_cantidad, st.rc_bancalino_l1_cantidad);
+                    st.acc_bancalino_l1_cantidad += (line == 2) ? d / 4 : d;
+                }
 
                 st.acc_bancalino_l1_tiempo_ds += diff_counter_safe(bancalino_l1_tiempo, st.last_bancalino_l1_tiempo, st.rc_bancalino_l1_tiempo);
 
-                st.acc_bancalino_l2_cantidad += diff_counter_safe(bancalino_l2_cantidad, st.last_bancalino_l2_cantidad, st.rc_bancalino_l2_cantidad);
+                {
+                    uint16_t d = diff_counter_safe(bancalino_l2_cantidad, st.last_bancalino_l2_cantidad, st.rc_bancalino_l2_cantidad);
+                    st.acc_bancalino_l2_cantidad += (line == 2) ? d / 4 : d;
+                }
 
                 st.acc_bancalino_l2_tiempo_ds += diff_counter_safe(bancalino_l2_tiempo, st.last_bancalino_l2_tiempo, st.rc_bancalino_l2_tiempo);
             }
