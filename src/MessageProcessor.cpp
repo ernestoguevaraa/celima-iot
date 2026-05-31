@@ -155,6 +155,14 @@ class CalidadProcessor final : public IMessageProcessor {
         uint64_t acc_discarded = 0;
         int shift = -1;
         bool initialized = false;
+        // Duplicate-frame detection: Arduino retries after 30 s when ACK is lost.
+        // Store the last accepted payload values + timestamp; reject identical
+        // payloads arriving within DEDUP_WINDOW_SECS of the previous acceptance.
+        uint64_t    last_delta_q1     = 0;
+        uint64_t    last_delta_q2     = 0;
+        uint64_t    last_delta_q6     = 0;
+        uint64_t    last_delta_broken = 0;
+        std::time_t last_accepted_time = 0;   // 0 = never accepted
     };
     
     static std::mutex mtx_;
@@ -202,14 +210,35 @@ public:
         {
             std::lock_guard<std::mutex> lock(mtx_);
             auto& st = states_[line_id];
-            
+
             // First time or shift changed
             if (!st.initialized || st.shift != shift_now) {
                 st = LineState();      // reset for this line
                 st.initialized = true;
                 st.shift = shift_now;
             }
-            
+
+            // Duplicate-frame rejection: Arduino retries the same LoRa frame after
+            // ~30 s when the gateway ACK is lost. Identical payload within 120 s of
+            // the last accepted frame is treated as a retry and silently discarded.
+            constexpr int DEDUP_WINDOW_SECS = 120;
+            const auto now = std::time(nullptr);
+            if (st.last_accepted_time != 0 &&
+                delta_q1     == st.last_delta_q1 &&
+                delta_q2     == st.last_delta_q2 &&
+                delta_q6     == st.last_delta_q6 &&
+                delta_broken == st.last_delta_broken &&
+                (now - st.last_accepted_time) < DEDUP_WINDOW_SECS) {
+                std::cout << "[Calidad] Trama repetida descartada (lineID=" << line_id
+                          << " dt=" << (now - st.last_accepted_time) << "s)\n";
+                return {};
+            }
+            st.last_delta_q1     = delta_q1;
+            st.last_delta_q2     = delta_q2;
+            st.last_delta_q6     = delta_q6;
+            st.last_delta_broken = delta_broken;
+            st.last_accepted_time = now;
+
             // Add the deltas (accumulated counts from this message)
             st.acc_q1 += delta_q1;
             st.acc_q2 += delta_q2;
@@ -269,6 +298,12 @@ class PrensaHidraulica1Processor : public IMessageProcessor
     struct PH1State {
         bool initialized = false;
         int  shift       = -1;
+
+        uint16_t    last_dd_pisadas        = 0;
+        uint16_t    last_dd_tiempo         = 0;
+        uint16_t    last_dd_paradas        = 0;
+        uint16_t    last_dd_tiempo_paradas = 0;
+        std::time_t last_accepted_time     = 0;
 
         // Counters are 16-bit with bit-15 validation
         uint16_t last_pisadas = 0;        // D29005 - PISADAS (press strokes)
@@ -348,8 +383,31 @@ public:
                 st.last_metrica_tiempo = metrica_tiempo;
                 st.last_paradas_count = paradas_count;
                 st.last_paradas_tiempo = paradas_tiempo;
+                st.last_dd_pisadas        = pisadas;
+                st.last_dd_tiempo         = metrica_tiempo;
+                st.last_dd_paradas        = paradas_count;
+                st.last_dd_tiempo_paradas = paradas_tiempo;
+                st.last_accepted_time     = std::time(nullptr);
             }
             else {
+                // Duplicate-frame rejection: no timer1Hz available; compare all
+                // four counter values + 120 s window (retry @ 30 s, interval @ 180 s).
+                constexpr int DEDUP_WINDOW_SECS = 120;
+                const auto now = std::time(nullptr);
+                if (pisadas        == st.last_dd_pisadas        &&
+                    metrica_tiempo == st.last_dd_tiempo         &&
+                    paradas_count  == st.last_dd_paradas        &&
+                    paradas_tiempo == st.last_dd_tiempo_paradas &&
+                    (now - st.last_accepted_time) < DEDUP_WINDOW_SECS) {
+                    std::cout << "[PH1] Trama repetida descartada (lineID=" << line << ")\n";
+                    return {};
+                }
+                st.last_dd_pisadas        = pisadas;
+                st.last_dd_tiempo         = metrica_tiempo;
+                st.last_dd_paradas        = paradas_count;
+                st.last_dd_tiempo_paradas = paradas_tiempo;
+                st.last_accepted_time     = now;
+
                 // Accumulate deltas using PLC-compatible validation
 
                 // D29005 - PISADAS counter (use diff_counter with bit-15 validation)
@@ -446,6 +504,12 @@ class PrensaHidraulica2Processor : public IMessageProcessor
         bool initialized = false;
         int  shift       = -1;
 
+        uint16_t    last_dd_pisadas        = 0;
+        uint16_t    last_dd_tiempo         = 0;
+        uint16_t    last_dd_paradas        = 0;
+        uint16_t    last_dd_tiempo_paradas = 0;
+        std::time_t last_accepted_time     = 0;
+
         uint16_t last_pisadas = 0;
         uint8_t  rc_pisadas = 0;
         uint32_t acc_pisadas = 0;
@@ -509,8 +573,30 @@ public:
                 st.last_metrica_tiempo = metrica_tiempo;
                 st.last_paradas_count = paradas_count;
                 st.last_paradas_tiempo = paradas_tiempo;
+                st.last_dd_pisadas        = pisadas;
+                st.last_dd_tiempo         = metrica_tiempo;
+                st.last_dd_paradas        = paradas_count;
+                st.last_dd_tiempo_paradas = paradas_tiempo;
+                st.last_accepted_time     = std::time(nullptr);
             }
             else {
+                // Duplicate-frame rejection
+                constexpr int DEDUP_WINDOW_SECS = 120;
+                const auto now = std::time(nullptr);
+                if (pisadas        == st.last_dd_pisadas        &&
+                    metrica_tiempo == st.last_dd_tiempo         &&
+                    paradas_count  == st.last_dd_paradas        &&
+                    paradas_tiempo == st.last_dd_tiempo_paradas &&
+                    (now - st.last_accepted_time) < DEDUP_WINDOW_SECS) {
+                    std::cout << "[PH2] Trama repetida descartada (lineID=" << line << ")\n";
+                    return {};
+                }
+                st.last_dd_pisadas        = pisadas;
+                st.last_dd_tiempo         = metrica_tiempo;
+                st.last_dd_paradas        = paradas_count;
+                st.last_dd_tiempo_paradas = paradas_tiempo;
+                st.last_accepted_time     = now;
+
                 // Use PLC-compatible counter validation
                 uint16_t delta_pisadas = diff_counter_safe(pisadas, st.last_pisadas, st.rc_pisadas);
                 st.acc_pisadas += delta_pisadas;
@@ -617,6 +703,8 @@ private:
     {
         bool initialized = false;
         int shift = 0;
+
+        uint16_t last_accepted_timer1Hz = 0;
 
         // All 16-bit counters - last values and accumulators
         uint16_t last_timer1Hz = 0;
@@ -727,6 +815,7 @@ public:
                 st.initialized = true;
                 st.shift = shiftNum;
 
+                st.last_accepted_timer1Hz = timer1Hz;
                 st.last_timer1Hz = timer1Hz;
                 st.last_paradas_cantidad = paradas_cantidad;
                 st.last_paradas_tempo = paradas_tempo;
@@ -738,6 +827,15 @@ public:
                 st.last_bancalino_l2_tiempo = bancalino_l2_tiempo;
             }
             else {
+                // Duplicate-frame rejection: timer1Hz is a free-running 1 Hz counter;
+                // identical value guarantees same LoRa frame was retransmitted.
+                if (timer1Hz == st.last_accepted_timer1Hz) {
+                    std::cout << "[EntradaSecador] Trama repetida descartada (lineID=" << line
+                              << " timer1Hz=" << timer1Hz << ")\n";
+                    return {};
+                }
+                st.last_accepted_timer1Hz = timer1Hz;
+
                 // Accumulate deltas — ALL PLC registers have bit-15 flag, use diff_counter for everything
                 st.acc_timer1Hz += diff_counter_safe(timer1Hz, st.last_timer1Hz, st.rc_timer1Hz);
 
@@ -862,6 +960,8 @@ private:
         bool initialized = false;
         int shift = 0;
 
+        uint16_t last_accepted_timer1Hz = 0;
+
         // All 16-bit counters - last values and accumulators
         uint16_t last_timer1Hz = 0;
         uint8_t  rc_timer1Hz = 0;
@@ -939,6 +1039,7 @@ public:
                 st.initialized = true;
                 st.shift = shiftNum;
 
+                st.last_accepted_timer1Hz = timer1Hz;
                 st.last_timer1Hz = timer1Hz;
                 st.last_parada_mds_cantidad = parada_mds_cantidad;
                 st.last_parada_mds_tiempo = parada_mds_tiempo;
@@ -946,6 +1047,14 @@ public:
                 st.last_metrica_mds_tiempo = metrica_mds_tiempo;
             }
             else {
+                // Duplicate-frame rejection
+                if (timer1Hz == st.last_accepted_timer1Hz) {
+                    std::cout << "[SalidaSecador] Trama repetida descartada (lineID=" << line
+                              << " timer1Hz=" << timer1Hz << ")\n";
+                    return {};
+                }
+                st.last_accepted_timer1Hz = timer1Hz;
+
                 // Accumulate deltas — ALL PLC registers have bit-15 flag, use diff_counter for everything
                 st.acc_timer1Hz += diff_counter_safe(timer1Hz, st.last_timer1Hz, st.rc_timer1Hz);
 
@@ -1042,6 +1151,8 @@ private:
         bool initialized = false;
         int shift = 0;
 
+        uint16_t last_accepted_timer1Hz = 0;
+
         // All 16-bit counters - last values and accumulators
         uint16_t last_timer1Hz = 0;
         uint8_t  rc_timer1Hz = 0;
@@ -1119,6 +1230,7 @@ public:
                 st.initialized = true;
                 st.shift = shiftNum;
 
+                st.last_accepted_timer1Hz = timer1Hz;
                 st.last_timer1Hz = timer1Hz;
                 st.last_parada_esm_cantidad = parada_esm_cantidad;
                 st.last_parada_esm_tiempo = parada_esm_tiempo;
@@ -1126,6 +1238,14 @@ public:
                 st.last_metrica_esm_tiempo = metrica_esm_tiempo;
             }
             else {
+                // Duplicate-frame rejection
+                if (timer1Hz == st.last_accepted_timer1Hz) {
+                    std::cout << "[Esmalte] Trama repetida descartada (lineID=" << line
+                              << " timer1Hz=" << timer1Hz << ")\n";
+                    return {};
+                }
+                st.last_accepted_timer1Hz = timer1Hz;
+
                 // Accumulate deltas — ALL PLC registers have bit-15 flag, use diff_counter for everything
                 st.acc_timer1Hz += diff_counter_safe(timer1Hz, st.last_timer1Hz, st.rc_timer1Hz);
 
@@ -1236,6 +1356,8 @@ private:
     {
         bool initialized = false;
         int shift = 0;
+
+        uint16_t last_accepted_timer1Hz = 0;
 
         // Timer
         uint16_t last_timer1Hz = 0;
@@ -1365,6 +1487,7 @@ public:
                 st.initialized = true;
                 st.shift = shiftNum;
 
+                st.last_accepted_timer1Hz = timer1Hz;
                 st.last_timer1Hz = timer1Hz;
                 st.last_numero_grades = numero_grades;
                 st.last_parada_mcf_cantidad = parada_mcf_cantidad;
@@ -1377,6 +1500,14 @@ public:
                 st.last_falha_forno_tiempo = falha_forno_tiempo;
             }
             else {
+                // Duplicate-frame rejection
+                if (timer1Hz == st.last_accepted_timer1Hz) {
+                    std::cout << "[EntradaHorno] Trama repetida descartada (lineID=" << line
+                              << " timer1Hz=" << timer1Hz << ")\n";
+                    return {};
+                }
+                st.last_accepted_timer1Hz = timer1Hz;
+
                 // Accumulate deltas — ALL PLC registers have bit-15 flag, use diff_counter for everything
                 uint32_t delta_timer = diff_counter_safe(timer1Hz, st.last_timer1Hz, st.rc_timer1Hz);
                 st.acc_timer1Hz += delta_timer;
@@ -1512,6 +1643,8 @@ private:
     {
         bool initialized = false;
         int shift = 0;
+
+        uint16_t last_accepted_timer1Hz = 0;
 
         // All 16-bit counters - last values and accumulators
         uint16_t last_timer1Hz = 0;
@@ -1680,6 +1813,7 @@ public:
                 st.initialized = true;
                 st.shift = shiftNum;
 
+                st.last_accepted_timer1Hz = timer1Hz;
                 st.last_timer1Hz = timer1Hz;
                 st.last_paradas_cantidad = paradas_cantidad;
                 st.last_paradas_tempo = paradas_tempo;
@@ -1698,6 +1832,14 @@ public:
                 st.last_barreira1_tiempo = barreira1_tiempo;
             }
             else {
+                // Duplicate-frame rejection
+                if (timer1Hz == st.last_accepted_timer1Hz) {
+                    std::cout << "[SalidaHorno] Trama repetida descartada (lineID=" << line
+                              << " timer1Hz=" << timer1Hz << ")\n";
+                    return {};
+                }
+                st.last_accepted_timer1Hz = timer1Hz;
+
                 // Accumulate deltas — ALL PLC registers have bit-15 flag, use diff_counter for everything
                 uint16_t delta_timer = diff_counter_safe(timer1Hz, st.last_timer1Hz, st.rc_timer1Hz);
                 st.acc_timer1Hz += delta_timer;
