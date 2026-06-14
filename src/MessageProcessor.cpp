@@ -255,7 +255,7 @@ public:
         // Output format remains unchanged
         json out;
         out["maquina_id"]       = 8;
-        out["timestamp_device"] = iso8601_utc_now();
+        out["timestamp_device"] = device_timestamp(msg);
         out["shift"]            = shift_now;
         out["lineID"]           = line_id;
         out["extra_c1"]   = q1;
@@ -453,7 +453,7 @@ public:
         // Build output JSON
         json qual;
         qual["alarms"] = alarms;
-        qual["timestamp_device"] = iso8601_utc_now();
+        qual["timestamp_device"] = device_timestamp(msg);
 
         json prod;
         prod["maquina_id"] = 1;
@@ -480,7 +480,7 @@ public:
         prod["tiempoParadas_instantaneo"] = paradas_tiempo;
         prod["tiempoParadas_turno_s"] = acc_paradas_tiempo_s_out;
 
-        prod["timestamp_device"] = iso8601_utc_now();
+        prod["timestamp_device"] = device_timestamp(msg);
 
         auto t1 = isa95_prefix + std::to_string(line) + "/prensa_hidraulica1/alarms";
         auto t2 = isa95_prefix + std::to_string(line) + "/prensa_hidraulica1/production";
@@ -633,7 +633,7 @@ public:
 
         json qual;
         qual["alarms"] = alarms;
-        qual["timestamp_device"] = iso8601_utc_now();
+        qual["timestamp_device"] = device_timestamp(msg);
 
         json prod;
         prod["maquina_id"] = 2;
@@ -656,7 +656,7 @@ public:
         prod["tiempoParadas_instantaneo"] = paradas_tiempo;
         prod["tiempoParadas_turno_s"] = acc_paradas_tiempo_s_out;
 
-        prod["timestamp_device"] = iso8601_utc_now();
+        prod["timestamp_device"] = device_timestamp(msg);
 
         auto t1 = isa95_prefix + std::to_string(line) + "/prensa_hidraulica2/alarms";
         auto t2 = isa95_prefix + std::to_string(line) + "/prensa_hidraulica2/production";
@@ -910,12 +910,12 @@ public:
         prod["bancalino_l2_tiempo_instantaneo_ds"] = bancalino_l2_tiempo;
         prod["bancalino_l2_tiempo_turno_ds"] = acc_bancalino_l2_tiempo_ds_out;  // CF100: 1 tick = 0.1s = 1ds (validated, no ×2)
 
-        prod["timestamp_device"] = iso8601_utc_now();
+        prod["timestamp_device"] = device_timestamp(msg);
 
         // Alarms
         json qual;
         qual["alarms"] = alarms;
-        qual["timestamp_device"] = iso8601_utc_now();
+        qual["timestamp_device"] = device_timestamp(msg);
 
         auto t1 = isa95_prefix + std::to_string(line) + "/entrada_secador/alarms";
         auto t2 = isa95_prefix + std::to_string(line) + "/entrada_secador/production";
@@ -1103,12 +1103,12 @@ public:
         // Convert deciseconds to seconds for convenience
         prod["metrica_mds_tiempo_turno_s"] = static_cast<double>(acc_metrica_mds_tiempo_ds_out) * 0.1;  // CF100: each tick = 0.1s (validated)
 
-        prod["timestamp_device"] = iso8601_utc_now();
+        prod["timestamp_device"] = device_timestamp(msg);
 
         // Alarms
         json qual;
         qual["alarms"] = alarms;
-        qual["timestamp_device"] = iso8601_utc_now();
+        qual["timestamp_device"] = device_timestamp(msg);
 
         auto t1 = isa95_prefix + std::to_string(line) + "/salida_secador/alarms";
         auto t2 = isa95_prefix + std::to_string(line) + "/salida_secador/production";
@@ -1304,12 +1304,12 @@ public:
                   << " acc_parada_turno=" << acc_parada_esm_cantidad_out
                   << "\n";
 
-        prod["timestamp_device"] = iso8601_utc_now();
+        prod["timestamp_device"] = device_timestamp(msg);
 
         // Alarms
         json qual;
         qual["alarms"] = alarms;
-        qual["timestamp_device"] = iso8601_utc_now();
+        qual["timestamp_device"] = device_timestamp(msg);
 
         auto t1 = isa95_prefix + std::to_string(line) + "/esmalte/alarms";
         auto t2 = isa95_prefix + std::to_string(line) + "/esmalte/production";
@@ -1599,12 +1599,12 @@ public:
         // Resets on shift change along with all other accumulators
         prod["sin_entrada_turno_s"] = acc_sin_entrada_s_out;
 
-        prod["timestamp_device"] = iso8601_utc_now();
+        prod["timestamp_device"] = device_timestamp(msg);
 
         // Alarms
         json qual;
         qual["alarms"] = alarms;
-        qual["timestamp_device"] = iso8601_utc_now();
+        qual["timestamp_device"] = device_timestamp(msg);
 
         auto t1 = isa95_prefix + std::to_string(line) + "/entrada_horno/alarms";
         auto t2 = isa95_prefix + std::to_string(line) + "/entrada_horno/production";
@@ -1970,12 +1970,12 @@ public:
         prod["paradaEscolhaTempo_instantaneo"] = parada_escolha_tempo;
         prod["paradaEscolhaTempo_turno"] = acc_parada_escolha_tempo_out;  // firmware Arduino ya corrige alineamiento de bit
 
-        prod["timestamp_device"] = iso8601_utc_now();
+        prod["timestamp_device"] = device_timestamp(msg);
 
         // Alarms
         json qual;
         qual["alarms"] = alarms;
-        qual["timestamp_device"] = iso8601_utc_now();
+        qual["timestamp_device"] = device_timestamp(msg);
 
         auto t1 = isa95_prefix + std::to_string(line) + "/salida_horno/alarms";
         auto t2 = isa95_prefix + std::to_string(line) + "/salida_horno/production";

@@ -42,3 +42,4 @@ _pkg
 # debug information files
 *.dwo
 
+settings.json
