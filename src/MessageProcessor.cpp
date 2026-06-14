@@ -148,111 +148,147 @@ public:
  * }
  */
 class CalidadProcessor final : public IMessageProcessor {
-    struct LineState {
-        uint64_t acc_q1  = 0;
-        uint64_t acc_q2  = 0;
-        uint64_t acc_q6  = 0;
-        uint64_t acc_discarded = 0;
+    // ========================================================================
+    //  v4 — ACUMULADORES MONOTONICOS
+    //  El firmware ahora envia contadores monotonicos (no se resetean por TX).
+    //  El delta por intervalo se calcula aqui con safe_delta_u16 (maneja rollover
+    //  de 16 bits). Si se pierde un paquete, el siguiente recupera el conteo.
+    //
+    //  Separacion clave de estado:
+    //   - RawTrack: tracking del raw monotonico. PERSISTE a traves de cambios de
+    //     turno. Solo se re-ancla en freshBoot (reinicio del equipo) o primer pkt.
+    //   - ShiftAcc: acumulador del turno. SE RESETEA en cambio de turno. El delta
+    //     que cruza el limite de turno se asigna integro al turno nuevo (status
+    //     quo: error <=1 intervalo) pero NUNCA se pierde.
+    //
+    //  Dedup: por gatewayTime + raw identico (duplicado republicado por el NS),
+    //  reemplaza la antigua ventana de 120s (que borraba produccion estable).
+    // ========================================================================
+
+    // Umbrales de delta para recuperar hasta ~10 intervalos perdidos:
+    static constexpr int MAXR_BOXES  = 300;   // ~25/int * 10 + margen
+    static constexpr int MAXR_BROKEN = 1200;  // picos ~100/int * 10 + margen
+
+    struct RawTrack {
+        uint16_t last_q1 = 0, last_q2 = 0, last_q6 = 0, last_broken = 0;
+        bool baseline_set = false;
+        std::string last_gateway_time;
+    };
+    struct ShiftAcc {
+        uint64_t q1 = 0, q2 = 0, q6 = 0, discarded = 0;
         int shift = -1;
         bool initialized = false;
-        // Duplicate-frame detection: Arduino retries after 30 s when ACK is lost.
-        // Store the last accepted payload values + timestamp; reject identical
-        // payloads arriving within DEDUP_WINDOW_SECS of the previous acceptance.
-        uint64_t    last_delta_q1     = 0;
-        uint64_t    last_delta_q2     = 0;
-        uint64_t    last_delta_q6     = 0;
-        uint64_t    last_delta_broken = 0;
-        std::time_t last_accepted_time = 0;   // 0 = never accepted
     };
-    
+
     static std::mutex mtx_;
-    static std::unordered_map<int, LineState> states_;
+    static std::unordered_map<int, RawTrack> raw_;     // por lineID, persiste turnos
+    static std::unordered_map<int, ShiftAcc> states_;  // por lineID, resetea turnos
 
 public:
     static void reset_states();
-    
+
     std::vector<Publication> process(const json& msg,
                                      const std::string& isa95_prefix,
                                      int shift_mode = 3) override {
         const int shift_now = static_cast<int>(current_shift_localtime(shift_mode));
         const int line_id   = msg.value("lineID", 0);
-        
-        // Extract accumulated counts from new payload format
-        // Support both field names for backward compatibility
-        uint64_t delta_q1 = 0;
-        uint64_t delta_q2 = 0;
-        uint64_t delta_q6 = 0;
-        uint64_t delta_broken = 0;
-        
-        // NEW FORMAT: accumulated counts (3-minute intervals)
+        const std::string gw_time = msg.value("gatewayTime", std::string{});
+
+        // ---- Extraer valores del payload ----
+        // v4: contadores monotonicos uint16. Formato viejo (cajaCalidad) se trata
+        // como delta directo de 1 evento por compatibilidad.
+        bool   is_monotonic = false;
+        uint16_t raw_q1 = 0, raw_q2 = 0, raw_q6 = 0, raw_broken = 0;
+        bool   fresh_boot = msg.value("freshBoot", false);
+
+        // delta directo (solo formato viejo cajaCalidad)
+        uint64_t direct_q1 = 0, direct_q2 = 0, direct_q6 = 0, direct_broken = 0;
+
         if (msg.contains("boxesQ1")) {
-            delta_q1 = msg.value("boxesQ1", 0);
-            delta_q2 = msg.value("boxesQ2", 0);
-            delta_q6 = msg.value("boxesQ6", 0);
-            delta_broken = msg.value("totalBroken", 0);
+            // NUEVO FORMATO v4: acumuladores monotonicos
+            is_monotonic = true;
+            raw_q1     = static_cast<uint16_t>(msg.value("boxesQ1", 0));
+            raw_q2     = static_cast<uint16_t>(msg.value("boxesQ2", 0));
+            raw_q6     = static_cast<uint16_t>(msg.value("boxesQ6", 0));
+            raw_broken = static_cast<uint16_t>(msg.value("totalBroken", 0));
         }
-        // OLD FORMAT: single box event (backward compatibility)
         else if (msg.contains("cajaCalidad")) {
+            // FORMATO VIEJO: un evento por mensaje (delta directo)
             const int cajaCalidad = msg.value("cajaCalidad", 0);
-            if      (cajaCalidad == 1) delta_q1 = 1;
-            else if (cajaCalidad == 2) delta_q2 = 1;
-            else if (cajaCalidad == 6) delta_q6 = 1;
-            
+            if      (cajaCalidad == 1) direct_q1 = 1;
+            else if (cajaCalidad == 2) direct_q2 = 1;
+            else if (cajaCalidad == 6) direct_q6 = 1;
             const int quebrados = msg.contains("quebrados")
                                     ? msg.value("quebrados", 0)
                                     : msg.value("quebrado", 0);
-            if (quebrados > 0) {
-                delta_broken = static_cast<uint64_t>(quebrados);
-            }
+            if (quebrados > 0) direct_broken = static_cast<uint64_t>(quebrados);
         }
-        
+
         uint64_t q1, q2, q6, disc;
         {
             std::lock_guard<std::mutex> lock(mtx_);
-            auto& st = states_[line_id];
+            auto& rt = raw_[line_id];
+            auto& sa = states_[line_id];
 
-            // First time or shift changed
-            if (!st.initialized || st.shift != shift_now) {
-                st = LineState();      // reset for this line
-                st.initialized = true;
-                st.shift = shift_now;
+            if (is_monotonic) {
+                // ---- 1) Dedup por gatewayTime + raw identico ----
+                if (!gw_time.empty() &&
+                    gw_time == rt.last_gateway_time &&
+                    rt.baseline_set &&
+                    raw_q1 == rt.last_q1 && raw_q2 == rt.last_q2 &&
+                    raw_q6 == rt.last_q6 && raw_broken == rt.last_broken) {
+                    std::cout << "[Calidad] Duplicado NS descartado (lineID=" << line_id
+                              << " gwTime=" << gw_time << ")\n";
+                    return {};
+                }
+
+                // ---- 2) Reset del acumulador SOLO en cambio de turno ----
+                if (!sa.initialized || sa.shift != shift_now) {
+                    sa = ShiftAcc();
+                    sa.initialized = true;
+                    sa.shift = shift_now;
+                }
+
+                // ---- 3) freshBoot o sin baseline: re-anclar, no emitir delta ----
+                if (fresh_boot || !rt.baseline_set) {
+                    rt.last_q1 = raw_q1; rt.last_q2 = raw_q2;
+                    rt.last_q6 = raw_q6; rt.last_broken = raw_broken;
+                    rt.baseline_set = true;
+                    rt.last_gateway_time = gw_time;
+                    std::cout << "[Calidad] Baseline anclada (lineID=" << line_id
+                              << (fresh_boot ? " freshBoot" : " primer pkt") << ")\n";
+                    return {};
+                }
+
+                // ---- 4) Delta normal via safe_delta_u16 (rollover-safe) ----
+                uint32_t d_q1 = safe_delta_u16(rt.last_q1, raw_q1, MAXR_BOXES);
+                uint32_t d_q2 = safe_delta_u16(rt.last_q2, raw_q2, MAXR_BOXES);
+                uint32_t d_q6 = safe_delta_u16(rt.last_q6, raw_q6, MAXR_BOXES);
+                uint32_t d_br = safe_delta_u16(rt.last_broken, raw_broken, MAXR_BROKEN);
+
+                // ---- 5) Actualizar tracking del raw (persiste turnos) ----
+                rt.last_q1 = raw_q1; rt.last_q2 = raw_q2;
+                rt.last_q6 = raw_q6; rt.last_broken = raw_broken;
+                rt.last_gateway_time = gw_time;
+
+                // ---- 6) Sumar deltas al acumulador del turno ----
+                sa.q1 += d_q1; sa.q2 += d_q2; sa.q6 += d_q6; sa.discarded += d_br;
+            }
+            else {
+                // FORMATO VIEJO: delta directo. Solo reset por turno.
+                if (!sa.initialized || sa.shift != shift_now) {
+                    sa = ShiftAcc();
+                    sa.initialized = true;
+                    sa.shift = shift_now;
+                }
+                sa.q1 += direct_q1; sa.q2 += direct_q2;
+                sa.q6 += direct_q6; sa.discarded += direct_broken;
             }
 
-            // Duplicate-frame rejection: Arduino retries the same LoRa frame after
-            // ~30 s when the gateway ACK is lost. Identical payload within 120 s of
-            // the last accepted frame is treated as a retry and silently discarded.
-            constexpr int DEDUP_WINDOW_SECS = 120;
-            const auto now = std::time(nullptr);
-            if (st.last_accepted_time != 0 &&
-                delta_q1     == st.last_delta_q1 &&
-                delta_q2     == st.last_delta_q2 &&
-                delta_q6     == st.last_delta_q6 &&
-                delta_broken == st.last_delta_broken &&
-                (now - st.last_accepted_time) < DEDUP_WINDOW_SECS) {
-                std::cout << "[Calidad] Trama repetida descartada (lineID=" << line_id
-                          << " dt=" << (now - st.last_accepted_time) << "s)\n";
-                return {};
-            }
-            st.last_delta_q1     = delta_q1;
-            st.last_delta_q2     = delta_q2;
-            st.last_delta_q6     = delta_q6;
-            st.last_delta_broken = delta_broken;
-            st.last_accepted_time = now;
-
-            // Add the deltas (accumulated counts from this message)
-            st.acc_q1 += delta_q1;
-            st.acc_q2 += delta_q2;
-            st.acc_q6 += delta_q6;
-            st.acc_discarded += delta_broken;
-            
-            // Snapshot current shift totals
-            q1 = st.acc_q1;
-            q2 = st.acc_q2;
-            q6 = st.acc_q6;
-            disc = st.acc_discarded;
+            q1 = sa.q1; q2 = sa.q2; q6 = sa.q6; disc = sa.discarded;
         }
-        
-        // Output format remains unchanged
+
+        // ---- Salida (formato sin cambios) ----
         json out;
         out["maquina_id"]       = 8;
         out["timestamp_device"] = device_timestamp(msg);
@@ -262,7 +298,7 @@ public:
         out["extra_c2"]   = q2;
         out["comercial"]  = q6;
         out["quebrados"]  = disc;
-        
+
         const auto t1 = isa95_prefix + std::to_string(line_id) + "/calidad/production";
         return { make_pub(t1, out) };
     }
@@ -270,10 +306,12 @@ public:
 
 // Static definitions
 std::mutex CalidadProcessor::mtx_;
-std::unordered_map<int, CalidadProcessor::LineState> CalidadProcessor::states_;
+std::unordered_map<int, CalidadProcessor::RawTrack> CalidadProcessor::raw_;
+std::unordered_map<int, CalidadProcessor::ShiftAcc> CalidadProcessor::states_;
 
 void CalidadProcessor::reset_states() {
     std::lock_guard<std::mutex> lock(mtx_);
+    raw_.clear();
     states_.clear();
 }
 
