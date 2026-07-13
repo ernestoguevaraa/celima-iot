@@ -1966,19 +1966,18 @@ public:
         prod["paradas_2_instantaneo"] = paradas_tempo;
         prod["paradas_2_turno"] = acc_paradas_tempo_out;  // firmware Arduino ya corrige alineamiento de bit
 
-        // Bancalinos Q:3.01 (D25007)
-        // OLD: bancalinos0 → NEW: bancalinos_q301
-        prod["bancalinos0_instantaneo"] = bancalinos_q301;
-        prod["bancalinos0_turno"] = acc_bancalinos_q301_out;  // firmware Arduino ya corrige alineamiento de bit
+        // Bancalinos Q:3.01 sin sensor (D25007) — activaciones Q:3.01 sin confirmar presencia de lozeta
+        prod["bancalinos0_nosensor_instantaneo"] = bancalinos_q301;
+        prod["bancalinos0_nosensor_turno"] = acc_bancalinos_q301_out;
 
         // Bancalinos Q:3.00 (D25008)
         // OLD: bancalinos1 → NEW: bancalinos_q300
         prod["bancalinos1_instantaneo"] = bancalinos_q300;
         prod["bancalinos1_turno"] = acc_bancalinos_q300_out;  // firmware Arduino ya corrige alineamiento de bit
 
-        // Bancalinos Comb1: Q:3.01 AND I:1.09 (D25009)
-        prod["bancalinosComb1_instantaneo"] = bancalinos_comb1;
-        prod["bancalinosComb1_turno"] = acc_bancalinos_comb1_out;  // firmware Arduino ya corrige alineamiento de bit
+        // Bancalinos Comb1: Q:3.01 AND I:1.09 (D25009) — activaciones con lozeta presente (sustituye bancalinos0)
+        prod["bancalinos0_instantaneo"] = bancalinos_comb1;
+        prod["bancalinos0_turno"] = acc_bancalinos_comb1_out;
 
         // Bancalinos Comb2: Q:3.01 AND Q:2.10 (D25016) - NOW INCLUDED!
         prod["bancalinosComb2_instantaneo"] = bancalinos_comb2;
