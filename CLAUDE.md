@@ -32,9 +32,23 @@ make clean
 ./scripts/build_deb.sh 1.05.0   # .deb into ./_pkg (needs bin/Release built first)
 ```
 
-There is no test suite and no test framework wired up. Verification today is done by running the
-binary against a broker and reading its stdout (every accepted frame logs `[PUB QoS1] <topic> <-
-<payload>`), or in production via `journalctl -u iot-celima-mqtt.service`.
+```bash
+make test          # compila tests/ + los .cpp de dominio y ejecuta la suite
+./bin/tests -tc='replay*'          # un solo caso (doctest: -tc / --test-case)
+./bin/tests -ltc                   # listar casos
+make test GOLDEN_OUT=tests/data/celima_data_replay.golden   # regenerar el golden
+```
+
+The suite is doctest (vendored at [tests/doctest.h](tests/doctest.h), MIT, header-only — no runtime
+dependency, not linked into the release binary). Its core is a deterministic replay:
+[tests/data/celima_data_replay.jsonl](tests/data/celima_data_replay.jsonl) is fed through the
+processors and every publication is compared byte-for-byte against a golden file. See
+[tests/data/README.md](tests/data/README.md) — the fixture is synthetic, and the golden was generated
+with pre-instrumentation code on purpose.
+
+Beyond the suite, verification means running the binary against a broker and reading its stdout
+(every accepted frame logs `[PUB QoS1] <topic> <- <payload>`, and state events log `[STATE] <event>
+line=<n> proc=<name> ...`), or in production via `journalctl -u iot-celima-mqtt.service`.
 
 ## Configuration
 
@@ -107,10 +121,13 @@ sum of deltas, and every hard-won fix here is about a specific field failure mod
 
 - `diff_counter(curr, prev, max_valid)` — unsigned 16-bit subtraction (rollover at 65536 is
   automatic); rejects `delta > max_valid` (default 5000) as corruption.
-- `diff_counter_safe(curr, prev_ref, reject_count, ...)` — the one to use. Only advances `prev_ref`
-  on a *valid* delta, so one corrupt frame doesn't also poison the next, plus stale recovery: after
-  3 consecutive rejections it force-re-anchors `prev_ref` (otherwise a single bad value could freeze
-  an accumulator for the rest of the shift).
+- `diff_counter_safe(curr, prev_ref, reject_count, max_valid, max_rejects, line, proc, field)` — the
+  one to use. Only advances `prev_ref` on a *valid* delta, so one corrupt frame doesn't also poison
+  the next, plus stale recovery: after 3 consecutive rejections it force-re-anchors `prev_ref`
+  (otherwise a single bad value could freeze an accumulator for the rest of the shift). The last three
+  arguments only label the `[STATE]` events; pass them at every new call site (`line` is the local
+  `line` variable, `proc` the topic segment, `field` the counter name) or the log shows
+  `line=-1 proc=? field=?`.
 - `safe_delta_u16()` in [inc/MessageProcessor.hpp](inc/MessageProcessor.hpp) — used by
   CalidadProcessor for its monotonic accumulators.
 - `spike_detected()` / `spike_ema_update()` — EMA-based corruption detection used by
@@ -141,8 +158,12 @@ delta bound must ship in the same release.
 2. Write the processor in [src/MessageProcessor.cpp](src/MessageProcessor.cpp) following the pattern
    above, with its statics defined below the class.
 3. Register it in `createProcessor()` and its `reset_states()` in `reset_all_processor_states()`.
+4. Emit `reseed` in its init branch and pass `line`/`proc`/`field` to every `diff_counter_safe` call.
+5. Add frames for it to [tests/data/celima_data_replay.jsonl](tests/data/celima_data_replay.jsonl) and
+   regenerate the golden — otherwise the replay covers everything except the new processor.
 
-New `.cpp` files are picked up automatically (`SRC := $(wildcard src/*.cpp)`).
+New `.cpp` files are picked up automatically (`SRC := $(wildcard src/*.cpp)`), and so are new
+`tests/*.cpp`.
 
 ### Invariantes del dominio
 
@@ -198,16 +219,21 @@ Léelas antes de tocar [src/MessageProcessor.cpp](src/MessageProcessor.cpp).
   acumuladores cada tres segundos, en silencio.
 - **D1 y D2 se corrigen en el mismo release.** Persistir el estado sin acotar el delta por tiempo
   desenmascara D2 y convierte un reporte corto en uno inflado, que es peor porque nadie lo cuestiona.
-- **Los logs van a `std::cout`** con buffer de bloque de 4 KB (stdout es un pipe bajo systemd, no un
-  terminal). Llegan al journal en ráfagas con hasta 36 s de retraso y se pierden hasta 4 KB en cada
-  parada dura — precisamente las líneas que explicarían la caída. La única que se vacía en el momento
-  es el `std::endl` del cambio de turno en [MqttApp.cpp:148](src/MqttApp.cpp#L148). La corrección es
-  `std::cout << std::unitbuf;` al inicio de `main()`, y va **antes** que la persistencia: sin ella,
-  cualquier depuración posterior arranca con los últimos segundos borrados.
-- **Re-anclajes y descartes ocurren en silencio.** `diff_counter_safe` re-ancla `prev_ref` sin dejar
-  rastro, y solo los descartes por trama repetida y los spikes de salida horno se registran. Tras el
-  incidente del 1 de septiembre, identificar la re-siembra exigió reconstruirla comparando
-  `timer1Hz_turno` entre tópicos del journal. Si añades lógica de descarte, loguéala.
+- **El buffering de stdout ya está corregido** (`std::cout << std::unitbuf;` como primera sentencia de
+  `main()`). No lo quites ni metas salida antes de esa línea: sin ella, stdout bajo systemd es un pipe
+  con buffer de bloque de 4 KB, los logs llegaban al journal con hasta 36 s de retraso y cada parada
+  dura se llevaba las líneas que explicaban la caída. Medido: con `kill -9`, antes sobrevivían 0
+  bytes; después, todo lo ya emitido.
+- **Los caminos de estado dejan rastro `[STATE]`**, vía `celima::log::state_event()`
+  ([inc/Logging.hpp](inc/Logging.hpp)): `reseed` (con `reason=first_message|shift_change`),
+  `delta_rejected`, `reanchor` y `shift_change_global`. Si añades lógica de descarte o de re-siembra,
+  emítela por ahí — en silencio no es reconstruible: tras el incidente del 1 de septiembre identificar
+  la re-siembra exigió comparar `timer1Hz_turno` entre tópicos del journal. Dos reglas al hacerlo:
+  nada de logging en la rama de acumulación normal (~36.000 mensajes/día, el journal ya crece
+  43,5 MB/día), y un `reseed` por procesador y línea, no uno por campo.
+- **`EsmalteProcessor` sí loguea en la rama normal** (`[ESM diag] ...`, una línea por mensaje). Es
+  anterior a esta convención y contradice la regla de arriba; si toca revisar volumen de journal,
+  empieza por ahí.
 
 ### Contexto operativo
 

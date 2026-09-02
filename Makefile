@@ -65,6 +65,20 @@ build/Debug/%.o: src/%.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS_DBG) $(SANFLAGS) -c $< -o $@
 
+# --- Tests ---
+# Target aislado: no entra en el binario de release y no añade dependencias de
+# runtime. doctest está vendorizado en tests/doctest.h (MIT, un header).
+# src/main.cpp queda fuera: tiene su propio main().
+TEST_SRC     := $(wildcard tests/*.cpp)
+TEST_APP_SRC := src/MessageProcessor.cpp src/JsonUtils.cpp src/DeviceTypes.cpp
+TEST_BIN     := bin/tests
+
+test: $(TEST_SRC) $(TEST_APP_SRC) $(wildcard tests/*.hpp)
+	@mkdir -p bin
+	$(CXX) $(CXXSTD) $(WARN) $(INC) -Itests -O0 -g $(SANFLAGS) \
+	    $(TEST_SRC) $(TEST_APP_SRC) -pthread -o $(TEST_BIN)
+	./$(TEST_BIN)
+
 # --- Utilities ---
 
 strip:
@@ -82,4 +96,4 @@ format:
 clean:
 	rm -rf build bin
 
-.PHONY: all release debug strip run-release run-debug format clean
+.PHONY: all release debug test strip run-release run-debug format clean

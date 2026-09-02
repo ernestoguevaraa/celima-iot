@@ -1,5 +1,6 @@
 #include "MessageProcessor.hpp"
 #include "JsonUtils.hpp"
+#include "Logging.hpp"
 #include "Shift.hpp"
 #include "TimeUtils.hpp"
 #include <memory>
@@ -19,6 +20,9 @@ bool detect_global_shift_change(int currentShift)
 
     // First run or shift change
     g_last_global_shift.store(currentShift, std::memory_order_relaxed);
+    celima::log::state_event("shift_change_global", -1, "global",
+        "shift_prev=" + std::to_string(prev) +
+        " shift_new=" + std::to_string(currentShift));
     return true;
 }
 
@@ -50,10 +54,18 @@ static uint16_t diff_counter(uint16_t curr, uint16_t prev, uint16_t max_valid = 
 // This prevents permanent lockout where a single corrupted reading poisons
 // prev_ref into a range that makes ALL subsequent valid readings appear as
 // huge deltas (via 16-bit wraparound), freezing the accumulator forever.
+//
+// Observabilidad: los parámetros line/proc/field solo etiquetan los eventos
+// [STATE]; no intervienen en la aritmética. Tienen valor por defecto para que
+// una llamada nueva sin contexto compile y se delate en el log como
+// "line=-1 proc=? field=?" en lugar de perderse en silencio.
 static uint16_t diff_counter_safe(uint16_t curr, uint16_t &prev_ref,
                                    uint8_t &reject_count,
                                    uint16_t max_valid = 5000,
-                                   uint8_t max_rejects = 3) {
+                                   uint8_t max_rejects = 3,
+                                   int line = -1,
+                                   const char* proc = "?",
+                                   const char* field = "?") {
     uint16_t d = diff_counter(curr, prev_ref, max_valid);
     if (d > 0) {
         prev_ref = curr;
@@ -66,12 +78,24 @@ static uint16_t diff_counter_safe(uint16_t curr, uint16_t &prev_ref,
     uint16_t raw_delta = static_cast<uint16_t>(curr - prev_ref);
     if (raw_delta > max_valid) {
         // This was a rejection, not a genuine zero
+        const uint16_t prev_before = prev_ref;
         reject_count++;
+        celima::log::state_event("delta_rejected", line, proc,
+            "field=" + std::string(field) +
+            " prev=" + std::to_string(prev_before) +
+            " curr=" + std::to_string(curr) +
+            " raw_delta=" + std::to_string(raw_delta) +
+            " max_valid=" + std::to_string(max_valid) +
+            " reject_count=" + std::to_string(static_cast<int>(reject_count)));
         if (reject_count >= max_rejects) {
             // Stale recovery: prev_ref is stuck in an unrecoverable range.
             // Force-reset so next message can compute a valid delta.
             prev_ref = curr;
             reject_count = 0;
+            celima::log::state_event("reanchor", line, proc,
+                "field=" + std::string(field) +
+                " prev=" + std::to_string(prev_before) +
+                " curr=" + std::to_string(curr));
         }
     }
     // else: raw_delta == 0, genuinely no change -- don't increment reject_count
@@ -264,6 +288,12 @@ public:
 
                 // ---- 2) Reset del acumulador SOLO en cambio de turno ----
                 if (!sa.initialized || sa.shift != shift_now) {
+                    // reseed: una vez por procesador y línea, antes de pisar el estado.
+                    celima::log::state_event("reseed", line_id, "calidad",
+                        sa.initialized
+                            ? ("reason=shift_change shift_prev=" + std::to_string(sa.shift) +
+                               " shift_new=" + std::to_string(shift_now))
+                            : ("reason=first_message shift=" + std::to_string(shift_now)));
                     sa = ShiftAcc();
                     sa.initialized = true;
                     sa.shift = shift_now;
@@ -275,8 +305,15 @@ public:
                     rt.last_q6 = raw_q6; rt.last_broken = raw_broken;
                     rt.baseline_set = true;
                     rt.last_gateway_time = gw_time;
-                    std::cout << "[Calidad] Baseline anclada (lineID=" << line_id
-                              << (fresh_boot ? " freshBoot" : " primer pkt") << ")\n";
+                    // Re-ancla del tracking del raw: no es el acumulador de turno,
+                    // pero descarta el delta de este mensaje y por eso deja rastro.
+                    celima::log::state_event("reanchor", line_id, "calidad",
+                        std::string("field=boxes_raw reason=") +
+                        (fresh_boot ? "fresh_boot" : "first_message") +
+                        " q1=" + std::to_string(raw_q1) +
+                        " q2=" + std::to_string(raw_q2) +
+                        " q6=" + std::to_string(raw_q6) +
+                        " broken=" + std::to_string(raw_broken));
                     return {};
                 }
 
@@ -297,6 +334,12 @@ public:
             else {
                 // FORMATO VIEJO: delta directo. Solo reset por turno.
                 if (!sa.initialized || sa.shift != shift_now) {
+                    // reseed: una vez por procesador y línea, antes de pisar el estado.
+                    celima::log::state_event("reseed", line_id, "calidad",
+                        sa.initialized
+                            ? ("reason=shift_change shift_prev=" + std::to_string(sa.shift) +
+                               " shift_new=" + std::to_string(shift_now))
+                            : ("reason=first_message shift=" + std::to_string(shift_now)));
                     sa = ShiftAcc();
                     sa.initialized = true;
                     sa.shift = shift_now;
@@ -433,6 +476,12 @@ public:
             PH1State &st = states_[line];
 
             if (!st.initialized || st.shift != shiftNum) {
+                // reseed: una vez por procesador y línea, antes de pisar el estado.
+                celima::log::state_event("reseed", line, "prensa_hidraulica1",
+                    st.initialized
+                        ? ("reason=shift_change shift_prev=" + std::to_string(st.shift) +
+                           " shift_new=" + std::to_string(shiftNum))
+                        : ("reason=first_message shift=" + std::to_string(shiftNum)));
                 // New shift - initialize
                 st = PH1State();
                 st.initialized = true;
@@ -469,19 +518,19 @@ public:
                 // Accumulate deltas using PLC-compatible validation
 
                 // D29005 - PISADAS counter (use diff_counter with bit-15 validation)
-                uint16_t delta_pisadas = diff_counter_safe(pisadas, st.last_pisadas, st.rc_pisadas);
+                uint16_t delta_pisadas = diff_counter_safe(pisadas, st.last_pisadas, st.rc_pisadas, 5000, 3, line, "prensa_hidraulica1", "pisadas");
                 st.acc_pisadas += delta_pisadas;
 
                 // D29006 - Metric time (deciseconds, bit-15 masked)
-                uint16_t delta_tiempo = diff_counter_safe(metrica_tiempo, st.last_metrica_tiempo, st.rc_metrica_tiempo);
+                uint16_t delta_tiempo = diff_counter_safe(metrica_tiempo, st.last_metrica_tiempo, st.rc_metrica_tiempo, 5000, 3, line, "prensa_hidraulica1", "metrica_tiempo");
                 st.acc_metrica_tiempo_s += delta_tiempo * 0.1;  // CF100 P_0_1s: 0.1s per tick (validated)
 
                 // D29003 - Stop count counter
-                uint16_t delta_paradas = diff_counter_safe(paradas_count, st.last_paradas_count, st.rc_paradas_count);
+                uint16_t delta_paradas = diff_counter_safe(paradas_count, st.last_paradas_count, st.rc_paradas_count, 5000, 3, line, "prensa_hidraulica1", "paradas_count");
                 st.acc_paradas_count += delta_paradas;
 
                 // D29004 - Stop time counter (seconds)
-                uint16_t delta_tiempo_paradas = diff_counter_safe(paradas_tiempo, st.last_paradas_tiempo, st.rc_paradas_tiempo);
+                uint16_t delta_tiempo_paradas = diff_counter_safe(paradas_tiempo, st.last_paradas_tiempo, st.rc_paradas_tiempo, 5000, 3, line, "prensa_hidraulica1", "paradas_tiempo");
                 st.acc_paradas_tiempo_s += delta_tiempo_paradas;  // firmware Arduino ya corrige alineamiento de bit
             }
 
@@ -624,6 +673,12 @@ public:
             PH2State &st = states_[line];
 
             if (!st.initialized || st.shift != shiftNum) {
+                // reseed: una vez por procesador y línea, antes de pisar el estado.
+                celima::log::state_event("reseed", line, "prensa_hidraulica2",
+                    st.initialized
+                        ? ("reason=shift_change shift_prev=" + std::to_string(st.shift) +
+                           " shift_new=" + std::to_string(shiftNum))
+                        : ("reason=first_message shift=" + std::to_string(shiftNum)));
                 st = PH2State();
                 st.initialized = true;
                 st.shift = shiftNum;
@@ -656,16 +711,16 @@ public:
                 st.last_accepted_time     = now;
 
                 // Use PLC-compatible counter validation
-                uint16_t delta_pisadas = diff_counter_safe(pisadas, st.last_pisadas, st.rc_pisadas);
+                uint16_t delta_pisadas = diff_counter_safe(pisadas, st.last_pisadas, st.rc_pisadas, 5000, 3, line, "prensa_hidraulica2", "pisadas");
                 st.acc_pisadas += delta_pisadas;
 
-                uint16_t delta_tiempo = diff_counter_safe(metrica_tiempo, st.last_metrica_tiempo, st.rc_metrica_tiempo);
+                uint16_t delta_tiempo = diff_counter_safe(metrica_tiempo, st.last_metrica_tiempo, st.rc_metrica_tiempo, 5000, 3, line, "prensa_hidraulica2", "metrica_tiempo");
                 st.acc_metrica_tiempo_s += delta_tiempo * 0.1;  // CF100 P_0_1s: 0.1s per tick (validated)
 
-                uint16_t delta_paradas = diff_counter_safe(paradas_count, st.last_paradas_count, st.rc_paradas_count);
+                uint16_t delta_paradas = diff_counter_safe(paradas_count, st.last_paradas_count, st.rc_paradas_count, 5000, 3, line, "prensa_hidraulica2", "paradas_count");
                 st.acc_paradas_count += delta_paradas;
 
-                uint16_t delta_tiempo_paradas = diff_counter_safe(paradas_tiempo, st.last_paradas_tiempo, st.rc_paradas_tiempo);
+                uint16_t delta_tiempo_paradas = diff_counter_safe(paradas_tiempo, st.last_paradas_tiempo, st.rc_paradas_tiempo, 5000, 3, line, "prensa_hidraulica2", "paradas_tiempo");
                 st.acc_paradas_tiempo_s += delta_tiempo_paradas;  // firmware Arduino ya corrige alineamiento de bit
             }
 
@@ -868,6 +923,12 @@ public:
             State &st = states_[line];
 
             if (!st.initialized || st.shift != shiftNum) {
+                // reseed: una vez por procesador y línea, antes de pisar el estado.
+                celima::log::state_event("reseed", line, "entrada_secador",
+                    st.initialized
+                        ? ("reason=shift_change shift_prev=" + std::to_string(st.shift) +
+                           " shift_new=" + std::to_string(shiftNum))
+                        : ("reason=first_message shift=" + std::to_string(shiftNum)));
                 // New shift - reset all accumulators and store initial values
                 st = State();
                 st.initialized = true;
@@ -895,29 +956,29 @@ public:
                 st.last_accepted_timer1Hz = timer1Hz;
 
                 // Accumulate deltas — ALL PLC registers have bit-15 flag, use diff_counter for everything
-                st.acc_timer1Hz += diff_counter_safe(timer1Hz, st.last_timer1Hz, st.rc_timer1Hz);
+                st.acc_timer1Hz += diff_counter_safe(timer1Hz, st.last_timer1Hz, st.rc_timer1Hz, 5000, 3, line, "entrada_secador", "timer1Hz");
 
-                st.acc_paradas_cantidad += diff_counter_safe(paradas_cantidad, st.last_paradas_cantidad, st.rc_paradas_cantidad);
+                st.acc_paradas_cantidad += diff_counter_safe(paradas_cantidad, st.last_paradas_cantidad, st.rc_paradas_cantidad, 5000, 3, line, "entrada_secador", "paradas_cantidad");
 
-                st.acc_paradas_tempo_s += diff_counter_safe(paradas_tempo, st.last_paradas_tempo, st.rc_paradas_tempo);
+                st.acc_paradas_tempo_s += diff_counter_safe(paradas_tempo, st.last_paradas_tempo, st.rc_paradas_tempo, 5000, 3, line, "entrada_secador", "paradas_tempo");
 
-                st.acc_ingreso_elevador_cantidad += diff_counter_safe(ingreso_elevador_cantidad, st.last_ingreso_elevador_cantidad, st.rc_ingreso_elevador_cantidad);
+                st.acc_ingreso_elevador_cantidad += diff_counter_safe(ingreso_elevador_cantidad, st.last_ingreso_elevador_cantidad, st.rc_ingreso_elevador_cantidad, 5000, 3, line, "entrada_secador", "ingreso_elevador_cantidad");
 
-                st.acc_ingreso_elevador_tiempo_ds += diff_counter_safe(ingreso_elevador_tiempo, st.last_ingreso_elevador_tiempo, st.rc_ingreso_elevador_tiempo);
+                st.acc_ingreso_elevador_tiempo_ds += diff_counter_safe(ingreso_elevador_tiempo, st.last_ingreso_elevador_tiempo, st.rc_ingreso_elevador_tiempo, 5000, 3, line, "entrada_secador", "ingreso_elevador_tiempo");
 
                 {
-                    uint16_t d = diff_counter_safe(bancalino_l1_cantidad, st.last_bancalino_l1_cantidad, st.rc_bancalino_l1_cantidad);
+                    uint16_t d = diff_counter_safe(bancalino_l1_cantidad, st.last_bancalino_l1_cantidad, st.rc_bancalino_l1_cantidad, 5000, 3, line, "entrada_secador", "bancalino_l1_cantidad");
                     st.acc_bancalino_l1_cantidad += (line == 2) ? d / 4 : d;
                 }
 
-                st.acc_bancalino_l1_tiempo_ds += diff_counter_safe(bancalino_l1_tiempo, st.last_bancalino_l1_tiempo, st.rc_bancalino_l1_tiempo);
+                st.acc_bancalino_l1_tiempo_ds += diff_counter_safe(bancalino_l1_tiempo, st.last_bancalino_l1_tiempo, st.rc_bancalino_l1_tiempo, 5000, 3, line, "entrada_secador", "bancalino_l1_tiempo");
 
                 {
-                    uint16_t d = diff_counter_safe(bancalino_l2_cantidad, st.last_bancalino_l2_cantidad, st.rc_bancalino_l2_cantidad);
+                    uint16_t d = diff_counter_safe(bancalino_l2_cantidad, st.last_bancalino_l2_cantidad, st.rc_bancalino_l2_cantidad, 5000, 3, line, "entrada_secador", "bancalino_l2_cantidad");
                     st.acc_bancalino_l2_cantidad += (line == 2) ? d / 4 : d;
                 }
 
-                st.acc_bancalino_l2_tiempo_ds += diff_counter_safe(bancalino_l2_tiempo, st.last_bancalino_l2_tiempo, st.rc_bancalino_l2_tiempo);
+                st.acc_bancalino_l2_tiempo_ds += diff_counter_safe(bancalino_l2_tiempo, st.last_bancalino_l2_tiempo, st.rc_bancalino_l2_tiempo, 5000, 3, line, "entrada_secador", "bancalino_l2_tiempo");
             }
 
             // Copy accumulated values to output
@@ -1092,6 +1153,12 @@ public:
             State &st = states_[line];
 
             if (!st.initialized || st.shift != shiftNum) {
+                // reseed: una vez por procesador y línea, antes de pisar el estado.
+                celima::log::state_event("reseed", line, "salida_secador",
+                    st.initialized
+                        ? ("reason=shift_change shift_prev=" + std::to_string(st.shift) +
+                           " shift_new=" + std::to_string(shiftNum))
+                        : ("reason=first_message shift=" + std::to_string(shiftNum)));
                 // New shift - reset all accumulators and store initial values
                 st = State();
                 st.initialized = true;
@@ -1114,15 +1181,15 @@ public:
                 st.last_accepted_timer1Hz = timer1Hz;
 
                 // Accumulate deltas — ALL PLC registers have bit-15 flag, use diff_counter for everything
-                st.acc_timer1Hz += diff_counter_safe(timer1Hz, st.last_timer1Hz, st.rc_timer1Hz);
+                st.acc_timer1Hz += diff_counter_safe(timer1Hz, st.last_timer1Hz, st.rc_timer1Hz, 5000, 3, line, "salida_secador", "timer1Hz");
 
-                st.acc_parada_mds_cantidad += diff_counter_safe(parada_mds_cantidad, st.last_parada_mds_cantidad, st.rc_parada_mds_cantidad);
+                st.acc_parada_mds_cantidad += diff_counter_safe(parada_mds_cantidad, st.last_parada_mds_cantidad, st.rc_parada_mds_cantidad, 5000, 3, line, "salida_secador", "parada_mds_cantidad");
 
-                st.acc_parada_mds_tiempo_s += diff_counter_safe(parada_mds_tiempo, st.last_parada_mds_tiempo, st.rc_parada_mds_tiempo);
+                st.acc_parada_mds_tiempo_s += diff_counter_safe(parada_mds_tiempo, st.last_parada_mds_tiempo, st.rc_parada_mds_tiempo, 5000, 3, line, "salida_secador", "parada_mds_tiempo");
 
-                st.acc_metrica_mds_cantidad += diff_counter_safe(metrica_mds_cantidad, st.last_metrica_mds_cantidad, st.rc_metrica_mds_cantidad);
+                st.acc_metrica_mds_cantidad += diff_counter_safe(metrica_mds_cantidad, st.last_metrica_mds_cantidad, st.rc_metrica_mds_cantidad, 5000, 3, line, "salida_secador", "metrica_mds_cantidad");
 
-                st.acc_metrica_mds_tiempo_ds += diff_counter_safe(metrica_mds_tiempo, st.last_metrica_mds_tiempo, st.rc_metrica_mds_tiempo);
+                st.acc_metrica_mds_tiempo_ds += diff_counter_safe(metrica_mds_tiempo, st.last_metrica_mds_tiempo, st.rc_metrica_mds_tiempo, 5000, 3, line, "salida_secador", "metrica_mds_tiempo");
             }
 
             // Copy accumulated values to output
@@ -1283,6 +1350,12 @@ public:
             State &st = states_[line];
 
             if (!st.initialized || st.shift != shiftNum) {
+                // reseed: una vez por procesador y línea, antes de pisar el estado.
+                celima::log::state_event("reseed", line, "esmalte",
+                    st.initialized
+                        ? ("reason=shift_change shift_prev=" + std::to_string(st.shift) +
+                           " shift_new=" + std::to_string(shiftNum))
+                        : ("reason=first_message shift=" + std::to_string(shiftNum)));
                 // New shift - reset all accumulators and store initial values
                 st = State();
                 st.initialized = true;
@@ -1305,15 +1378,15 @@ public:
                 st.last_accepted_timer1Hz = timer1Hz;
 
                 // Accumulate deltas — ALL PLC registers have bit-15 flag, use diff_counter for everything
-                st.acc_timer1Hz += diff_counter_safe(timer1Hz, st.last_timer1Hz, st.rc_timer1Hz);
+                st.acc_timer1Hz += diff_counter_safe(timer1Hz, st.last_timer1Hz, st.rc_timer1Hz, 5000, 3, line, "esmalte", "timer1Hz");
 
-                st.acc_parada_esm_cantidad += diff_counter_safe(parada_esm_cantidad, st.last_parada_esm_cantidad, st.rc_parada_esm_cantidad);
+                st.acc_parada_esm_cantidad += diff_counter_safe(parada_esm_cantidad, st.last_parada_esm_cantidad, st.rc_parada_esm_cantidad, 5000, 3, line, "esmalte", "parada_esm_cantidad");
 
-                st.acc_parada_esm_tiempo_s += diff_counter_safe(parada_esm_tiempo, st.last_parada_esm_tiempo, st.rc_parada_esm_tiempo);
+                st.acc_parada_esm_tiempo_s += diff_counter_safe(parada_esm_tiempo, st.last_parada_esm_tiempo, st.rc_parada_esm_tiempo, 5000, 3, line, "esmalte", "parada_esm_tiempo");
 
-                st.acc_metrica_esm_cantidad += diff_counter_safe(metrica_esm_cantidad, st.last_metrica_esm_cantidad, st.rc_metrica_esm_cantidad);
+                st.acc_metrica_esm_cantidad += diff_counter_safe(metrica_esm_cantidad, st.last_metrica_esm_cantidad, st.rc_metrica_esm_cantidad, 5000, 3, line, "esmalte", "metrica_esm_cantidad");
 
-                st.acc_metrica_esm_tiempo_ds += diff_counter_safe(metrica_esm_tiempo, st.last_metrica_esm_tiempo, st.rc_metrica_esm_tiempo);
+                st.acc_metrica_esm_tiempo_ds += diff_counter_safe(metrica_esm_tiempo, st.last_metrica_esm_tiempo, st.rc_metrica_esm_tiempo, 5000, 3, line, "esmalte", "metrica_esm_tiempo");
             }
 
             // Copy accumulated values to output
@@ -1540,6 +1613,12 @@ public:
             State &st = states_[line];
 
             if (!st.initialized || st.shift != shiftNum) {
+                // reseed: una vez por procesador y línea, antes de pisar el estado.
+                celima::log::state_event("reseed", line, "entrada_horno",
+                    st.initialized
+                        ? ("reason=shift_change shift_prev=" + std::to_string(st.shift) +
+                           " shift_new=" + std::to_string(shiftNum))
+                        : ("reason=first_message shift=" + std::to_string(shiftNum)));
                 // New shift - reset all accumulators and store initial values
                 st = State();
                 st.initialized = true;
@@ -1567,27 +1646,27 @@ public:
                 st.last_accepted_timer1Hz = timer1Hz;
 
                 // Accumulate deltas — ALL PLC registers have bit-15 flag, use diff_counter for everything
-                uint32_t delta_timer = diff_counter_safe(timer1Hz, st.last_timer1Hz, st.rc_timer1Hz);
+                uint32_t delta_timer = diff_counter_safe(timer1Hz, st.last_timer1Hz, st.rc_timer1Hz, 5000, 3, line, "entrada_horno", "timer1Hz");
                 st.acc_timer1Hz += delta_timer;
 
-                st.acc_numero_grades += diff_counter_safe(numero_grades, st.last_numero_grades, st.rc_numero_grades);
+                st.acc_numero_grades += diff_counter_safe(numero_grades, st.last_numero_grades, st.rc_numero_grades, 5000, 3, line, "entrada_horno", "numero_grades");
 
-                st.acc_parada_mcf_cantidad += diff_counter_safe(parada_mcf_cantidad, st.last_parada_mcf_cantidad, st.rc_parada_mcf_cantidad);
+                st.acc_parada_mcf_cantidad += diff_counter_safe(parada_mcf_cantidad, st.last_parada_mcf_cantidad, st.rc_parada_mcf_cantidad, 5000, 3, line, "entrada_horno", "parada_mcf_cantidad");
 
-                st.acc_parada_mcf_tiempo_s += diff_counter_safe(parada_mcf_tiempo, st.last_parada_mcf_tiempo, st.rc_parada_mcf_tiempo);
+                st.acc_parada_mcf_tiempo_s += diff_counter_safe(parada_mcf_tiempo, st.last_parada_mcf_tiempo, st.rc_parada_mcf_tiempo, 5000, 3, line, "entrada_horno", "parada_mcf_tiempo");
 
-                uint32_t delta_mcf = diff_counter_safe(metrica_mcf_cantidad, st.last_metrica_mcf_cantidad, st.rc_metrica_mcf_cantidad);
+                uint32_t delta_mcf = diff_counter_safe(metrica_mcf_cantidad, st.last_metrica_mcf_cantidad, st.rc_metrica_mcf_cantidad, 5000, 3, line, "entrada_horno", "metrica_mcf_cantidad");
                 st.acc_metrica_mcf_cantidad += delta_mcf;
 
-                st.acc_metrica_mcf_tiempo_ds += diff_counter_safe(metrica_mcf_tiempo, st.last_metrica_mcf_tiempo, st.rc_metrica_mcf_tiempo);
+                st.acc_metrica_mcf_tiempo_ds += diff_counter_safe(metrica_mcf_tiempo, st.last_metrica_mcf_tiempo, st.rc_metrica_mcf_tiempo, 5000, 3, line, "entrada_horno", "metrica_mcf_tiempo");
 
-                st.acc_metrica_formador_cantidad += diff_counter_safe(metrica_formador_cantidad, st.last_metrica_formador_cantidad, st.rc_metrica_formador_cantidad);
+                st.acc_metrica_formador_cantidad += diff_counter_safe(metrica_formador_cantidad, st.last_metrica_formador_cantidad, st.rc_metrica_formador_cantidad, 5000, 3, line, "entrada_horno", "metrica_formador_cantidad");
 
-                st.acc_metrica_formador_tiempo_ds += diff_counter_safe(metrica_formador_tiempo, st.last_metrica_formador_tiempo, st.rc_metrica_formador_tiempo);
+                st.acc_metrica_formador_tiempo_ds += diff_counter_safe(metrica_formador_tiempo, st.last_metrica_formador_tiempo, st.rc_metrica_formador_tiempo, 5000, 3, line, "entrada_horno", "metrica_formador_tiempo");
 
-                st.acc_falha_forno_cantidad += diff_counter_safe(falha_forno_cantidad, st.last_falha_forno_cantidad, st.rc_falha_forno_cantidad);
+                st.acc_falha_forno_cantidad += diff_counter_safe(falha_forno_cantidad, st.last_falha_forno_cantidad, st.rc_falha_forno_cantidad, 5000, 3, line, "entrada_horno", "falha_forno_cantidad");
 
-                st.acc_falha_forno_tiempo_s += diff_counter_safe(falha_forno_tiempo, st.last_falha_forno_tiempo, st.rc_falha_forno_tiempo);
+                st.acc_falha_forno_tiempo_s += diff_counter_safe(falha_forno_tiempo, st.last_falha_forno_tiempo, st.rc_falha_forno_tiempo, 5000, 3, line, "entrada_horno", "falha_forno_tiempo");
 
                 // Void detection: if no units entered this interval, count elapsed time as void
                 // delta_mcf == 0 means sensor saw zero new pieces since last message
@@ -1874,6 +1953,12 @@ public:
             State &st = states_[line];
 
             if (!st.initialized || st.shift != shiftNum) {
+                // reseed: una vez por procesador y línea, antes de pisar el estado.
+                celima::log::state_event("reseed", line, "salida_horno",
+                    st.initialized
+                        ? ("reason=shift_change shift_prev=" + std::to_string(st.shift) +
+                           " shift_new=" + std::to_string(shiftNum))
+                        : ("reason=first_message shift=" + std::to_string(shiftNum)));
                 // New shift - reset all accumulators and store initial values
                 st = State();
                 st.initialized = true;
@@ -1929,39 +2014,39 @@ public:
                     spike_ema_update(st.ema_barreira1_cantidad, rd_b1c);
 
                     // Accumulate deltas — ALL PLC registers have bit-15 flag, use diff_counter for everything
-                    uint16_t delta_timer = diff_counter_safe(timer1Hz, st.last_timer1Hz, st.rc_timer1Hz);
+                    uint16_t delta_timer = diff_counter_safe(timer1Hz, st.last_timer1Hz, st.rc_timer1Hz, 5000, 3, line, "salida_horno", "timer1Hz");
                     st.acc_timer1Hz += delta_timer;
                     st.acc_tiempo_operacion_s += delta_timer;
 
-                    st.acc_paradas_cantidad += diff_counter_safe(paradas_cantidad, st.last_paradas_cantidad, st.rc_paradas_cantidad);
+                    st.acc_paradas_cantidad += diff_counter_safe(paradas_cantidad, st.last_paradas_cantidad, st.rc_paradas_cantidad, 5000, 3, line, "salida_horno", "paradas_cantidad");
 
-                    st.acc_paradas_tempo += diff_counter_safe(paradas_tempo, st.last_paradas_tempo, st.rc_paradas_tempo);
+                    st.acc_paradas_tempo += diff_counter_safe(paradas_tempo, st.last_paradas_tempo, st.rc_paradas_tempo, 5000, 3, line, "salida_horno", "paradas_tempo");
 
-                    st.acc_metrica_ciclos += diff_counter_safe(metrica_ciclos, st.last_metrica_ciclos, st.rc_metrica_ciclos);
+                    st.acc_metrica_ciclos += diff_counter_safe(metrica_ciclos, st.last_metrica_ciclos, st.rc_metrica_ciclos, 5000, 3, line, "salida_horno", "metrica_ciclos");
 
-                    st.acc_metrica_tiempo += diff_counter_safe(metrica_tiempo, st.last_metrica_tiempo, st.rc_metrica_tiempo);
+                    st.acc_metrica_tiempo += diff_counter_safe(metrica_tiempo, st.last_metrica_tiempo, st.rc_metrica_tiempo, 5000, 3, line, "salida_horno", "metrica_tiempo");
 
-                    st.acc_bancalinos_q301 += diff_counter_safe(bancalinos_q301, st.last_bancalinos_q301, st.rc_bancalinos_q301);
+                    st.acc_bancalinos_q301 += diff_counter_safe(bancalinos_q301, st.last_bancalinos_q301, st.rc_bancalinos_q301, 5000, 3, line, "salida_horno", "bancalinos_q301");
 
-                    st.acc_bancalinos_q300 += diff_counter_safe(bancalinos_q300, st.last_bancalinos_q300, st.rc_bancalinos_q300);
+                    st.acc_bancalinos_q300 += diff_counter_safe(bancalinos_q300, st.last_bancalinos_q300, st.rc_bancalinos_q300, 5000, 3, line, "salida_horno", "bancalinos_q300");
 
-                    st.acc_bancalinos_comb1 += diff_counter_safe(bancalinos_comb1, st.last_bancalinos_comb1, st.rc_bancalinos_comb1);
+                    st.acc_bancalinos_comb1 += diff_counter_safe(bancalinos_comb1, st.last_bancalinos_comb1, st.rc_bancalinos_comb1, 5000, 3, line, "salida_horno", "bancalinos_comb1");
 
-                    st.acc_bancalinos_comb2 += diff_counter_safe(bancalinos_comb2, st.last_bancalinos_comb2, st.rc_bancalinos_comb2);
+                    st.acc_bancalinos_comb2 += diff_counter_safe(bancalinos_comb2, st.last_bancalinos_comb2, st.rc_bancalinos_comb2, 5000, 3, line, "salida_horno", "bancalinos_comb2");
 
-                    st.acc_bancalinos_total += diff_counter_safe(bancalinos_total, st.last_bancalinos_total, st.rc_bancalinos_total);
+                    st.acc_bancalinos_total += diff_counter_safe(bancalinos_total, st.last_bancalinos_total, st.rc_bancalinos_total, 5000, 3, line, "salida_horno", "bancalinos_total");
 
-                    st.acc_parada_escolha_cantidad += diff_counter_safe(parada_escolha_cantidad, st.last_parada_escolha_cantidad, st.rc_parada_escolha_cantidad);
+                    st.acc_parada_escolha_cantidad += diff_counter_safe(parada_escolha_cantidad, st.last_parada_escolha_cantidad, st.rc_parada_escolha_cantidad, 5000, 3, line, "salida_horno", "parada_escolha_cantidad");
 
-                    st.acc_parada_escolha_tempo += diff_counter_safe(parada_escolha_tempo, st.last_parada_escolha_tempo, st.rc_parada_escolha_tempo);
+                    st.acc_parada_escolha_tempo += diff_counter_safe(parada_escolha_tempo, st.last_parada_escolha_tempo, st.rc_parada_escolha_tempo, 5000, 3, line, "salida_horno", "parada_escolha_tempo");
 
-                    st.acc_sentido_escolha_cantidad += diff_counter_safe(sentido_escolha_cantidad, st.last_sentido_escolha_cantidad, st.rc_sentido_escolha_cantidad);
+                    st.acc_sentido_escolha_cantidad += diff_counter_safe(sentido_escolha_cantidad, st.last_sentido_escolha_cantidad, st.rc_sentido_escolha_cantidad, 5000, 3, line, "salida_horno", "sentido_escolha_cantidad");
 
-                    st.acc_sentido_escolha_tiempo += diff_counter_safe(sentido_escolha_tiempo, st.last_sentido_escolha_tiempo, st.rc_sentido_escolha_tiempo);
+                    st.acc_sentido_escolha_tiempo += diff_counter_safe(sentido_escolha_tiempo, st.last_sentido_escolha_tiempo, st.rc_sentido_escolha_tiempo, 5000, 3, line, "salida_horno", "sentido_escolha_tiempo");
 
-                    st.acc_barreira1_cantidad += diff_counter_safe(barreira1_cantidad, st.last_barreira1_cantidad, st.rc_barreira1_cantidad);
+                    st.acc_barreira1_cantidad += diff_counter_safe(barreira1_cantidad, st.last_barreira1_cantidad, st.rc_barreira1_cantidad, 5000, 3, line, "salida_horno", "barreira1_cantidad");
 
-                    st.acc_barreira1_tiempo += diff_counter_safe(barreira1_tiempo, st.last_barreira1_tiempo, st.rc_barreira1_tiempo);
+                    st.acc_barreira1_tiempo += diff_counter_safe(barreira1_tiempo, st.last_barreira1_tiempo, st.rc_barreira1_tiempo, 5000, 3, line, "salida_horno", "barreira1_tiempo");
                 }
             }
 

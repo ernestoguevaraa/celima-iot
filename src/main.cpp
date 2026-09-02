@@ -13,6 +13,12 @@ static std::string env_or(const char* key, const char* defv) {
 }
 
 int main(int argc, char** argv) {
+    // Flush tras cada inserción. Bajo systemd stdout es un pipe, así que libc
+    // usa buffer de bloque de 4 KB: los logs llegaban al journal en ráfagas con
+    // hasta 36 s de retraso y se perdían hasta 4 KB en cada parada dura.
+    // std::unitbuf no depende de sync_with_stdio ni del _IOLBF de glibc.
+    std::cout << std::unitbuf;
+
     std::signal(SIGINT, handle_sigint);
     std::signal(SIGTERM, handle_sigint);
 
