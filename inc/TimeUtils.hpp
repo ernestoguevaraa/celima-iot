@@ -43,17 +43,21 @@ inline std::string iso8601_utc_now()
 // gatewayTime del UG65 viene con resolución de segundos -> se emite ".000Z".
 // Si trae fracciones, se preservan los primeros 3 dígitos (ms).
 // ---------------------------------------------------------------------------
-inline std::optional<std::string> gateway_time_to_iso8601_utc(const std::string& gw)
+// Parseo común de gatewayTime: devuelve la época UTC en segundos y la parte
+// fraccionaria en ms. Lo usan gateway_time_to_iso8601_utc() (para el campo
+// publicado) y device_epoch_s() (para medir huecos). Un solo parser para que
+// las dos lecturas no puedan divergir.
+inline bool parse_gateway_time(const std::string& gw, std::time_t& epoch_s, int& frac_ms)
 {
-    if (gw.size() < 19) return std::nullopt;   // mínimo "YYYY-MM-DDTHH:MM:SS"
+    if (gw.size() < 19) return false;          // mínimo "YYYY-MM-DDTHH:MM:SS"
 
     int year, mon, day, hour, min, sec;
     if (std::sscanf(gw.c_str(), "%d-%d-%dT%d:%d:%d",
                     &year, &mon, &day, &hour, &min, &sec) != 6)
-        return std::nullopt;
+        return false;
 
     size_t pos = 19;
-    int frac_ms = 0;
+    frac_ms = 0;
     if (pos < gw.size() && gw[pos] == '.') {
         size_t fstart = pos + 1, fend = fstart;
         while (fend < gw.size() && std::isdigit((unsigned char)gw[fend])) ++fend;
@@ -73,9 +77,9 @@ inline std::optional<std::string> gateway_time_to_iso8601_utc(const std::string&
             if (std::sscanf(gw.c_str() + pos + 1, "%d:%d", &oh, &om) >= 1)
                 off_sec = (oh * 3600 + om * 60) * (c == '-' ? -1 : 1);
             else
-                return std::nullopt;
+                return false;
         } else {
-            return std::nullopt;
+            return false;
         }
     }
 
@@ -89,7 +93,36 @@ inline std::optional<std::string> gateway_time_to_iso8601_utc(const std::string&
 #else
     std::time_t local_as_utc = timegm(&tm);
 #endif
-    std::time_t real_utc = local_as_utc - off_sec;
+    epoch_s = local_as_utc - off_sec;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Época UTC en segundos del gatewayTime del mensaje.
+//
+// Devuelve nullopt si el campo falta o no parsea, y en ese caso NO cae a la
+// hora del servidor: sin timestamp de dispositivo fiable el hueco no es
+// medible, y un delta sin cota medible debe tratarse como implausible.
+// Es deliberadamente distinto de device_timestamp(), que sí tiene fallback
+// porque solo alimenta el campo publicado. No unifiques los dos.
+inline std::optional<int64_t> device_epoch_s(const nlohmann::json& msg)
+{
+    if (!msg.contains("gatewayTime") || !msg["gatewayTime"].is_string())
+        return std::nullopt;
+
+    std::time_t epoch = 0;
+    int frac_ms = 0;
+    if (!parse_gateway_time(msg.value("gatewayTime", std::string{}), epoch, frac_ms))
+        return std::nullopt;
+    return static_cast<int64_t>(epoch);
+}
+
+inline std::optional<std::string> gateway_time_to_iso8601_utc(const std::string& gw)
+{
+    std::time_t real_utc = 0;
+    int frac_ms = 0;
+    if (!parse_gateway_time(gw, real_utc, frac_ms))
+        return std::nullopt;
 
     std::tm out{};
 #if defined(_WIN32)

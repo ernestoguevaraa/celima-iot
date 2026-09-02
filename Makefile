@@ -25,7 +25,7 @@ else
 endif
 
 # Link
-LDFLAGS := -lpaho-mqttpp3 -lpaho-mqtt3a -pthread $(SANFLAGS)
+LDFLAGS := -lpaho-mqttpp3 -lpaho-mqtt3a -lsqlite3 -pthread $(SANFLAGS)
 
 # Sources / objects
 SRC      := $(wildcard src/*.cpp)
@@ -70,13 +70,14 @@ build/Debug/%.o: src/%.cpp
 # runtime. doctest está vendorizado en tests/doctest.h (MIT, un header).
 # src/main.cpp queda fuera: tiene su propio main().
 TEST_SRC     := $(wildcard tests/*.cpp)
-TEST_APP_SRC := src/MessageProcessor.cpp src/JsonUtils.cpp src/DeviceTypes.cpp
+TEST_APP_SRC := src/MessageProcessor.cpp src/JsonUtils.cpp src/DeviceTypes.cpp \
+                src/RateConfig.cpp src/StateStore.cpp src/SqliteStateStore.cpp
 TEST_BIN     := bin/tests
 
 test: $(TEST_SRC) $(TEST_APP_SRC) $(wildcard tests/*.hpp)
 	@mkdir -p bin
 	$(CXX) $(CXXSTD) $(WARN) $(INC) -Itests -O0 -g $(SANFLAGS) \
-	    $(TEST_SRC) $(TEST_APP_SRC) -pthread -o $(TEST_BIN)
+	    $(TEST_SRC) $(TEST_APP_SRC) -lsqlite3 -pthread -o $(TEST_BIN)
 	./$(TEST_BIN)
 
 # --- Utilities ---

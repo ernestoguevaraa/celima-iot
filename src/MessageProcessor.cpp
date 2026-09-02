@@ -1,25 +1,63 @@
 #include "MessageProcessor.hpp"
 #include "JsonUtils.hpp"
 #include "Logging.hpp"
+#include "RateConfig.hpp"
+#include "StateStore.hpp"
 #include "Shift.hpp"
 #include "TimeUtils.hpp"
 #include <memory>
 #include <sstream>
 #include <mutex>
+#include <set>
 #include <atomic>
+#include <cstdlib>
 #include <iostream>
 using json = nlohmann::json;
 
 static std::atomic<int> g_last_global_shift { -1 };
 
+// Claves cuyo estado persistido ya se consultó en ESTE proceso.
+//
+// No puede vivir en el State: reset_all_processor_states() lo borra en cada
+// cambio de turno, y entonces cada clave releería el disco y reportaría un
+// "shift_change_across_restart" donde solo hubo un cambio de turno normal.
+// Restaurar es un evento de arranque, no de turno.
+static std::mutex g_restored_mtx;
+static std::set<std::string> g_restored_keys;
+
+static bool mark_restore_attempted(const char* proc, int line)
+{
+    std::lock_guard<std::mutex> lock(g_restored_mtx);
+    return g_restored_keys.insert(std::string(proc) + "/" + std::to_string(line)).second;
+}
+
+void reset_global_shift_state()
+{
+    g_last_global_shift.store(-1, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(g_restored_mtx);
+    g_restored_keys.clear();
+}
+
 bool detect_global_shift_change(int currentShift)
 {
-    int prev = g_last_global_shift.load(std::memory_order_relaxed);
+    int prev = g_last_global_shift.exchange(currentShift, std::memory_order_relaxed);
     if (prev == currentShift)
         return false;
 
-    // First run or shift change
-    g_last_global_shift.store(currentShift, std::memory_order_relaxed);
+    // Primer mensaje tras arrancar: NO es un cambio de turno.
+    //
+    // Antes se devolvía true, y el reset_all_processor_states() que provoca
+    // borraba el estado que la persistencia acaba de restaurar — sin fallar
+    // ninguna prueba que no lo buscara a propósito. El cambio de turno a
+    // través de un reinicio lo detecta cada clave por su cuenta, comparando el
+    // turno guardado con el actual (caso 2 de la restauración), que además es
+    // más preciso que un reset global.
+    if (prev == -1) {
+        celima::log::state_event("shift_first_observed", -1, "global",
+            "shift=" + std::to_string(currentShift));
+        return false;
+    }
+
     celima::log::state_event("shift_change_global", -1, "global",
         "shift_prev=" + std::to_string(prev) +
         " shift_new=" + std::to_string(currentShift));
@@ -31,16 +69,9 @@ bool detect_global_shift_change(int currentShift)
 // 15-bit rollover (32768). With the corrected firmware, counters are full
 // uint16_t — no masking, rollover at 65536.
 // Example: prev=65530, curr=12 → delta=(uint16_t)(12-65530)=18  ✓
-static uint16_t diff_counter(uint16_t curr, uint16_t prev, uint16_t max_valid = 5000) {
-    // Full 16-bit unsigned subtraction handles rollover at 65536 automatically.
-    uint16_t delta = static_cast<uint16_t>(curr - prev);
-
-    if (delta > max_valid) {
-        return 0;  // Implausible jump — likely counter reset or corruption
-    }
-
-    return delta;
-}
+//
+// El antiguo diff_counter(curr, prev, max_valid) desapareció: su techo fijo es
+// justo el defecto D2. Toda la aritmética pasa ahora por diff_counter_scaled().
 
 // FIX: Safe wrapper that only updates 'last' when delta is valid.
 // When LoRa devices intermittently send data from alternate PLC register banks,
@@ -54,6 +85,255 @@ static uint16_t diff_counter(uint16_t curr, uint16_t prev, uint16_t max_valid = 
 // This prevents permanent lockout where a single corrupted reading poisons
 // prev_ref into a range that makes ALL subsequent valid readings appear as
 // huge deltas (via 16-bit wraparound), freezing the accumulator forever.
+// ---------------------------------------------------------------------------
+// Cota de plausibilidad escalada por tiempo (D2).
+//
+// El techo fijo de 5000 se agota en ~3,9 h de producción a la tasa medida de L1
+// prensa, así que cualquier hueco mayor descartaba la recuperación legítima.
+// Aquí la cota depende del hueco: rate_max_per_s * elapsed_s * margin.
+//
+// Regla de los empates: ante la duda, subcontar. Un total bajo se investiga;
+// uno inflado se reporta como producción real y nadie lo cuestiona.
+DeltaResult diff_counter_scaled(uint16_t curr, uint16_t prev, const CounterCtx &ctx)
+{
+    DeltaResult r;
+    r.value = static_cast<uint16_t>(curr - prev);   // misma resta sin máscara que siempre
+
+    // El contador no se movió: no hay nada que acotar.
+    if (r.value == 0) {
+        r.plausible = true;
+        return r;
+    }
+
+    // 1) Sin hueco medible no hay cota posible. Cubre el reloj hacia atrás y
+    //    los timestamps duplicados. No se "arregla" un tiempo negativo.
+    if (ctx.elapsed_s <= 0.0) {
+        r.reason = "no_elapsed";
+        return r;
+    }
+
+    // 2) Configuración de tasa ausente o absurda: subcontar es el lado seguro.
+    if (ctx.rate_max_per_s <= 0.0) {
+        r.reason = "no_rate";
+        return r;
+    }
+
+    const double scaled = ctx.rate_max_per_s * ctx.elapsed_s * ctx.margin;
+
+    // 3) Límite duro: si la cota alcanza el módulo, el contador pudo dar más de
+    //    una vuelta y el delta es ambiguo por construcción. Sin más aritmética.
+    if (scaled >= 65536.0) {
+        r.max_plausible = scaled;
+        r.reason = "ambiguous_module";
+        return r;
+    }
+
+    // 4) max_valid se conserva como techo mínimo: la cota escalada solo puede
+    //    ser más permisiva que la de hoy, nunca más estricta. Así el camino
+    //    normal —intervalos de ~180 s— se comporta exactamente igual que antes.
+    r.max_plausible = std::max(scaled, static_cast<double>(ctx.max_valid));
+    r.plausible = (static_cast<double>(r.value) <= r.max_plausible);
+    if (!r.plausible)
+        r.reason = "over_bound";
+    return r;
+}
+
+// ---------------------------------------------------------------------------
+// Persistencia por (procesador, línea): restauración al primer mensaje y
+// guardado tras cada mensaje procesado.
+//
+// La persistencia no puede ser una causa de caída nueva: sin store configurado
+// (o con CELIMA_STATE_PERSISTENCE=0) todo esto es un no-op y el servicio se
+// comporta como antes de PR 2.
+
+// Devuelve los segundos de turno no observados que aporta este arranque, 0 si
+// el hueco fue corto o no hay nada restaurado.
+template <typename StateT>
+static int64_t restore_state_if_needed(StateT &st, const char* proc, int line,
+                                       int shiftNum,
+                                       const std::optional<int64_t>& dev_epoch)
+{
+    if (!mark_restore_attempted(proc, line)) return 0;
+
+    celima::IStateStore* store = celima::state_store();
+    if (!store) return 0;
+
+    celima::StoredState stored;
+    if (!store->load(proc, line, stored)) return 0;   // caso 1: sin estado guardado
+
+    if (stored.shift != shiftNum) {
+        // Caso 2: el turno cambió mientras el proceso no estaba. Acumuladores a
+        // cero y sin arrastre — parte del turno transcurrió sin que nadie
+        // escuchara, y ese delta no pertenece al turno nuevo. El estado queda
+        // sin inicializar a propósito: lo siembra la rama normal con esta trama.
+        celima::log::state_event("reseed", line, proc,
+            "reason=shift_change_across_restart shift_prev=" + std::to_string(stored.shift) +
+            " shift_new=" + std::to_string(shiftNum));
+        st.suppress_reseed_log = true;    // no duplicar la traza de la rama normal
+        int64_t gap = 0;
+        if (dev_epoch && stored.updated_at > 0)
+            gap = *dev_epoch - stored.updated_at;
+        return gap > 0 ? gap : 0;
+    }
+
+    // Casos 3 y 4: mismo turno. Se restaura TODO, incluido el tracking del raw
+    // —sin él no hay contra qué diferenciar—, y es la cota escalada la que
+    // decide qué hacer con el primer delta. La diferencia entre hueco corto y
+    // largo es la traza y los segundos no observados, no la aritmética.
+    st.from_json(stored.state);
+    st.initialized = true;
+    st.shift = shiftNum;
+
+    int64_t gap = 0;
+    if (dev_epoch && stored.updated_at > 0)
+        gap = *dev_epoch - stored.updated_at;
+
+    if (gap > celima::gap_short_seconds()) {
+        celima::log::state_event("gap", line, proc,
+            "reason=restart elapsed_s=" + std::to_string(gap) +
+            " shift=" + std::to_string(shiftNum));
+        return gap;
+    }
+    celima::log::state_event("restored", line, proc,
+        "elapsed_s=" + std::to_string(gap) + " shift=" + std::to_string(shiftNum));
+    return 0;
+}
+
+// Calidad guarda dos structs bajo la misma clave: RawTrack, que persiste a
+// través de los cambios de turno, y ShiftAcc, que se resetea con ellos.
+template <typename RawT, typename AccT>
+static void persist_calidad_state(const RawT &rt, const AccT &sa, int line, int shift)
+{
+    celima::IStateStore* store = celima::state_store();
+    if (!store) return;
+    nlohmann::json j;
+    j["v"]   = celima::kStateSchemaVersion;
+    j["raw"] = rt.to_json();
+    j["acc"] = sa.to_json();
+    const int64_t updated_at = (rt.last_accepted_epoch_s > 0)
+                                 ? rt.last_accepted_epoch_s
+                                 : static_cast<int64_t>(std::time(nullptr));
+    store->save("calidad", line, shift, updated_at, j);
+}
+
+// Devuelve los segundos no observados que aporta este arranque.
+template <typename RawT, typename AccT>
+static int64_t restore_calidad_state(RawT &rt, AccT &sa, int line, int shift,
+                                     const std::optional<int64_t>& dev_epoch)
+{
+    if (!mark_restore_attempted("calidad", line)) return 0;
+
+    celima::IStateStore* store = celima::state_store();
+    if (!store) return 0;
+
+    celima::StoredState stored;
+    if (!store->load("calidad", line, stored)) return 0;
+    if (!stored.state.contains("raw") || !stored.state.contains("acc")) return 0;
+
+    // El tracking del raw se restaura siempre: no depende del turno.
+    rt.from_json(stored.state["raw"]);
+
+    int64_t gap = 0;
+    if (dev_epoch && stored.updated_at > 0)
+        gap = *dev_epoch - stored.updated_at;
+
+    if (stored.shift != shift) {
+        // Caso 2: el turno cambió con el proceso caído. Acumulador a cero, sin
+        // arrastre; la rama normal lo inicializa con esta trama.
+        celima::log::state_event("reseed", line, "calidad",
+            "reason=shift_change_across_restart shift_prev=" + std::to_string(stored.shift) +
+            " shift_new=" + std::to_string(shift));
+        sa.suppress_reseed_log = true;
+        return gap > 0 ? gap : 0;
+    }
+
+    sa.from_json(stored.state["acc"]);
+    sa.initialized = true;
+    sa.shift = shift;
+
+    if (gap > celima::gap_short_seconds()) {
+        celima::log::state_event("gap", line, "calidad",
+            "reason=restart elapsed_s=" + std::to_string(gap) +
+            " shift=" + std::to_string(shift));
+        return gap;
+    }
+    celima::log::state_event("restored", line, "calidad",
+        "elapsed_s=" + std::to_string(gap) + " shift=" + std::to_string(shift));
+    return 0;
+}
+
+template <typename StateT>
+static void persist_state(const StateT &st, const char* proc, int line, int shiftNum)
+{
+    celima::IStateStore* store = celima::state_store();
+    if (!store) return;
+    const int64_t updated_at = (st.last_accepted_epoch_s > 0)
+                                 ? st.last_accepted_epoch_s
+                                 : static_cast<int64_t>(std::time(nullptr));
+    store->save(proc, line, shiftNum, updated_at, st.to_json());
+}
+
+// ---------------------------------------------------------------------------
+// Marcador de turno incompleto (apartado G del PR 2).
+//
+// SUJETO A UNA DECISIÓN ABIERTA: no se sabe si el boxer-patrol-edge-processor
+// propaga campos desconocidos hacia InfluxDB y AWS o los descarta. Un marcador
+// que se pierde en el siguiente salto no sirve de nada, y un campo nuevo en el
+// payload no se puede retirar de lo ya enviado.
+//
+// Por eso queda tras CELIMA_INCOMPLETE_SHIFT_MARKER=1: la contabilidad de
+// segundos no observados se lleva siempre (y se ve en los eventos [STATE] gap),
+// pero el campo solo se publica cuando alguien lo activa a conciencia.
+// Añadir un campo nuevo es seguro; redefinir uno existente, no.
+static bool g_marker_override_set = false;
+static bool g_marker_override = false;
+
+void set_incomplete_shift_marker_for_tests(bool on)
+{
+    g_marker_override_set = true;
+    g_marker_override = on;
+}
+
+void clear_incomplete_shift_marker_override()
+{
+    g_marker_override_set = false;
+}
+
+static bool publish_incomplete_shift_marker()
+{
+    if (g_marker_override_set) return g_marker_override;
+    static const bool on = [] {
+        const char* v = std::getenv("CELIMA_INCOMPLETE_SHIFT_MARKER");
+        return v && v[0] == '1';
+    }();
+    return on;
+}
+
+static void add_unobserved_marker(nlohmann::json &prod, int64_t unobserved_s)
+{
+    if (publish_incomplete_shift_marker())
+        prod["turno_segundos_no_observados"] = unobserved_s;
+}
+
+uint32_t safe_delta_u16(uint16_t prev, uint16_t curr, const CounterCtx &ctx)
+{
+    const DeltaResult r = diff_counter_scaled(curr, prev, ctx);
+    if (r.plausible)
+        return r.value;
+    if (r.value == 0)
+        return 0;
+
+    celima::log::state_event("delta_rejected", ctx.line, ctx.proc,
+        "field=" + std::string(ctx.field) +
+        " prev=" + std::to_string(prev) +
+        " curr=" + std::to_string(curr) +
+        " raw_delta=" + std::to_string(r.value) +
+        " max_plausible=" + std::to_string(r.max_plausible) +
+        " elapsed_s=" + std::to_string(static_cast<int64_t>(ctx.elapsed_s)) +
+        " reason=" + r.reason);
+    return 0;
+}
+
 //
 // Observabilidad: los parámetros line/proc/field solo etiquetan los eventos
 // [STATE]; no intervienen en la aritmética. Tienen valor por defecto para que
@@ -61,44 +341,40 @@ static uint16_t diff_counter(uint16_t curr, uint16_t prev, uint16_t max_valid = 
 // "line=-1 proc=? field=?" en lugar de perderse en silencio.
 static uint16_t diff_counter_safe(uint16_t curr, uint16_t &prev_ref,
                                    uint8_t &reject_count,
-                                   uint16_t max_valid = 5000,
-                                   uint8_t max_rejects = 3,
-                                   int line = -1,
-                                   const char* proc = "?",
-                                   const char* field = "?") {
-    uint16_t d = diff_counter(curr, prev_ref, max_valid);
-    if (d > 0) {
+                                   const CounterCtx &ctx) {
+    const DeltaResult r = diff_counter_scaled(curr, prev_ref, ctx);
+    if (r.plausible) {
         prev_ref = curr;
         reject_count = 0;
-        return d;
+        return r.value;
     }
-    // d == 0: either genuinely unchanged, or rejected by max_valid check
-    // Distinguish: compute raw delta to see if it was a rejection.
-    // Same unsigned-wrap arithmetic as diff_counter — no bit masking needed.
-    uint16_t raw_delta = static_cast<uint16_t>(curr - prev_ref);
-    if (raw_delta > max_valid) {
-        // This was a rejection, not a genuine zero
-        const uint16_t prev_before = prev_ref;
-        reject_count++;
-        celima::log::state_event("delta_rejected", line, proc,
-            "field=" + std::string(field) +
+
+    // Implausible: puede ser un cero genuino (el contador no se movió) o un
+    // rechazo de la cota. Solo el rechazo cuenta para el re-anclaje.
+    if (r.value == 0)
+        return 0;
+
+    const uint16_t prev_before = prev_ref;
+    reject_count++;
+    celima::log::state_event("delta_rejected", ctx.line, ctx.proc,
+        "field=" + std::string(ctx.field) +
+        " prev=" + std::to_string(prev_before) +
+        " curr=" + std::to_string(curr) +
+        " raw_delta=" + std::to_string(r.value) +
+        " max_plausible=" + std::to_string(r.max_plausible) +
+        " elapsed_s=" + std::to_string(static_cast<int64_t>(ctx.elapsed_s)) +
+        " reason=" + r.reason +
+        " reject_count=" + std::to_string(static_cast<int>(reject_count)));
+    if (reject_count >= ctx.max_rejects) {
+        // Stale recovery: prev_ref is stuck in an unrecoverable range.
+        // Force-reset so next message can compute a valid delta.
+        prev_ref = curr;
+        reject_count = 0;
+        celima::log::state_event("reanchor", ctx.line, ctx.proc,
+            "field=" + std::string(ctx.field) +
             " prev=" + std::to_string(prev_before) +
-            " curr=" + std::to_string(curr) +
-            " raw_delta=" + std::to_string(raw_delta) +
-            " max_valid=" + std::to_string(max_valid) +
-            " reject_count=" + std::to_string(static_cast<int>(reject_count)));
-        if (reject_count >= max_rejects) {
-            // Stale recovery: prev_ref is stuck in an unrecoverable range.
-            // Force-reset so next message can compute a valid delta.
-            prev_ref = curr;
-            reject_count = 0;
-            celima::log::state_event("reanchor", line, proc,
-                "field=" + std::string(field) +
-                " prev=" + std::to_string(prev_before) +
-                " curr=" + std::to_string(curr));
-        }
+            " curr=" + std::to_string(curr));
     }
-    // else: raw_delta == 0, genuinely no change -- don't increment reject_count
     return 0;
 }
 
@@ -216,12 +492,79 @@ class CalidadProcessor final : public IMessageProcessor {
     struct RawTrack {
         uint16_t last_q1 = 0, last_q2 = 0, last_q6 = 0, last_broken = 0;
         bool baseline_set = false;
+        // Época del último mensaje ACEPTADO, para medir el hueco (D2).
+        // Semántica y unidad distintas a last_accepted_time (dedup): no reutilizar.
+        int64_t last_accepted_epoch_s = 0;
         std::string last_gateway_time;
+
+        // Segundos del turno en curso que nadie observó (huecos por reinicio).
+        int64_t acc_unobserved_s = 0;
+        // Traza de re-siembra ya emitida por la restauración. No se serializa.
+        bool suppress_reseed_log = false;
+
+        // Serialización generada a partir de los miembros del struct: se
+        // persisten TODOS (acumuladores, tracking de raw, contadores de
+        // rechazo, EMA y estado de deduplicación), no solo los acc_*.
+        nlohmann::json to_json() const {
+            nlohmann::json j;
+            j["v"] = celima::kStateSchemaVersion;
+            j["acc_unobserved_s"] = acc_unobserved_s;
+            j["last_q1"] = last_q1;
+            j["last_q2"] = last_q2;
+            j["last_q6"] = last_q6;
+            j["last_broken"] = last_broken;
+            j["baseline_set"] = baseline_set;
+            j["last_accepted_epoch_s"] = last_accepted_epoch_s;
+            j["last_gateway_time"] = last_gateway_time;
+            return j;
+        }
+
+        void from_json(const nlohmann::json &j) {
+            acc_unobserved_s = j.value("acc_unobserved_s", acc_unobserved_s);
+            last_q1 = j.value("last_q1", last_q1);
+            last_q2 = j.value("last_q2", last_q2);
+            last_q6 = j.value("last_q6", last_q6);
+            last_broken = j.value("last_broken", last_broken);
+            baseline_set = j.value("baseline_set", baseline_set);
+            last_accepted_epoch_s = j.value("last_accepted_epoch_s", last_accepted_epoch_s);
+            last_gateway_time = j.value("last_gateway_time", last_gateway_time);
+        }
     };
     struct ShiftAcc {
         uint64_t q1 = 0, q2 = 0, q6 = 0, discarded = 0;
         int shift = -1;
         bool initialized = false;
+
+        // Segundos del turno en curso que nadie observó (huecos por reinicio).
+        int64_t acc_unobserved_s = 0;
+        // Traza de re-siembra ya emitida por la restauración. No se serializa.
+        bool suppress_reseed_log = false;
+
+        // Serialización generada a partir de los miembros del struct: se
+        // persisten TODOS (acumuladores, tracking de raw, contadores de
+        // rechazo, EMA y estado de deduplicación), no solo los acc_*.
+        nlohmann::json to_json() const {
+            nlohmann::json j;
+            j["v"] = celima::kStateSchemaVersion;
+            j["acc_unobserved_s"] = acc_unobserved_s;
+            j["q1"] = q1;
+            j["q2"] = q2;
+            j["q6"] = q6;
+            j["discarded"] = discarded;
+            j["shift"] = shift;
+            j["initialized"] = initialized;
+            return j;
+        }
+
+        void from_json(const nlohmann::json &j) {
+            acc_unobserved_s = j.value("acc_unobserved_s", acc_unobserved_s);
+            q1 = j.value("q1", q1);
+            q2 = j.value("q2", q2);
+            q6 = j.value("q6", q6);
+            discarded = j.value("discarded", discarded);
+            shift = j.value("shift", shift);
+            initialized = j.value("initialized", initialized);
+        }
     };
 
     static std::mutex mtx_;
@@ -236,6 +579,8 @@ public:
                                      int shift_mode = 3) override {
         const int shift_now = static_cast<int>(current_shift_localtime(shift_mode));
         const int line_id   = msg.value("lineID", 0);
+        const auto dev_epoch = device_epoch_s(msg);
+        int64_t unobserved_s = 0;   // segundos del turno sin observar
         const std::string gw_time = msg.value("gatewayTime", std::string{});
 
         // ---- Extraer valores del payload ----
@@ -274,6 +619,12 @@ public:
             auto& rt = raw_[line_id];
             auto& sa = states_[line_id];
 
+            // Restauración del estado persistido, una vez por clave y arranque.
+            const int64_t restart_gap_s =
+                restore_calidad_state(rt, sa, line_id, shift_now, dev_epoch);
+            if (restart_gap_s > 0 && sa.initialized)
+                sa.acc_unobserved_s += restart_gap_s;   // caso 4: hueco dentro del turno
+
             if (is_monotonic) {
                 // ---- 1) Dedup por gatewayTime + raw identico ----
                 if (!gw_time.empty() &&
@@ -289,12 +640,16 @@ public:
                 // ---- 2) Reset del acumulador SOLO en cambio de turno ----
                 if (!sa.initialized || sa.shift != shift_now) {
                     // reseed: una vez por procesador y línea, antes de pisar el estado.
-                    celima::log::state_event("reseed", line_id, "calidad",
-                        sa.initialized
-                            ? ("reason=shift_change shift_prev=" + std::to_string(sa.shift) +
-                               " shift_new=" + std::to_string(shift_now))
-                            : ("reason=first_message shift=" + std::to_string(shift_now)));
+                    // suppress_reseed_log lo pone la restauración cuando ya emitió la
+                    // traza del cambio de turno a través del reinicio.
+                    if (!sa.suppress_reseed_log)
+                        celima::log::state_event("reseed", line_id, "calidad",
+                            sa.initialized
+                                ? ("reason=shift_change shift_prev=" + std::to_string(sa.shift) +
+                                   " shift_new=" + std::to_string(shift_now))
+                                : ("reason=first_message shift=" + std::to_string(shift_now)));
                     sa = ShiftAcc();
+                    sa.acc_unobserved_s = restart_gap_s;
                     sa.initialized = true;
                     sa.shift = shift_now;
                 }
@@ -305,6 +660,7 @@ public:
                     rt.last_q6 = raw_q6; rt.last_broken = raw_broken;
                     rt.baseline_set = true;
                     rt.last_gateway_time = gw_time;
+                    if (dev_epoch) rt.last_accepted_epoch_s = *dev_epoch;
                     // Re-ancla del tracking del raw: no es el acumulador de turno,
                     // pero descarta el delta de este mensaje y por eso deja rastro.
                     celima::log::state_event("reanchor", line_id, "calidad",
@@ -318,15 +674,26 @@ public:
                 }
 
                 // ---- 4) Delta normal via safe_delta_u16 (rollover-safe) ----
-                uint32_t d_q1 = safe_delta_u16(rt.last_q1, raw_q1, MAXR_BOXES);
-                uint32_t d_q2 = safe_delta_u16(rt.last_q2, raw_q2, MAXR_BOXES);
-                uint32_t d_q6 = safe_delta_u16(rt.last_q6, raw_q6, MAXR_BOXES);
-                uint32_t d_br = safe_delta_u16(rt.last_broken, raw_broken, MAXR_BROKEN);
+                // Cota escalada por tiempo: los MAXR_* quedan como techo mínimo.
+                CounterCtx ctx{};
+                ctx.line = line_id;
+                ctx.proc = "calidad";
+                ctx.rate_max_per_s = celima::rates().rate_per_s(line_id, ctx.proc);
+                ctx.margin         = celima::rates().margin();
+                if (dev_epoch && rt.last_accepted_epoch_s > 0)
+                    ctx.elapsed_s = static_cast<double>(*dev_epoch - rt.last_accepted_epoch_s);
+
+                uint32_t d_q1 = safe_delta_u16(rt.last_q1, raw_q1, ctx.with("boxesQ1", MAXR_BOXES));
+                uint32_t d_q2 = safe_delta_u16(rt.last_q2, raw_q2, ctx.with("boxesQ2", MAXR_BOXES));
+                uint32_t d_q6 = safe_delta_u16(rt.last_q6, raw_q6, ctx.with("boxesQ6", MAXR_BOXES));
+                uint32_t d_br = safe_delta_u16(rt.last_broken, raw_broken,
+                                               ctx.with("totalBroken", MAXR_BROKEN));
 
                 // ---- 5) Actualizar tracking del raw (persiste turnos) ----
                 rt.last_q1 = raw_q1; rt.last_q2 = raw_q2;
                 rt.last_q6 = raw_q6; rt.last_broken = raw_broken;
                 rt.last_gateway_time = gw_time;
+                if (dev_epoch) rt.last_accepted_epoch_s = *dev_epoch;
 
                 // ---- 6) Sumar deltas al acumulador del turno ----
                 sa.q1 += d_q1; sa.q2 += d_q2; sa.q6 += d_q6; sa.discarded += d_br;
@@ -335,12 +702,16 @@ public:
                 // FORMATO VIEJO: delta directo. Solo reset por turno.
                 if (!sa.initialized || sa.shift != shift_now) {
                     // reseed: una vez por procesador y línea, antes de pisar el estado.
-                    celima::log::state_event("reseed", line_id, "calidad",
-                        sa.initialized
-                            ? ("reason=shift_change shift_prev=" + std::to_string(sa.shift) +
-                               " shift_new=" + std::to_string(shift_now))
-                            : ("reason=first_message shift=" + std::to_string(shift_now)));
+                    // suppress_reseed_log lo pone la restauración cuando ya emitió la
+                    // traza del cambio de turno a través del reinicio.
+                    if (!sa.suppress_reseed_log)
+                        celima::log::state_event("reseed", line_id, "calidad",
+                            sa.initialized
+                                ? ("reason=shift_change shift_prev=" + std::to_string(sa.shift) +
+                                   " shift_new=" + std::to_string(shift_now))
+                                : ("reason=first_message shift=" + std::to_string(shift_now)));
                     sa = ShiftAcc();
+                    sa.acc_unobserved_s = restart_gap_s;
                     sa.initialized = true;
                     sa.shift = shift_now;
                 }
@@ -349,6 +720,12 @@ public:
             }
 
             q1 = sa.q1; q2 = sa.q2; q6 = sa.q6; disc = sa.discarded;
+            unobserved_s = sa.acc_unobserved_s;
+
+            // Guardar tras procesar el mensaje, dentro del mismo mutex que
+            // protege el estado. Calidad guarda sus dos structs bajo la misma
+            // clave: RawTrack (persiste turnos) y ShiftAcc (se resetea).
+            persist_calidad_state(rt, sa, line_id, shift_now);
         }
 
         // ---- Salida (formato sin cambios) ----
@@ -361,6 +738,7 @@ public:
         out["extra_c2"]   = q2;
         out["comercial"]  = q6;
         out["quebrados"]  = disc;
+        add_unobserved_marker(out, unobserved_s);
 
         const auto t1 = isa95_prefix + std::to_string(line_id) + "/calidad/production";
         return { make_pub(t1, out) };
@@ -405,6 +783,9 @@ class PrensaHidraulica1Processor : public IMessageProcessor
         uint16_t    last_dd_paradas        = 0;
         uint16_t    last_dd_tiempo_paradas = 0;
         std::time_t last_accepted_time     = 0;
+        // Época del último mensaje ACEPTADO, para medir el hueco (D2).
+        // Semántica y unidad distintas a last_accepted_time (dedup): no reutilizar.
+        int64_t last_accepted_epoch_s = 0;
 
         // Counters are 16-bit with bit-15 validation
         uint16_t last_pisadas = 0;        // D29005 - PISADAS (press strokes)
@@ -422,6 +803,65 @@ class PrensaHidraulica1Processor : public IMessageProcessor
         uint16_t last_paradas_tiempo = 0; // D29004 - Stop time (seconds)
         uint8_t  rc_paradas_tiempo = 0;
         uint32_t acc_paradas_tiempo_s = 0;
+
+        // Segundos del turno en curso que nadie observó (huecos por reinicio).
+        int64_t acc_unobserved_s = 0;
+        // Traza de re-siembra ya emitida por la restauración. No se serializa.
+        bool suppress_reseed_log = false;
+
+        // Serialización generada a partir de los miembros del struct: se
+        // persisten TODOS (acumuladores, tracking de raw, contadores de
+        // rechazo, EMA y estado de deduplicación), no solo los acc_*.
+        nlohmann::json to_json() const {
+            nlohmann::json j;
+            j["v"] = celima::kStateSchemaVersion;
+            j["acc_unobserved_s"] = acc_unobserved_s;
+            j["initialized"] = initialized;
+            j["shift"] = shift;
+            j["last_dd_pisadas"] = last_dd_pisadas;
+            j["last_dd_tiempo"] = last_dd_tiempo;
+            j["last_dd_paradas"] = last_dd_paradas;
+            j["last_dd_tiempo_paradas"] = last_dd_tiempo_paradas;
+            j["last_accepted_time"] = last_accepted_time;
+            j["last_accepted_epoch_s"] = last_accepted_epoch_s;
+            j["last_pisadas"] = last_pisadas;
+            j["rc_pisadas"] = rc_pisadas;
+            j["acc_pisadas"] = acc_pisadas;
+            j["last_metrica_tiempo"] = last_metrica_tiempo;
+            j["rc_metrica_tiempo"] = rc_metrica_tiempo;
+            j["acc_metrica_tiempo_s"] = acc_metrica_tiempo_s;
+            j["last_paradas_count"] = last_paradas_count;
+            j["rc_paradas_count"] = rc_paradas_count;
+            j["acc_paradas_count"] = acc_paradas_count;
+            j["last_paradas_tiempo"] = last_paradas_tiempo;
+            j["rc_paradas_tiempo"] = rc_paradas_tiempo;
+            j["acc_paradas_tiempo_s"] = acc_paradas_tiempo_s;
+            return j;
+        }
+
+        void from_json(const nlohmann::json &j) {
+            acc_unobserved_s = j.value("acc_unobserved_s", acc_unobserved_s);
+            initialized = j.value("initialized", initialized);
+            shift = j.value("shift", shift);
+            last_dd_pisadas = j.value("last_dd_pisadas", last_dd_pisadas);
+            last_dd_tiempo = j.value("last_dd_tiempo", last_dd_tiempo);
+            last_dd_paradas = j.value("last_dd_paradas", last_dd_paradas);
+            last_dd_tiempo_paradas = j.value("last_dd_tiempo_paradas", last_dd_tiempo_paradas);
+            last_accepted_time = j.value("last_accepted_time", last_accepted_time);
+            last_accepted_epoch_s = j.value("last_accepted_epoch_s", last_accepted_epoch_s);
+            last_pisadas = j.value("last_pisadas", last_pisadas);
+            rc_pisadas = j.value("rc_pisadas", rc_pisadas);
+            acc_pisadas = j.value("acc_pisadas", acc_pisadas);
+            last_metrica_tiempo = j.value("last_metrica_tiempo", last_metrica_tiempo);
+            rc_metrica_tiempo = j.value("rc_metrica_tiempo", rc_metrica_tiempo);
+            acc_metrica_tiempo_s = j.value("acc_metrica_tiempo_s", acc_metrica_tiempo_s);
+            last_paradas_count = j.value("last_paradas_count", last_paradas_count);
+            rc_paradas_count = j.value("rc_paradas_count", rc_paradas_count);
+            acc_paradas_count = j.value("acc_paradas_count", acc_paradas_count);
+            last_paradas_tiempo = j.value("last_paradas_tiempo", last_paradas_tiempo);
+            rc_paradas_tiempo = j.value("rc_paradas_tiempo", rc_paradas_tiempo);
+            acc_paradas_tiempo_s = j.value("acc_paradas_tiempo_s", acc_paradas_tiempo_s);
+        }
     };
 
     static std::mutex mtx_;
@@ -444,6 +884,8 @@ public:
         // NOTE: Field names will change when decoder is updated
         // Current: cantidadProductos → Should be: pisadas
         int line          = jsonu::get_opt<int>(msg, "lineID").value_or(0);
+        const auto dev_epoch = device_epoch_s(msg);
+        int64_t unobserved_s = 0;   // segundos del turno sin observar
         int alarms        = jsonu::get_opt<int>(msg, "alarms").value_or(0);
         
         // D29005 - PISADAS (decoder currently calls this "cantidadProductos")
@@ -474,16 +916,40 @@ public:
         {
             std::lock_guard<std::mutex> lock(mtx_);
             PH1State &st = states_[line];
+            // Restauración del estado persistido, una vez por clave y arranque.
+            // Va PRIMERO: decide si este mensaje continúa el acumulador o lo pone a
+            // cero, y deja last_accepted_epoch_s en su sitio para que el hueco de
+            // abajo sea el real y no cero.
+            const int64_t restart_gap_s =
+                restore_state_if_needed(st, "prensa_hidraulica1", line, shiftNum, dev_epoch);
+            if (restart_gap_s > 0 && st.initialized)
+                st.acc_unobserved_s += restart_gap_s;   // caso 4: hueco dentro del turno
+
+            CounterCtx ctx{};
+            ctx.line = line;
+            ctx.proc = "prensa_hidraulica1";
+            ctx.rate_max_per_s = celima::rates().rate_per_s(line, ctx.proc);
+            ctx.margin         = celima::rates().margin();
+            // Hueco desde el último mensaje aceptado de esta clave. Sin epoch de
+            // dispositivo queda en 0 y la cota declara el delta implausible.
+            if (dev_epoch && st.last_accepted_epoch_s > 0)
+                ctx.elapsed_s = static_cast<double>(*dev_epoch - st.last_accepted_epoch_s);
 
             if (!st.initialized || st.shift != shiftNum) {
                 // reseed: una vez por procesador y línea, antes de pisar el estado.
-                celima::log::state_event("reseed", line, "prensa_hidraulica1",
-                    st.initialized
-                        ? ("reason=shift_change shift_prev=" + std::to_string(st.shift) +
-                           " shift_new=" + std::to_string(shiftNum))
-                        : ("reason=first_message shift=" + std::to_string(shiftNum)));
+                // suppress_reseed_log lo pone la restauración cuando ya emitió la
+                // traza del cambio de turno a través del reinicio.
+                if (!st.suppress_reseed_log)
+                    celima::log::state_event("reseed", line, "prensa_hidraulica1",
+                        st.initialized
+                            ? ("reason=shift_change shift_prev=" + std::to_string(st.shift) +
+                               " shift_new=" + std::to_string(shiftNum))
+                            : ("reason=first_message shift=" + std::to_string(shiftNum)));
                 // New shift - initialize
                 st = PH1State();
+                // Los segundos no observados pertenecen al turno: 0 en un cambio de
+                // turno normal, el hueco en un cambio a través de un reinicio (caso 2).
+                st.acc_unobserved_s = restart_gap_s;
                 st.initialized = true;
                 st.shift = shiftNum;
                 st.last_pisadas = pisadas;
@@ -495,6 +961,7 @@ public:
                 st.last_dd_paradas        = paradas_count;
                 st.last_dd_tiempo_paradas = paradas_tiempo;
                 st.last_accepted_time     = std::time(nullptr);
+                if (dev_epoch) st.last_accepted_epoch_s = *dev_epoch;
             }
             else {
                 // Duplicate-frame rejection: no timer1Hz available; compare all
@@ -514,23 +981,24 @@ public:
                 st.last_dd_paradas        = paradas_count;
                 st.last_dd_tiempo_paradas = paradas_tiempo;
                 st.last_accepted_time     = now;
+                if (dev_epoch) st.last_accepted_epoch_s = *dev_epoch;
 
                 // Accumulate deltas using PLC-compatible validation
 
                 // D29005 - PISADAS counter (use diff_counter with bit-15 validation)
-                uint16_t delta_pisadas = diff_counter_safe(pisadas, st.last_pisadas, st.rc_pisadas, 5000, 3, line, "prensa_hidraulica1", "pisadas");
+                uint16_t delta_pisadas = diff_counter_safe(pisadas, st.last_pisadas, st.rc_pisadas, ctx.with("pisadas"));
                 st.acc_pisadas += delta_pisadas;
 
                 // D29006 - Metric time (deciseconds, bit-15 masked)
-                uint16_t delta_tiempo = diff_counter_safe(metrica_tiempo, st.last_metrica_tiempo, st.rc_metrica_tiempo, 5000, 3, line, "prensa_hidraulica1", "metrica_tiempo");
+                uint16_t delta_tiempo = diff_counter_safe(metrica_tiempo, st.last_metrica_tiempo, st.rc_metrica_tiempo, ctx.with("metrica_tiempo"));
                 st.acc_metrica_tiempo_s += delta_tiempo * 0.1;  // CF100 P_0_1s: 0.1s per tick (validated)
 
                 // D29003 - Stop count counter
-                uint16_t delta_paradas = diff_counter_safe(paradas_count, st.last_paradas_count, st.rc_paradas_count, 5000, 3, line, "prensa_hidraulica1", "paradas_count");
+                uint16_t delta_paradas = diff_counter_safe(paradas_count, st.last_paradas_count, st.rc_paradas_count, ctx.with("paradas_count"));
                 st.acc_paradas_count += delta_paradas;
 
                 // D29004 - Stop time counter (seconds)
-                uint16_t delta_tiempo_paradas = diff_counter_safe(paradas_tiempo, st.last_paradas_tiempo, st.rc_paradas_tiempo, 5000, 3, line, "prensa_hidraulica1", "paradas_tiempo");
+                uint16_t delta_tiempo_paradas = diff_counter_safe(paradas_tiempo, st.last_paradas_tiempo, st.rc_paradas_tiempo, ctx.with("paradas_tiempo"));
                 st.acc_paradas_tiempo_s += delta_tiempo_paradas;  // firmware Arduino ya corrige alineamiento de bit
             }
 
@@ -544,6 +1012,12 @@ public:
             if (acc_metrica_tiempo_s_out > 1.0) {
                 pisadas_min = acc_pisadas_out / (acc_metrica_tiempo_s_out / 60.0);
             }
+
+            // Guardar tras procesar el mensaje, dentro del mismo mutex que protege
+            // el estado: un corte de energía no da oportunidad de cerrar limpio, así
+            // que no vale dejarlo solo en SIGTERM.
+            unobserved_s = st.acc_unobserved_s;
+            persist_state(st, "prensa_hidraulica1", line, shiftNum);
         }
 
         // Calculate products from pisadas using line-specific factor
@@ -588,6 +1062,7 @@ public:
         prod["tiempoParadas_turno_s"] = acc_paradas_tiempo_s_out;
 
         prod["timestamp_device"] = device_timestamp(msg);
+        add_unobserved_marker(prod, unobserved_s);
 
         auto t1 = isa95_prefix + std::to_string(line) + "/prensa_hidraulica1/alarms";
         auto t2 = isa95_prefix + std::to_string(line) + "/prensa_hidraulica1/production";
@@ -616,6 +1091,9 @@ class PrensaHidraulica2Processor : public IMessageProcessor
         uint16_t    last_dd_paradas        = 0;
         uint16_t    last_dd_tiempo_paradas = 0;
         std::time_t last_accepted_time     = 0;
+        // Época del último mensaje ACEPTADO, para medir el hueco (D2).
+        // Semántica y unidad distintas a last_accepted_time (dedup): no reutilizar.
+        int64_t last_accepted_epoch_s = 0;
 
         uint16_t last_pisadas = 0;
         uint8_t  rc_pisadas = 0;
@@ -632,6 +1110,65 @@ class PrensaHidraulica2Processor : public IMessageProcessor
         uint16_t last_paradas_tiempo = 0;
         uint8_t  rc_paradas_tiempo = 0;
         uint32_t acc_paradas_tiempo_s = 0;
+
+        // Segundos del turno en curso que nadie observó (huecos por reinicio).
+        int64_t acc_unobserved_s = 0;
+        // Traza de re-siembra ya emitida por la restauración. No se serializa.
+        bool suppress_reseed_log = false;
+
+        // Serialización generada a partir de los miembros del struct: se
+        // persisten TODOS (acumuladores, tracking de raw, contadores de
+        // rechazo, EMA y estado de deduplicación), no solo los acc_*.
+        nlohmann::json to_json() const {
+            nlohmann::json j;
+            j["v"] = celima::kStateSchemaVersion;
+            j["acc_unobserved_s"] = acc_unobserved_s;
+            j["initialized"] = initialized;
+            j["shift"] = shift;
+            j["last_dd_pisadas"] = last_dd_pisadas;
+            j["last_dd_tiempo"] = last_dd_tiempo;
+            j["last_dd_paradas"] = last_dd_paradas;
+            j["last_dd_tiempo_paradas"] = last_dd_tiempo_paradas;
+            j["last_accepted_time"] = last_accepted_time;
+            j["last_accepted_epoch_s"] = last_accepted_epoch_s;
+            j["last_pisadas"] = last_pisadas;
+            j["rc_pisadas"] = rc_pisadas;
+            j["acc_pisadas"] = acc_pisadas;
+            j["last_metrica_tiempo"] = last_metrica_tiempo;
+            j["rc_metrica_tiempo"] = rc_metrica_tiempo;
+            j["acc_metrica_tiempo_s"] = acc_metrica_tiempo_s;
+            j["last_paradas_count"] = last_paradas_count;
+            j["rc_paradas_count"] = rc_paradas_count;
+            j["acc_paradas_count"] = acc_paradas_count;
+            j["last_paradas_tiempo"] = last_paradas_tiempo;
+            j["rc_paradas_tiempo"] = rc_paradas_tiempo;
+            j["acc_paradas_tiempo_s"] = acc_paradas_tiempo_s;
+            return j;
+        }
+
+        void from_json(const nlohmann::json &j) {
+            acc_unobserved_s = j.value("acc_unobserved_s", acc_unobserved_s);
+            initialized = j.value("initialized", initialized);
+            shift = j.value("shift", shift);
+            last_dd_pisadas = j.value("last_dd_pisadas", last_dd_pisadas);
+            last_dd_tiempo = j.value("last_dd_tiempo", last_dd_tiempo);
+            last_dd_paradas = j.value("last_dd_paradas", last_dd_paradas);
+            last_dd_tiempo_paradas = j.value("last_dd_tiempo_paradas", last_dd_tiempo_paradas);
+            last_accepted_time = j.value("last_accepted_time", last_accepted_time);
+            last_accepted_epoch_s = j.value("last_accepted_epoch_s", last_accepted_epoch_s);
+            last_pisadas = j.value("last_pisadas", last_pisadas);
+            rc_pisadas = j.value("rc_pisadas", rc_pisadas);
+            acc_pisadas = j.value("acc_pisadas", acc_pisadas);
+            last_metrica_tiempo = j.value("last_metrica_tiempo", last_metrica_tiempo);
+            rc_metrica_tiempo = j.value("rc_metrica_tiempo", rc_metrica_tiempo);
+            acc_metrica_tiempo_s = j.value("acc_metrica_tiempo_s", acc_metrica_tiempo_s);
+            last_paradas_count = j.value("last_paradas_count", last_paradas_count);
+            rc_paradas_count = j.value("rc_paradas_count", rc_paradas_count);
+            acc_paradas_count = j.value("acc_paradas_count", acc_paradas_count);
+            last_paradas_tiempo = j.value("last_paradas_tiempo", last_paradas_tiempo);
+            rc_paradas_tiempo = j.value("rc_paradas_tiempo", rc_paradas_tiempo);
+            acc_paradas_tiempo_s = j.value("acc_paradas_tiempo_s", acc_paradas_tiempo_s);
+        }
     };
 
     static std::mutex mtx_;
@@ -651,6 +1188,8 @@ public:
         int shiftNum = (sh == Shift::S1 ? 1 : (sh == Shift::S2 ? 2 : 3));
 
         int line          = jsonu::get_opt<int>(msg, "lineID").value_or(0);
+        const auto dev_epoch = device_epoch_s(msg);
+        int64_t unobserved_s = 0;   // segundos del turno sin observar
         int alarms        = jsonu::get_opt<int>(msg, "alarms").value_or(0);
         int raw_pisadas   = jsonu::get_opt<int>(msg, "cantidadProductos").value_or(0);
         int raw_tiempo    = jsonu::get_opt<int>(msg, "tiempoProduccion_ds").value_or(0);
@@ -671,15 +1210,39 @@ public:
         {
             std::lock_guard<std::mutex> lock(mtx_);
             PH2State &st = states_[line];
+            // Restauración del estado persistido, una vez por clave y arranque.
+            // Va PRIMERO: decide si este mensaje continúa el acumulador o lo pone a
+            // cero, y deja last_accepted_epoch_s en su sitio para que el hueco de
+            // abajo sea el real y no cero.
+            const int64_t restart_gap_s =
+                restore_state_if_needed(st, "prensa_hidraulica2", line, shiftNum, dev_epoch);
+            if (restart_gap_s > 0 && st.initialized)
+                st.acc_unobserved_s += restart_gap_s;   // caso 4: hueco dentro del turno
+
+            CounterCtx ctx{};
+            ctx.line = line;
+            ctx.proc = "prensa_hidraulica2";
+            ctx.rate_max_per_s = celima::rates().rate_per_s(line, ctx.proc);
+            ctx.margin         = celima::rates().margin();
+            // Hueco desde el último mensaje aceptado de esta clave. Sin epoch de
+            // dispositivo queda en 0 y la cota declara el delta implausible.
+            if (dev_epoch && st.last_accepted_epoch_s > 0)
+                ctx.elapsed_s = static_cast<double>(*dev_epoch - st.last_accepted_epoch_s);
 
             if (!st.initialized || st.shift != shiftNum) {
                 // reseed: una vez por procesador y línea, antes de pisar el estado.
-                celima::log::state_event("reseed", line, "prensa_hidraulica2",
-                    st.initialized
-                        ? ("reason=shift_change shift_prev=" + std::to_string(st.shift) +
-                           " shift_new=" + std::to_string(shiftNum))
-                        : ("reason=first_message shift=" + std::to_string(shiftNum)));
+                // suppress_reseed_log lo pone la restauración cuando ya emitió la
+                // traza del cambio de turno a través del reinicio.
+                if (!st.suppress_reseed_log)
+                    celima::log::state_event("reseed", line, "prensa_hidraulica2",
+                        st.initialized
+                            ? ("reason=shift_change shift_prev=" + std::to_string(st.shift) +
+                               " shift_new=" + std::to_string(shiftNum))
+                            : ("reason=first_message shift=" + std::to_string(shiftNum)));
                 st = PH2State();
+                // Los segundos no observados pertenecen al turno: 0 en un cambio de
+                // turno normal, el hueco en un cambio a través de un reinicio (caso 2).
+                st.acc_unobserved_s = restart_gap_s;
                 st.initialized = true;
                 st.shift = shiftNum;
                 st.last_pisadas = pisadas;
@@ -691,6 +1254,7 @@ public:
                 st.last_dd_paradas        = paradas_count;
                 st.last_dd_tiempo_paradas = paradas_tiempo;
                 st.last_accepted_time     = std::time(nullptr);
+                if (dev_epoch) st.last_accepted_epoch_s = *dev_epoch;
             }
             else {
                 // Duplicate-frame rejection
@@ -709,18 +1273,19 @@ public:
                 st.last_dd_paradas        = paradas_count;
                 st.last_dd_tiempo_paradas = paradas_tiempo;
                 st.last_accepted_time     = now;
+                if (dev_epoch) st.last_accepted_epoch_s = *dev_epoch;
 
                 // Use PLC-compatible counter validation
-                uint16_t delta_pisadas = diff_counter_safe(pisadas, st.last_pisadas, st.rc_pisadas, 5000, 3, line, "prensa_hidraulica2", "pisadas");
+                uint16_t delta_pisadas = diff_counter_safe(pisadas, st.last_pisadas, st.rc_pisadas, ctx.with("pisadas"));
                 st.acc_pisadas += delta_pisadas;
 
-                uint16_t delta_tiempo = diff_counter_safe(metrica_tiempo, st.last_metrica_tiempo, st.rc_metrica_tiempo, 5000, 3, line, "prensa_hidraulica2", "metrica_tiempo");
+                uint16_t delta_tiempo = diff_counter_safe(metrica_tiempo, st.last_metrica_tiempo, st.rc_metrica_tiempo, ctx.with("metrica_tiempo"));
                 st.acc_metrica_tiempo_s += delta_tiempo * 0.1;  // CF100 P_0_1s: 0.1s per tick (validated)
 
-                uint16_t delta_paradas = diff_counter_safe(paradas_count, st.last_paradas_count, st.rc_paradas_count, 5000, 3, line, "prensa_hidraulica2", "paradas_count");
+                uint16_t delta_paradas = diff_counter_safe(paradas_count, st.last_paradas_count, st.rc_paradas_count, ctx.with("paradas_count"));
                 st.acc_paradas_count += delta_paradas;
 
-                uint16_t delta_tiempo_paradas = diff_counter_safe(paradas_tiempo, st.last_paradas_tiempo, st.rc_paradas_tiempo, 5000, 3, line, "prensa_hidraulica2", "paradas_tiempo");
+                uint16_t delta_tiempo_paradas = diff_counter_safe(paradas_tiempo, st.last_paradas_tiempo, st.rc_paradas_tiempo, ctx.with("paradas_tiempo"));
                 st.acc_paradas_tiempo_s += delta_tiempo_paradas;  // firmware Arduino ya corrige alineamiento de bit
             }
 
@@ -732,6 +1297,12 @@ public:
             if (acc_metrica_tiempo_s_out > 1.0) {
                 pisadas_min = acc_pisadas_out / (acc_metrica_tiempo_s_out / 60.0);
             }
+
+            // Guardar tras procesar el mensaje, dentro del mismo mutex que protege
+            // el estado: un corte de energía no da oportunidad de cerrar limpio, así
+            // que no vale dejarlo solo en SIGTERM.
+            unobserved_s = st.acc_unobserved_s;
+            persist_state(st, "prensa_hidraulica2", line, shiftNum);
         }
 
         int factor_pisadas;
@@ -770,6 +1341,7 @@ public:
         prod["tiempoParadas_turno_s"] = acc_paradas_tiempo_s_out;
 
         prod["timestamp_device"] = device_timestamp(msg);
+        add_unobserved_marker(prod, unobserved_s);
 
         auto t1 = isa95_prefix + std::to_string(line) + "/prensa_hidraulica2/alarms";
         auto t2 = isa95_prefix + std::to_string(line) + "/prensa_hidraulica2/production";
@@ -818,6 +1390,9 @@ private:
         int shift = 0;
 
         uint16_t last_accepted_timer1Hz = 0;
+        // Época del último mensaje ACEPTADO, para medir el hueco (D2).
+        // Semántica y unidad distintas a last_accepted_time (dedup): no reutilizar.
+        int64_t last_accepted_epoch_s = 0;
 
         // All 16-bit counters - last values and accumulators
         uint16_t last_timer1Hz = 0;
@@ -855,6 +1430,87 @@ private:
         uint16_t last_bancalino_l2_tiempo = 0;
         uint8_t  rc_bancalino_l2_tiempo = 0;
         uint32_t acc_bancalino_l2_tiempo_ds = 0;
+
+        // Segundos del turno en curso que nadie observó (huecos por reinicio).
+        int64_t acc_unobserved_s = 0;
+        // Traza de re-siembra ya emitida por la restauración. No se serializa.
+        bool suppress_reseed_log = false;
+
+        // Serialización generada a partir de los miembros del struct: se
+        // persisten TODOS (acumuladores, tracking de raw, contadores de
+        // rechazo, EMA y estado de deduplicación), no solo los acc_*.
+        nlohmann::json to_json() const {
+            nlohmann::json j;
+            j["v"] = celima::kStateSchemaVersion;
+            j["acc_unobserved_s"] = acc_unobserved_s;
+            j["initialized"] = initialized;
+            j["shift"] = shift;
+            j["last_accepted_timer1Hz"] = last_accepted_timer1Hz;
+            j["last_accepted_epoch_s"] = last_accepted_epoch_s;
+            j["last_timer1Hz"] = last_timer1Hz;
+            j["rc_timer1Hz"] = rc_timer1Hz;
+            j["acc_timer1Hz"] = acc_timer1Hz;
+            j["last_paradas_cantidad"] = last_paradas_cantidad;
+            j["rc_paradas_cantidad"] = rc_paradas_cantidad;
+            j["acc_paradas_cantidad"] = acc_paradas_cantidad;
+            j["last_paradas_tempo"] = last_paradas_tempo;
+            j["rc_paradas_tempo"] = rc_paradas_tempo;
+            j["acc_paradas_tempo_s"] = acc_paradas_tempo_s;
+            j["last_ingreso_elevador_cantidad"] = last_ingreso_elevador_cantidad;
+            j["rc_ingreso_elevador_cantidad"] = rc_ingreso_elevador_cantidad;
+            j["acc_ingreso_elevador_cantidad"] = acc_ingreso_elevador_cantidad;
+            j["last_ingreso_elevador_tiempo"] = last_ingreso_elevador_tiempo;
+            j["rc_ingreso_elevador_tiempo"] = rc_ingreso_elevador_tiempo;
+            j["acc_ingreso_elevador_tiempo_ds"] = acc_ingreso_elevador_tiempo_ds;
+            j["last_bancalino_l1_cantidad"] = last_bancalino_l1_cantidad;
+            j["rc_bancalino_l1_cantidad"] = rc_bancalino_l1_cantidad;
+            j["acc_bancalino_l1_cantidad"] = acc_bancalino_l1_cantidad;
+            j["last_bancalino_l1_tiempo"] = last_bancalino_l1_tiempo;
+            j["rc_bancalino_l1_tiempo"] = rc_bancalino_l1_tiempo;
+            j["acc_bancalino_l1_tiempo_ds"] = acc_bancalino_l1_tiempo_ds;
+            j["last_bancalino_l2_cantidad"] = last_bancalino_l2_cantidad;
+            j["rc_bancalino_l2_cantidad"] = rc_bancalino_l2_cantidad;
+            j["acc_bancalino_l2_cantidad"] = acc_bancalino_l2_cantidad;
+            j["last_bancalino_l2_tiempo"] = last_bancalino_l2_tiempo;
+            j["rc_bancalino_l2_tiempo"] = rc_bancalino_l2_tiempo;
+            j["acc_bancalino_l2_tiempo_ds"] = acc_bancalino_l2_tiempo_ds;
+            return j;
+        }
+
+        void from_json(const nlohmann::json &j) {
+            acc_unobserved_s = j.value("acc_unobserved_s", acc_unobserved_s);
+            initialized = j.value("initialized", initialized);
+            shift = j.value("shift", shift);
+            last_accepted_timer1Hz = j.value("last_accepted_timer1Hz", last_accepted_timer1Hz);
+            last_accepted_epoch_s = j.value("last_accepted_epoch_s", last_accepted_epoch_s);
+            last_timer1Hz = j.value("last_timer1Hz", last_timer1Hz);
+            rc_timer1Hz = j.value("rc_timer1Hz", rc_timer1Hz);
+            acc_timer1Hz = j.value("acc_timer1Hz", acc_timer1Hz);
+            last_paradas_cantidad = j.value("last_paradas_cantidad", last_paradas_cantidad);
+            rc_paradas_cantidad = j.value("rc_paradas_cantidad", rc_paradas_cantidad);
+            acc_paradas_cantidad = j.value("acc_paradas_cantidad", acc_paradas_cantidad);
+            last_paradas_tempo = j.value("last_paradas_tempo", last_paradas_tempo);
+            rc_paradas_tempo = j.value("rc_paradas_tempo", rc_paradas_tempo);
+            acc_paradas_tempo_s = j.value("acc_paradas_tempo_s", acc_paradas_tempo_s);
+            last_ingreso_elevador_cantidad = j.value("last_ingreso_elevador_cantidad", last_ingreso_elevador_cantidad);
+            rc_ingreso_elevador_cantidad = j.value("rc_ingreso_elevador_cantidad", rc_ingreso_elevador_cantidad);
+            acc_ingreso_elevador_cantidad = j.value("acc_ingreso_elevador_cantidad", acc_ingreso_elevador_cantidad);
+            last_ingreso_elevador_tiempo = j.value("last_ingreso_elevador_tiempo", last_ingreso_elevador_tiempo);
+            rc_ingreso_elevador_tiempo = j.value("rc_ingreso_elevador_tiempo", rc_ingreso_elevador_tiempo);
+            acc_ingreso_elevador_tiempo_ds = j.value("acc_ingreso_elevador_tiempo_ds", acc_ingreso_elevador_tiempo_ds);
+            last_bancalino_l1_cantidad = j.value("last_bancalino_l1_cantidad", last_bancalino_l1_cantidad);
+            rc_bancalino_l1_cantidad = j.value("rc_bancalino_l1_cantidad", rc_bancalino_l1_cantidad);
+            acc_bancalino_l1_cantidad = j.value("acc_bancalino_l1_cantidad", acc_bancalino_l1_cantidad);
+            last_bancalino_l1_tiempo = j.value("last_bancalino_l1_tiempo", last_bancalino_l1_tiempo);
+            rc_bancalino_l1_tiempo = j.value("rc_bancalino_l1_tiempo", rc_bancalino_l1_tiempo);
+            acc_bancalino_l1_tiempo_ds = j.value("acc_bancalino_l1_tiempo_ds", acc_bancalino_l1_tiempo_ds);
+            last_bancalino_l2_cantidad = j.value("last_bancalino_l2_cantidad", last_bancalino_l2_cantidad);
+            rc_bancalino_l2_cantidad = j.value("rc_bancalino_l2_cantidad", rc_bancalino_l2_cantidad);
+            acc_bancalino_l2_cantidad = j.value("acc_bancalino_l2_cantidad", acc_bancalino_l2_cantidad);
+            last_bancalino_l2_tiempo = j.value("last_bancalino_l2_tiempo", last_bancalino_l2_tiempo);
+            rc_bancalino_l2_tiempo = j.value("rc_bancalino_l2_tiempo", rc_bancalino_l2_tiempo);
+            acc_bancalino_l2_tiempo_ds = j.value("acc_bancalino_l2_tiempo_ds", acc_bancalino_l2_tiempo_ds);
+        }
     };
 
     static std::mutex mtx_;
@@ -875,6 +1531,8 @@ public:
 
         // === Read header fields ===
         int line = jsonu::get_opt<int>(msg, "lineID").value_or(0);
+        const auto dev_epoch = device_epoch_s(msg);
+        int64_t unobserved_s = 0;   // segundos del turno sin observar
         int alarms = jsonu::get_opt<int>(msg, "alarms").value_or(0);
         int checksum = jsonu::get_opt<int>(msg, "checksum").value_or(0);
         int deviceType = jsonu::get_opt<int>(msg, "deviceType").value_or(0);
@@ -921,20 +1579,45 @@ public:
         {
             std::lock_guard<std::mutex> lock(mtx_);
             State &st = states_[line];
+            // Restauración del estado persistido, una vez por clave y arranque.
+            // Va PRIMERO: decide si este mensaje continúa el acumulador o lo pone a
+            // cero, y deja last_accepted_epoch_s en su sitio para que el hueco de
+            // abajo sea el real y no cero.
+            const int64_t restart_gap_s =
+                restore_state_if_needed(st, "entrada_secador", line, shiftNum, dev_epoch);
+            if (restart_gap_s > 0 && st.initialized)
+                st.acc_unobserved_s += restart_gap_s;   // caso 4: hueco dentro del turno
+
+            CounterCtx ctx{};
+            ctx.line = line;
+            ctx.proc = "entrada_secador";
+            ctx.rate_max_per_s = celima::rates().rate_per_s(line, ctx.proc);
+            ctx.margin         = celima::rates().margin();
+            // Hueco desde el último mensaje aceptado de esta clave. Sin epoch de
+            // dispositivo queda en 0 y la cota declara el delta implausible.
+            if (dev_epoch && st.last_accepted_epoch_s > 0)
+                ctx.elapsed_s = static_cast<double>(*dev_epoch - st.last_accepted_epoch_s);
 
             if (!st.initialized || st.shift != shiftNum) {
                 // reseed: una vez por procesador y línea, antes de pisar el estado.
-                celima::log::state_event("reseed", line, "entrada_secador",
-                    st.initialized
-                        ? ("reason=shift_change shift_prev=" + std::to_string(st.shift) +
-                           " shift_new=" + std::to_string(shiftNum))
-                        : ("reason=first_message shift=" + std::to_string(shiftNum)));
+                // suppress_reseed_log lo pone la restauración cuando ya emitió la
+                // traza del cambio de turno a través del reinicio.
+                if (!st.suppress_reseed_log)
+                    celima::log::state_event("reseed", line, "entrada_secador",
+                        st.initialized
+                            ? ("reason=shift_change shift_prev=" + std::to_string(st.shift) +
+                               " shift_new=" + std::to_string(shiftNum))
+                            : ("reason=first_message shift=" + std::to_string(shiftNum)));
                 // New shift - reset all accumulators and store initial values
                 st = State();
+                // Los segundos no observados pertenecen al turno: 0 en un cambio de
+                // turno normal, el hueco en un cambio a través de un reinicio (caso 2).
+                st.acc_unobserved_s = restart_gap_s;
                 st.initialized = true;
                 st.shift = shiftNum;
 
                 st.last_accepted_timer1Hz = timer1Hz;
+                if (dev_epoch) st.last_accepted_epoch_s = *dev_epoch;
                 st.last_timer1Hz = timer1Hz;
                 st.last_paradas_cantidad = paradas_cantidad;
                 st.last_paradas_tempo = paradas_tempo;
@@ -954,31 +1637,32 @@ public:
                     return {};
                 }
                 st.last_accepted_timer1Hz = timer1Hz;
+                if (dev_epoch) st.last_accepted_epoch_s = *dev_epoch;
 
                 // Accumulate deltas — ALL PLC registers have bit-15 flag, use diff_counter for everything
-                st.acc_timer1Hz += diff_counter_safe(timer1Hz, st.last_timer1Hz, st.rc_timer1Hz, 5000, 3, line, "entrada_secador", "timer1Hz");
+                st.acc_timer1Hz += diff_counter_safe(timer1Hz, st.last_timer1Hz, st.rc_timer1Hz, ctx.with("timer1Hz"));
 
-                st.acc_paradas_cantidad += diff_counter_safe(paradas_cantidad, st.last_paradas_cantidad, st.rc_paradas_cantidad, 5000, 3, line, "entrada_secador", "paradas_cantidad");
+                st.acc_paradas_cantidad += diff_counter_safe(paradas_cantidad, st.last_paradas_cantidad, st.rc_paradas_cantidad, ctx.with("paradas_cantidad"));
 
-                st.acc_paradas_tempo_s += diff_counter_safe(paradas_tempo, st.last_paradas_tempo, st.rc_paradas_tempo, 5000, 3, line, "entrada_secador", "paradas_tempo");
+                st.acc_paradas_tempo_s += diff_counter_safe(paradas_tempo, st.last_paradas_tempo, st.rc_paradas_tempo, ctx.with("paradas_tempo"));
 
-                st.acc_ingreso_elevador_cantidad += diff_counter_safe(ingreso_elevador_cantidad, st.last_ingreso_elevador_cantidad, st.rc_ingreso_elevador_cantidad, 5000, 3, line, "entrada_secador", "ingreso_elevador_cantidad");
+                st.acc_ingreso_elevador_cantidad += diff_counter_safe(ingreso_elevador_cantidad, st.last_ingreso_elevador_cantidad, st.rc_ingreso_elevador_cantidad, ctx.with("ingreso_elevador_cantidad"));
 
-                st.acc_ingreso_elevador_tiempo_ds += diff_counter_safe(ingreso_elevador_tiempo, st.last_ingreso_elevador_tiempo, st.rc_ingreso_elevador_tiempo, 5000, 3, line, "entrada_secador", "ingreso_elevador_tiempo");
+                st.acc_ingreso_elevador_tiempo_ds += diff_counter_safe(ingreso_elevador_tiempo, st.last_ingreso_elevador_tiempo, st.rc_ingreso_elevador_tiempo, ctx.with("ingreso_elevador_tiempo"));
 
                 {
-                    uint16_t d = diff_counter_safe(bancalino_l1_cantidad, st.last_bancalino_l1_cantidad, st.rc_bancalino_l1_cantidad, 5000, 3, line, "entrada_secador", "bancalino_l1_cantidad");
+                    uint16_t d = diff_counter_safe(bancalino_l1_cantidad, st.last_bancalino_l1_cantidad, st.rc_bancalino_l1_cantidad, ctx.with("bancalino_l1_cantidad"));
                     st.acc_bancalino_l1_cantidad += (line == 2) ? d / 4 : d;
                 }
 
-                st.acc_bancalino_l1_tiempo_ds += diff_counter_safe(bancalino_l1_tiempo, st.last_bancalino_l1_tiempo, st.rc_bancalino_l1_tiempo, 5000, 3, line, "entrada_secador", "bancalino_l1_tiempo");
+                st.acc_bancalino_l1_tiempo_ds += diff_counter_safe(bancalino_l1_tiempo, st.last_bancalino_l1_tiempo, st.rc_bancalino_l1_tiempo, ctx.with("bancalino_l1_tiempo"));
 
                 {
-                    uint16_t d = diff_counter_safe(bancalino_l2_cantidad, st.last_bancalino_l2_cantidad, st.rc_bancalino_l2_cantidad, 5000, 3, line, "entrada_secador", "bancalino_l2_cantidad");
+                    uint16_t d = diff_counter_safe(bancalino_l2_cantidad, st.last_bancalino_l2_cantidad, st.rc_bancalino_l2_cantidad, ctx.with("bancalino_l2_cantidad"));
                     st.acc_bancalino_l2_cantidad += (line == 2) ? d / 4 : d;
                 }
 
-                st.acc_bancalino_l2_tiempo_ds += diff_counter_safe(bancalino_l2_tiempo, st.last_bancalino_l2_tiempo, st.rc_bancalino_l2_tiempo, 5000, 3, line, "entrada_secador", "bancalino_l2_tiempo");
+                st.acc_bancalino_l2_tiempo_ds += diff_counter_safe(bancalino_l2_tiempo, st.last_bancalino_l2_tiempo, st.rc_bancalino_l2_tiempo, ctx.with("bancalino_l2_tiempo"));
             }
 
             // Copy accumulated values to output
@@ -991,6 +1675,12 @@ public:
             acc_bancalino_l1_tiempo_ds_out = st.acc_bancalino_l1_tiempo_ds;
             acc_bancalino_l2_cantidad_out = st.acc_bancalino_l2_cantidad;
             acc_bancalino_l2_tiempo_ds_out = st.acc_bancalino_l2_tiempo_ds;
+
+            // Guardar tras procesar el mensaje, dentro del mismo mutex que protege
+            // el estado: un corte de energía no da oportunidad de cerrar limpio, así
+            // que no vale dejarlo solo en SIGTERM.
+            unobserved_s = st.acc_unobserved_s;
+            persist_state(st, "entrada_secador", line, shiftNum);
         }
 
         // === Build output JSON with CORRECT semantic field names ===
@@ -1030,6 +1720,7 @@ public:
         prod["bancalino_l2_tiempo_turno_ds"] = acc_bancalino_l2_tiempo_ds_out;  // CF100: 1 tick = 0.1s = 1ds (validated, no ×2)
 
         prod["timestamp_device"] = device_timestamp(msg);
+        add_unobserved_marker(prod, unobserved_s);
 
         // Alarms
         json qual;
@@ -1046,7 +1737,6 @@ public:
 // Static definitions
 std::mutex EntradaSecadorProcessor::mtx_;
 std::unordered_map<int, EntradaSecadorProcessor::State> EntradaSecadorProcessor::states_;
-
 
 
 /**
@@ -1080,6 +1770,9 @@ private:
         int shift = 0;
 
         uint16_t last_accepted_timer1Hz = 0;
+        // Época del último mensaje ACEPTADO, para medir el hueco (D2).
+        // Semántica y unidad distintas a last_accepted_time (dedup): no reutilizar.
+        int64_t last_accepted_epoch_s = 0;
 
         // All 16-bit counters - last values and accumulators
         uint16_t last_timer1Hz = 0;
@@ -1101,6 +1794,63 @@ private:
         uint16_t last_metrica_mds_tiempo = 0;
         uint8_t  rc_metrica_mds_tiempo = 0;
         uint32_t acc_metrica_mds_tiempo_ds = 0;
+
+        // Segundos del turno en curso que nadie observó (huecos por reinicio).
+        int64_t acc_unobserved_s = 0;
+        // Traza de re-siembra ya emitida por la restauración. No se serializa.
+        bool suppress_reseed_log = false;
+
+        // Serialización generada a partir de los miembros del struct: se
+        // persisten TODOS (acumuladores, tracking de raw, contadores de
+        // rechazo, EMA y estado de deduplicación), no solo los acc_*.
+        nlohmann::json to_json() const {
+            nlohmann::json j;
+            j["v"] = celima::kStateSchemaVersion;
+            j["acc_unobserved_s"] = acc_unobserved_s;
+            j["initialized"] = initialized;
+            j["shift"] = shift;
+            j["last_accepted_timer1Hz"] = last_accepted_timer1Hz;
+            j["last_accepted_epoch_s"] = last_accepted_epoch_s;
+            j["last_timer1Hz"] = last_timer1Hz;
+            j["rc_timer1Hz"] = rc_timer1Hz;
+            j["acc_timer1Hz"] = acc_timer1Hz;
+            j["last_parada_mds_cantidad"] = last_parada_mds_cantidad;
+            j["rc_parada_mds_cantidad"] = rc_parada_mds_cantidad;
+            j["acc_parada_mds_cantidad"] = acc_parada_mds_cantidad;
+            j["last_parada_mds_tiempo"] = last_parada_mds_tiempo;
+            j["rc_parada_mds_tiempo"] = rc_parada_mds_tiempo;
+            j["acc_parada_mds_tiempo_s"] = acc_parada_mds_tiempo_s;
+            j["last_metrica_mds_cantidad"] = last_metrica_mds_cantidad;
+            j["rc_metrica_mds_cantidad"] = rc_metrica_mds_cantidad;
+            j["acc_metrica_mds_cantidad"] = acc_metrica_mds_cantidad;
+            j["last_metrica_mds_tiempo"] = last_metrica_mds_tiempo;
+            j["rc_metrica_mds_tiempo"] = rc_metrica_mds_tiempo;
+            j["acc_metrica_mds_tiempo_ds"] = acc_metrica_mds_tiempo_ds;
+            return j;
+        }
+
+        void from_json(const nlohmann::json &j) {
+            acc_unobserved_s = j.value("acc_unobserved_s", acc_unobserved_s);
+            initialized = j.value("initialized", initialized);
+            shift = j.value("shift", shift);
+            last_accepted_timer1Hz = j.value("last_accepted_timer1Hz", last_accepted_timer1Hz);
+            last_accepted_epoch_s = j.value("last_accepted_epoch_s", last_accepted_epoch_s);
+            last_timer1Hz = j.value("last_timer1Hz", last_timer1Hz);
+            rc_timer1Hz = j.value("rc_timer1Hz", rc_timer1Hz);
+            acc_timer1Hz = j.value("acc_timer1Hz", acc_timer1Hz);
+            last_parada_mds_cantidad = j.value("last_parada_mds_cantidad", last_parada_mds_cantidad);
+            rc_parada_mds_cantidad = j.value("rc_parada_mds_cantidad", rc_parada_mds_cantidad);
+            acc_parada_mds_cantidad = j.value("acc_parada_mds_cantidad", acc_parada_mds_cantidad);
+            last_parada_mds_tiempo = j.value("last_parada_mds_tiempo", last_parada_mds_tiempo);
+            rc_parada_mds_tiempo = j.value("rc_parada_mds_tiempo", rc_parada_mds_tiempo);
+            acc_parada_mds_tiempo_s = j.value("acc_parada_mds_tiempo_s", acc_parada_mds_tiempo_s);
+            last_metrica_mds_cantidad = j.value("last_metrica_mds_cantidad", last_metrica_mds_cantidad);
+            rc_metrica_mds_cantidad = j.value("rc_metrica_mds_cantidad", rc_metrica_mds_cantidad);
+            acc_metrica_mds_cantidad = j.value("acc_metrica_mds_cantidad", acc_metrica_mds_cantidad);
+            last_metrica_mds_tiempo = j.value("last_metrica_mds_tiempo", last_metrica_mds_tiempo);
+            rc_metrica_mds_tiempo = j.value("rc_metrica_mds_tiempo", rc_metrica_mds_tiempo);
+            acc_metrica_mds_tiempo_ds = j.value("acc_metrica_mds_tiempo_ds", acc_metrica_mds_tiempo_ds);
+        }
     };
 
     static std::mutex mtx_;
@@ -1121,6 +1871,8 @@ public:
 
         // === Read header fields ===
         int line = jsonu::get_opt<int>(msg, "lineID").value_or(0);
+        const auto dev_epoch = device_epoch_s(msg);
+        int64_t unobserved_s = 0;   // segundos del turno sin observar
         int alarms = jsonu::get_opt<int>(msg, "alarms").value_or(0);
         int checksum = jsonu::get_opt<int>(msg, "checksum").value_or(0);
         int deviceType = jsonu::get_opt<int>(msg, "deviceType").value_or(0);
@@ -1151,20 +1903,45 @@ public:
         {
             std::lock_guard<std::mutex> lock(mtx_);
             State &st = states_[line];
+            // Restauración del estado persistido, una vez por clave y arranque.
+            // Va PRIMERO: decide si este mensaje continúa el acumulador o lo pone a
+            // cero, y deja last_accepted_epoch_s en su sitio para que el hueco de
+            // abajo sea el real y no cero.
+            const int64_t restart_gap_s =
+                restore_state_if_needed(st, "salida_secador", line, shiftNum, dev_epoch);
+            if (restart_gap_s > 0 && st.initialized)
+                st.acc_unobserved_s += restart_gap_s;   // caso 4: hueco dentro del turno
+
+            CounterCtx ctx{};
+            ctx.line = line;
+            ctx.proc = "salida_secador";
+            ctx.rate_max_per_s = celima::rates().rate_per_s(line, ctx.proc);
+            ctx.margin         = celima::rates().margin();
+            // Hueco desde el último mensaje aceptado de esta clave. Sin epoch de
+            // dispositivo queda en 0 y la cota declara el delta implausible.
+            if (dev_epoch && st.last_accepted_epoch_s > 0)
+                ctx.elapsed_s = static_cast<double>(*dev_epoch - st.last_accepted_epoch_s);
 
             if (!st.initialized || st.shift != shiftNum) {
                 // reseed: una vez por procesador y línea, antes de pisar el estado.
-                celima::log::state_event("reseed", line, "salida_secador",
-                    st.initialized
-                        ? ("reason=shift_change shift_prev=" + std::to_string(st.shift) +
-                           " shift_new=" + std::to_string(shiftNum))
-                        : ("reason=first_message shift=" + std::to_string(shiftNum)));
+                // suppress_reseed_log lo pone la restauración cuando ya emitió la
+                // traza del cambio de turno a través del reinicio.
+                if (!st.suppress_reseed_log)
+                    celima::log::state_event("reseed", line, "salida_secador",
+                        st.initialized
+                            ? ("reason=shift_change shift_prev=" + std::to_string(st.shift) +
+                               " shift_new=" + std::to_string(shiftNum))
+                            : ("reason=first_message shift=" + std::to_string(shiftNum)));
                 // New shift - reset all accumulators and store initial values
                 st = State();
+                // Los segundos no observados pertenecen al turno: 0 en un cambio de
+                // turno normal, el hueco en un cambio a través de un reinicio (caso 2).
+                st.acc_unobserved_s = restart_gap_s;
                 st.initialized = true;
                 st.shift = shiftNum;
 
                 st.last_accepted_timer1Hz = timer1Hz;
+                if (dev_epoch) st.last_accepted_epoch_s = *dev_epoch;
                 st.last_timer1Hz = timer1Hz;
                 st.last_parada_mds_cantidad = parada_mds_cantidad;
                 st.last_parada_mds_tiempo = parada_mds_tiempo;
@@ -1179,17 +1956,18 @@ public:
                     return {};
                 }
                 st.last_accepted_timer1Hz = timer1Hz;
+                if (dev_epoch) st.last_accepted_epoch_s = *dev_epoch;
 
                 // Accumulate deltas — ALL PLC registers have bit-15 flag, use diff_counter for everything
-                st.acc_timer1Hz += diff_counter_safe(timer1Hz, st.last_timer1Hz, st.rc_timer1Hz, 5000, 3, line, "salida_secador", "timer1Hz");
+                st.acc_timer1Hz += diff_counter_safe(timer1Hz, st.last_timer1Hz, st.rc_timer1Hz, ctx.with("timer1Hz"));
 
-                st.acc_parada_mds_cantidad += diff_counter_safe(parada_mds_cantidad, st.last_parada_mds_cantidad, st.rc_parada_mds_cantidad, 5000, 3, line, "salida_secador", "parada_mds_cantidad");
+                st.acc_parada_mds_cantidad += diff_counter_safe(parada_mds_cantidad, st.last_parada_mds_cantidad, st.rc_parada_mds_cantidad, ctx.with("parada_mds_cantidad"));
 
-                st.acc_parada_mds_tiempo_s += diff_counter_safe(parada_mds_tiempo, st.last_parada_mds_tiempo, st.rc_parada_mds_tiempo, 5000, 3, line, "salida_secador", "parada_mds_tiempo");
+                st.acc_parada_mds_tiempo_s += diff_counter_safe(parada_mds_tiempo, st.last_parada_mds_tiempo, st.rc_parada_mds_tiempo, ctx.with("parada_mds_tiempo"));
 
-                st.acc_metrica_mds_cantidad += diff_counter_safe(metrica_mds_cantidad, st.last_metrica_mds_cantidad, st.rc_metrica_mds_cantidad, 5000, 3, line, "salida_secador", "metrica_mds_cantidad");
+                st.acc_metrica_mds_cantidad += diff_counter_safe(metrica_mds_cantidad, st.last_metrica_mds_cantidad, st.rc_metrica_mds_cantidad, ctx.with("metrica_mds_cantidad"));
 
-                st.acc_metrica_mds_tiempo_ds += diff_counter_safe(metrica_mds_tiempo, st.last_metrica_mds_tiempo, st.rc_metrica_mds_tiempo, 5000, 3, line, "salida_secador", "metrica_mds_tiempo");
+                st.acc_metrica_mds_tiempo_ds += diff_counter_safe(metrica_mds_tiempo, st.last_metrica_mds_tiempo, st.rc_metrica_mds_tiempo, ctx.with("metrica_mds_tiempo"));
             }
 
             // Copy accumulated values to output
@@ -1198,6 +1976,12 @@ public:
             acc_parada_mds_tiempo_s_out = st.acc_parada_mds_tiempo_s;
             acc_metrica_mds_cantidad_out = st.acc_metrica_mds_cantidad;
             acc_metrica_mds_tiempo_ds_out = st.acc_metrica_mds_tiempo_ds;
+
+            // Guardar tras procesar el mensaje, dentro del mismo mutex que protege
+            // el estado: un corte de energía no da oportunidad de cerrar limpio, así
+            // que no vale dejarlo solo en SIGTERM.
+            unobserved_s = st.acc_unobserved_s;
+            persist_state(st, "salida_secador", line, shiftNum);
         }
 
         // === Build output JSON with CORRECT semantic field names ===
@@ -1229,6 +2013,7 @@ public:
         prod["metrica_mds_tiempo_turno_s"] = static_cast<double>(acc_metrica_mds_tiempo_ds_out) * 0.1;  // CF100: each tick = 0.1s (validated)
 
         prod["timestamp_device"] = device_timestamp(msg);
+        add_unobserved_marker(prod, unobserved_s);
 
         // Alarms
         json qual;
@@ -1277,6 +2062,9 @@ private:
         int shift = 0;
 
         uint16_t last_accepted_timer1Hz = 0;
+        // Época del último mensaje ACEPTADO, para medir el hueco (D2).
+        // Semántica y unidad distintas a last_accepted_time (dedup): no reutilizar.
+        int64_t last_accepted_epoch_s = 0;
 
         // All 16-bit counters - last values and accumulators
         uint16_t last_timer1Hz = 0;
@@ -1298,6 +2086,63 @@ private:
         uint16_t last_metrica_esm_tiempo = 0;
         uint8_t  rc_metrica_esm_tiempo = 0;
         uint32_t acc_metrica_esm_tiempo_ds = 0;
+
+        // Segundos del turno en curso que nadie observó (huecos por reinicio).
+        int64_t acc_unobserved_s = 0;
+        // Traza de re-siembra ya emitida por la restauración. No se serializa.
+        bool suppress_reseed_log = false;
+
+        // Serialización generada a partir de los miembros del struct: se
+        // persisten TODOS (acumuladores, tracking de raw, contadores de
+        // rechazo, EMA y estado de deduplicación), no solo los acc_*.
+        nlohmann::json to_json() const {
+            nlohmann::json j;
+            j["v"] = celima::kStateSchemaVersion;
+            j["acc_unobserved_s"] = acc_unobserved_s;
+            j["initialized"] = initialized;
+            j["shift"] = shift;
+            j["last_accepted_timer1Hz"] = last_accepted_timer1Hz;
+            j["last_accepted_epoch_s"] = last_accepted_epoch_s;
+            j["last_timer1Hz"] = last_timer1Hz;
+            j["rc_timer1Hz"] = rc_timer1Hz;
+            j["acc_timer1Hz"] = acc_timer1Hz;
+            j["last_parada_esm_cantidad"] = last_parada_esm_cantidad;
+            j["rc_parada_esm_cantidad"] = rc_parada_esm_cantidad;
+            j["acc_parada_esm_cantidad"] = acc_parada_esm_cantidad;
+            j["last_parada_esm_tiempo"] = last_parada_esm_tiempo;
+            j["rc_parada_esm_tiempo"] = rc_parada_esm_tiempo;
+            j["acc_parada_esm_tiempo_s"] = acc_parada_esm_tiempo_s;
+            j["last_metrica_esm_cantidad"] = last_metrica_esm_cantidad;
+            j["rc_metrica_esm_cantidad"] = rc_metrica_esm_cantidad;
+            j["acc_metrica_esm_cantidad"] = acc_metrica_esm_cantidad;
+            j["last_metrica_esm_tiempo"] = last_metrica_esm_tiempo;
+            j["rc_metrica_esm_tiempo"] = rc_metrica_esm_tiempo;
+            j["acc_metrica_esm_tiempo_ds"] = acc_metrica_esm_tiempo_ds;
+            return j;
+        }
+
+        void from_json(const nlohmann::json &j) {
+            acc_unobserved_s = j.value("acc_unobserved_s", acc_unobserved_s);
+            initialized = j.value("initialized", initialized);
+            shift = j.value("shift", shift);
+            last_accepted_timer1Hz = j.value("last_accepted_timer1Hz", last_accepted_timer1Hz);
+            last_accepted_epoch_s = j.value("last_accepted_epoch_s", last_accepted_epoch_s);
+            last_timer1Hz = j.value("last_timer1Hz", last_timer1Hz);
+            rc_timer1Hz = j.value("rc_timer1Hz", rc_timer1Hz);
+            acc_timer1Hz = j.value("acc_timer1Hz", acc_timer1Hz);
+            last_parada_esm_cantidad = j.value("last_parada_esm_cantidad", last_parada_esm_cantidad);
+            rc_parada_esm_cantidad = j.value("rc_parada_esm_cantidad", rc_parada_esm_cantidad);
+            acc_parada_esm_cantidad = j.value("acc_parada_esm_cantidad", acc_parada_esm_cantidad);
+            last_parada_esm_tiempo = j.value("last_parada_esm_tiempo", last_parada_esm_tiempo);
+            rc_parada_esm_tiempo = j.value("rc_parada_esm_tiempo", rc_parada_esm_tiempo);
+            acc_parada_esm_tiempo_s = j.value("acc_parada_esm_tiempo_s", acc_parada_esm_tiempo_s);
+            last_metrica_esm_cantidad = j.value("last_metrica_esm_cantidad", last_metrica_esm_cantidad);
+            rc_metrica_esm_cantidad = j.value("rc_metrica_esm_cantidad", rc_metrica_esm_cantidad);
+            acc_metrica_esm_cantidad = j.value("acc_metrica_esm_cantidad", acc_metrica_esm_cantidad);
+            last_metrica_esm_tiempo = j.value("last_metrica_esm_tiempo", last_metrica_esm_tiempo);
+            rc_metrica_esm_tiempo = j.value("rc_metrica_esm_tiempo", rc_metrica_esm_tiempo);
+            acc_metrica_esm_tiempo_ds = j.value("acc_metrica_esm_tiempo_ds", acc_metrica_esm_tiempo_ds);
+        }
     };
 
     static std::mutex mtx_;
@@ -1318,6 +2163,8 @@ public:
 
         // === Read header fields ===
         int line = jsonu::get_opt<int>(msg, "lineID").value_or(0);
+        const auto dev_epoch = device_epoch_s(msg);
+        int64_t unobserved_s = 0;   // segundos del turno sin observar
         int alarms = jsonu::get_opt<int>(msg, "alarms").value_or(0);
         int checksum = jsonu::get_opt<int>(msg, "checksum").value_or(0);
         int deviceType = jsonu::get_opt<int>(msg, "deviceType").value_or(0);
@@ -1348,20 +2195,45 @@ public:
         {
             std::lock_guard<std::mutex> lock(mtx_);
             State &st = states_[line];
+            // Restauración del estado persistido, una vez por clave y arranque.
+            // Va PRIMERO: decide si este mensaje continúa el acumulador o lo pone a
+            // cero, y deja last_accepted_epoch_s en su sitio para que el hueco de
+            // abajo sea el real y no cero.
+            const int64_t restart_gap_s =
+                restore_state_if_needed(st, "esmalte", line, shiftNum, dev_epoch);
+            if (restart_gap_s > 0 && st.initialized)
+                st.acc_unobserved_s += restart_gap_s;   // caso 4: hueco dentro del turno
+
+            CounterCtx ctx{};
+            ctx.line = line;
+            ctx.proc = "esmalte";
+            ctx.rate_max_per_s = celima::rates().rate_per_s(line, ctx.proc);
+            ctx.margin         = celima::rates().margin();
+            // Hueco desde el último mensaje aceptado de esta clave. Sin epoch de
+            // dispositivo queda en 0 y la cota declara el delta implausible.
+            if (dev_epoch && st.last_accepted_epoch_s > 0)
+                ctx.elapsed_s = static_cast<double>(*dev_epoch - st.last_accepted_epoch_s);
 
             if (!st.initialized || st.shift != shiftNum) {
                 // reseed: una vez por procesador y línea, antes de pisar el estado.
-                celima::log::state_event("reseed", line, "esmalte",
-                    st.initialized
-                        ? ("reason=shift_change shift_prev=" + std::to_string(st.shift) +
-                           " shift_new=" + std::to_string(shiftNum))
-                        : ("reason=first_message shift=" + std::to_string(shiftNum)));
+                // suppress_reseed_log lo pone la restauración cuando ya emitió la
+                // traza del cambio de turno a través del reinicio.
+                if (!st.suppress_reseed_log)
+                    celima::log::state_event("reseed", line, "esmalte",
+                        st.initialized
+                            ? ("reason=shift_change shift_prev=" + std::to_string(st.shift) +
+                               " shift_new=" + std::to_string(shiftNum))
+                            : ("reason=first_message shift=" + std::to_string(shiftNum)));
                 // New shift - reset all accumulators and store initial values
                 st = State();
+                // Los segundos no observados pertenecen al turno: 0 en un cambio de
+                // turno normal, el hueco en un cambio a través de un reinicio (caso 2).
+                st.acc_unobserved_s = restart_gap_s;
                 st.initialized = true;
                 st.shift = shiftNum;
 
                 st.last_accepted_timer1Hz = timer1Hz;
+                if (dev_epoch) st.last_accepted_epoch_s = *dev_epoch;
                 st.last_timer1Hz = timer1Hz;
                 st.last_parada_esm_cantidad = parada_esm_cantidad;
                 st.last_parada_esm_tiempo = parada_esm_tiempo;
@@ -1376,17 +2248,18 @@ public:
                     return {};
                 }
                 st.last_accepted_timer1Hz = timer1Hz;
+                if (dev_epoch) st.last_accepted_epoch_s = *dev_epoch;
 
                 // Accumulate deltas — ALL PLC registers have bit-15 flag, use diff_counter for everything
-                st.acc_timer1Hz += diff_counter_safe(timer1Hz, st.last_timer1Hz, st.rc_timer1Hz, 5000, 3, line, "esmalte", "timer1Hz");
+                st.acc_timer1Hz += diff_counter_safe(timer1Hz, st.last_timer1Hz, st.rc_timer1Hz, ctx.with("timer1Hz"));
 
-                st.acc_parada_esm_cantidad += diff_counter_safe(parada_esm_cantidad, st.last_parada_esm_cantidad, st.rc_parada_esm_cantidad, 5000, 3, line, "esmalte", "parada_esm_cantidad");
+                st.acc_parada_esm_cantidad += diff_counter_safe(parada_esm_cantidad, st.last_parada_esm_cantidad, st.rc_parada_esm_cantidad, ctx.with("parada_esm_cantidad"));
 
-                st.acc_parada_esm_tiempo_s += diff_counter_safe(parada_esm_tiempo, st.last_parada_esm_tiempo, st.rc_parada_esm_tiempo, 5000, 3, line, "esmalte", "parada_esm_tiempo");
+                st.acc_parada_esm_tiempo_s += diff_counter_safe(parada_esm_tiempo, st.last_parada_esm_tiempo, st.rc_parada_esm_tiempo, ctx.with("parada_esm_tiempo"));
 
-                st.acc_metrica_esm_cantidad += diff_counter_safe(metrica_esm_cantidad, st.last_metrica_esm_cantidad, st.rc_metrica_esm_cantidad, 5000, 3, line, "esmalte", "metrica_esm_cantidad");
+                st.acc_metrica_esm_cantidad += diff_counter_safe(metrica_esm_cantidad, st.last_metrica_esm_cantidad, st.rc_metrica_esm_cantidad, ctx.with("metrica_esm_cantidad"));
 
-                st.acc_metrica_esm_tiempo_ds += diff_counter_safe(metrica_esm_tiempo, st.last_metrica_esm_tiempo, st.rc_metrica_esm_tiempo, 5000, 3, line, "esmalte", "metrica_esm_tiempo");
+                st.acc_metrica_esm_tiempo_ds += diff_counter_safe(metrica_esm_tiempo, st.last_metrica_esm_tiempo, st.rc_metrica_esm_tiempo, ctx.with("metrica_esm_tiempo"));
             }
 
             // Copy accumulated values to output
@@ -1395,6 +2268,12 @@ public:
             acc_parada_esm_tiempo_s_out = st.acc_parada_esm_tiempo_s;
             acc_metrica_esm_cantidad_out = st.acc_metrica_esm_cantidad;
             acc_metrica_esm_tiempo_ds_out = st.acc_metrica_esm_tiempo_ds;
+
+            // Guardar tras procesar el mensaje, dentro del mismo mutex que protege
+            // el estado: un corte de energía no da oportunidad de cerrar limpio, así
+            // que no vale dejarlo solo en SIGTERM.
+            unobserved_s = st.acc_unobserved_s;
+            persist_state(st, "esmalte", line, shiftNum);
         }
 
         // === Build output JSON with CORRECT semantic field names ===
@@ -1425,17 +2304,27 @@ public:
         // Convert deciseconds to seconds for convenience
         prod["metrica_esm_tiempo_turno_s"] = static_cast<double>(acc_metrica_esm_tiempo_ds_out) * 0.1;  // CF100: each tick = 0.1s (validated)
 
-        // Diagnostic log: confirm delta semantics after Arduino firmware fix
-        std::cerr << "[ESM diag] line=" << line
-                  << " metrica_esm_raw=" << metrica_esm_cantidad
-                  << " acc_metrica_turno=" << acc_metrica_esm_cantidad_out
-                  << " timer1Hz_raw=" << timer1Hz
-                  << " acc_timer1Hz_turno=" << acc_timer1Hz_out
-                  << " parada_esm_raw=" << parada_esm_cantidad
-                  << " acc_parada_turno=" << acc_parada_esm_cantidad_out
-                  << "\n";
+        // Diagnostic log: confirm delta semantics after Arduino firmware fix.
+        // Una línea por mensaje aceptado es demasiado para el camino caliente
+        // (~36.000 msg/día), así que queda tras CELIMA_DEBUG_ESM=1. El getenv se
+        // resuelve una sola vez.
+        static const bool esm_diag = [] {
+            const char* v = std::getenv("CELIMA_DEBUG_ESM");
+            return v && v[0] == '1';
+        }();
+        if (esm_diag) {
+            std::cerr << "[ESM diag] line=" << line
+                      << " metrica_esm_raw=" << metrica_esm_cantidad
+                      << " acc_metrica_turno=" << acc_metrica_esm_cantidad_out
+                      << " timer1Hz_raw=" << timer1Hz
+                      << " acc_timer1Hz_turno=" << acc_timer1Hz_out
+                      << " parada_esm_raw=" << parada_esm_cantidad
+                      << " acc_parada_turno=" << acc_parada_esm_cantidad_out
+                      << "\n";
+        }
 
         prod["timestamp_device"] = device_timestamp(msg);
+        add_unobserved_marker(prod, unobserved_s);
 
         // Alarms
         json qual;
@@ -1489,6 +2378,9 @@ private:
         int shift = 0;
 
         uint16_t last_accepted_timer1Hz = 0;
+        // Época del último mensaje ACEPTADO, para medir el hueco (D2).
+        // Semántica y unidad distintas a last_accepted_time (dedup): no reutilizar.
+        int64_t last_accepted_epoch_s = 0;
 
         // Timer
         uint16_t last_timer1Hz = 0;
@@ -1538,6 +2430,95 @@ private:
 
         // Void detection: accumulated seconds where no units entered the furnace
         uint32_t acc_sin_entrada_s = 0;
+
+        // Segundos del turno en curso que nadie observó (huecos por reinicio).
+        int64_t acc_unobserved_s = 0;
+        // Traza de re-siembra ya emitida por la restauración. No se serializa.
+        bool suppress_reseed_log = false;
+
+        // Serialización generada a partir de los miembros del struct: se
+        // persisten TODOS (acumuladores, tracking de raw, contadores de
+        // rechazo, EMA y estado de deduplicación), no solo los acc_*.
+        nlohmann::json to_json() const {
+            nlohmann::json j;
+            j["v"] = celima::kStateSchemaVersion;
+            j["acc_unobserved_s"] = acc_unobserved_s;
+            j["initialized"] = initialized;
+            j["shift"] = shift;
+            j["last_accepted_timer1Hz"] = last_accepted_timer1Hz;
+            j["last_accepted_epoch_s"] = last_accepted_epoch_s;
+            j["last_timer1Hz"] = last_timer1Hz;
+            j["rc_timer1Hz"] = rc_timer1Hz;
+            j["acc_timer1Hz"] = acc_timer1Hz;
+            j["last_numero_grades"] = last_numero_grades;
+            j["rc_numero_grades"] = rc_numero_grades;
+            j["acc_numero_grades"] = acc_numero_grades;
+            j["last_parada_mcf_cantidad"] = last_parada_mcf_cantidad;
+            j["rc_parada_mcf_cantidad"] = rc_parada_mcf_cantidad;
+            j["acc_parada_mcf_cantidad"] = acc_parada_mcf_cantidad;
+            j["last_parada_mcf_tiempo"] = last_parada_mcf_tiempo;
+            j["rc_parada_mcf_tiempo"] = rc_parada_mcf_tiempo;
+            j["acc_parada_mcf_tiempo_s"] = acc_parada_mcf_tiempo_s;
+            j["last_metrica_mcf_cantidad"] = last_metrica_mcf_cantidad;
+            j["rc_metrica_mcf_cantidad"] = rc_metrica_mcf_cantidad;
+            j["acc_metrica_mcf_cantidad"] = acc_metrica_mcf_cantidad;
+            j["last_metrica_mcf_tiempo"] = last_metrica_mcf_tiempo;
+            j["rc_metrica_mcf_tiempo"] = rc_metrica_mcf_tiempo;
+            j["acc_metrica_mcf_tiempo_ds"] = acc_metrica_mcf_tiempo_ds;
+            j["last_metrica_formador_cantidad"] = last_metrica_formador_cantidad;
+            j["rc_metrica_formador_cantidad"] = rc_metrica_formador_cantidad;
+            j["acc_metrica_formador_cantidad"] = acc_metrica_formador_cantidad;
+            j["last_metrica_formador_tiempo"] = last_metrica_formador_tiempo;
+            j["rc_metrica_formador_tiempo"] = rc_metrica_formador_tiempo;
+            j["acc_metrica_formador_tiempo_ds"] = acc_metrica_formador_tiempo_ds;
+            j["last_falha_forno_cantidad"] = last_falha_forno_cantidad;
+            j["rc_falha_forno_cantidad"] = rc_falha_forno_cantidad;
+            j["acc_falha_forno_cantidad"] = acc_falha_forno_cantidad;
+            j["last_falha_forno_tiempo"] = last_falha_forno_tiempo;
+            j["rc_falha_forno_tiempo"] = rc_falha_forno_tiempo;
+            j["acc_falha_forno_tiempo_s"] = acc_falha_forno_tiempo_s;
+            j["acc_sin_entrada_s"] = acc_sin_entrada_s;
+            return j;
+        }
+
+        void from_json(const nlohmann::json &j) {
+            acc_unobserved_s = j.value("acc_unobserved_s", acc_unobserved_s);
+            initialized = j.value("initialized", initialized);
+            shift = j.value("shift", shift);
+            last_accepted_timer1Hz = j.value("last_accepted_timer1Hz", last_accepted_timer1Hz);
+            last_accepted_epoch_s = j.value("last_accepted_epoch_s", last_accepted_epoch_s);
+            last_timer1Hz = j.value("last_timer1Hz", last_timer1Hz);
+            rc_timer1Hz = j.value("rc_timer1Hz", rc_timer1Hz);
+            acc_timer1Hz = j.value("acc_timer1Hz", acc_timer1Hz);
+            last_numero_grades = j.value("last_numero_grades", last_numero_grades);
+            rc_numero_grades = j.value("rc_numero_grades", rc_numero_grades);
+            acc_numero_grades = j.value("acc_numero_grades", acc_numero_grades);
+            last_parada_mcf_cantidad = j.value("last_parada_mcf_cantidad", last_parada_mcf_cantidad);
+            rc_parada_mcf_cantidad = j.value("rc_parada_mcf_cantidad", rc_parada_mcf_cantidad);
+            acc_parada_mcf_cantidad = j.value("acc_parada_mcf_cantidad", acc_parada_mcf_cantidad);
+            last_parada_mcf_tiempo = j.value("last_parada_mcf_tiempo", last_parada_mcf_tiempo);
+            rc_parada_mcf_tiempo = j.value("rc_parada_mcf_tiempo", rc_parada_mcf_tiempo);
+            acc_parada_mcf_tiempo_s = j.value("acc_parada_mcf_tiempo_s", acc_parada_mcf_tiempo_s);
+            last_metrica_mcf_cantidad = j.value("last_metrica_mcf_cantidad", last_metrica_mcf_cantidad);
+            rc_metrica_mcf_cantidad = j.value("rc_metrica_mcf_cantidad", rc_metrica_mcf_cantidad);
+            acc_metrica_mcf_cantidad = j.value("acc_metrica_mcf_cantidad", acc_metrica_mcf_cantidad);
+            last_metrica_mcf_tiempo = j.value("last_metrica_mcf_tiempo", last_metrica_mcf_tiempo);
+            rc_metrica_mcf_tiempo = j.value("rc_metrica_mcf_tiempo", rc_metrica_mcf_tiempo);
+            acc_metrica_mcf_tiempo_ds = j.value("acc_metrica_mcf_tiempo_ds", acc_metrica_mcf_tiempo_ds);
+            last_metrica_formador_cantidad = j.value("last_metrica_formador_cantidad", last_metrica_formador_cantidad);
+            rc_metrica_formador_cantidad = j.value("rc_metrica_formador_cantidad", rc_metrica_formador_cantidad);
+            acc_metrica_formador_cantidad = j.value("acc_metrica_formador_cantidad", acc_metrica_formador_cantidad);
+            last_metrica_formador_tiempo = j.value("last_metrica_formador_tiempo", last_metrica_formador_tiempo);
+            rc_metrica_formador_tiempo = j.value("rc_metrica_formador_tiempo", rc_metrica_formador_tiempo);
+            acc_metrica_formador_tiempo_ds = j.value("acc_metrica_formador_tiempo_ds", acc_metrica_formador_tiempo_ds);
+            last_falha_forno_cantidad = j.value("last_falha_forno_cantidad", last_falha_forno_cantidad);
+            rc_falha_forno_cantidad = j.value("rc_falha_forno_cantidad", rc_falha_forno_cantidad);
+            acc_falha_forno_cantidad = j.value("acc_falha_forno_cantidad", acc_falha_forno_cantidad);
+            last_falha_forno_tiempo = j.value("last_falha_forno_tiempo", last_falha_forno_tiempo);
+            rc_falha_forno_tiempo = j.value("rc_falha_forno_tiempo", rc_falha_forno_tiempo);
+            acc_falha_forno_tiempo_s = j.value("acc_falha_forno_tiempo_s", acc_falha_forno_tiempo_s);
+            acc_sin_entrada_s = j.value("acc_sin_entrada_s", acc_sin_entrada_s);
+        }
     };
 
     static std::mutex mtx_;
@@ -1558,6 +2539,8 @@ public:
 
         // === Read header fields ===
         int line = jsonu::get_opt<int>(msg, "lineID").value_or(0);
+        const auto dev_epoch = device_epoch_s(msg);
+        int64_t unobserved_s = 0;   // segundos del turno sin observar
         int alarms = jsonu::get_opt<int>(msg, "alarms").value_or(0);
         int checksum = jsonu::get_opt<int>(msg, "checksum").value_or(0);
         int deviceType = jsonu::get_opt<int>(msg, "deviceType").value_or(0);
@@ -1611,20 +2594,45 @@ public:
         {
             std::lock_guard<std::mutex> lock(mtx_);
             State &st = states_[line];
+            // Restauración del estado persistido, una vez por clave y arranque.
+            // Va PRIMERO: decide si este mensaje continúa el acumulador o lo pone a
+            // cero, y deja last_accepted_epoch_s en su sitio para que el hueco de
+            // abajo sea el real y no cero.
+            const int64_t restart_gap_s =
+                restore_state_if_needed(st, "entrada_horno", line, shiftNum, dev_epoch);
+            if (restart_gap_s > 0 && st.initialized)
+                st.acc_unobserved_s += restart_gap_s;   // caso 4: hueco dentro del turno
+
+            CounterCtx ctx{};
+            ctx.line = line;
+            ctx.proc = "entrada_horno";
+            ctx.rate_max_per_s = celima::rates().rate_per_s(line, ctx.proc);
+            ctx.margin         = celima::rates().margin();
+            // Hueco desde el último mensaje aceptado de esta clave. Sin epoch de
+            // dispositivo queda en 0 y la cota declara el delta implausible.
+            if (dev_epoch && st.last_accepted_epoch_s > 0)
+                ctx.elapsed_s = static_cast<double>(*dev_epoch - st.last_accepted_epoch_s);
 
             if (!st.initialized || st.shift != shiftNum) {
                 // reseed: una vez por procesador y línea, antes de pisar el estado.
-                celima::log::state_event("reseed", line, "entrada_horno",
-                    st.initialized
-                        ? ("reason=shift_change shift_prev=" + std::to_string(st.shift) +
-                           " shift_new=" + std::to_string(shiftNum))
-                        : ("reason=first_message shift=" + std::to_string(shiftNum)));
+                // suppress_reseed_log lo pone la restauración cuando ya emitió la
+                // traza del cambio de turno a través del reinicio.
+                if (!st.suppress_reseed_log)
+                    celima::log::state_event("reseed", line, "entrada_horno",
+                        st.initialized
+                            ? ("reason=shift_change shift_prev=" + std::to_string(st.shift) +
+                               " shift_new=" + std::to_string(shiftNum))
+                            : ("reason=first_message shift=" + std::to_string(shiftNum)));
                 // New shift - reset all accumulators and store initial values
                 st = State();
+                // Los segundos no observados pertenecen al turno: 0 en un cambio de
+                // turno normal, el hueco en un cambio a través de un reinicio (caso 2).
+                st.acc_unobserved_s = restart_gap_s;
                 st.initialized = true;
                 st.shift = shiftNum;
 
                 st.last_accepted_timer1Hz = timer1Hz;
+                if (dev_epoch) st.last_accepted_epoch_s = *dev_epoch;
                 st.last_timer1Hz = timer1Hz;
                 st.last_numero_grades = numero_grades;
                 st.last_parada_mcf_cantidad = parada_mcf_cantidad;
@@ -1644,29 +2652,30 @@ public:
                     return {};
                 }
                 st.last_accepted_timer1Hz = timer1Hz;
+                if (dev_epoch) st.last_accepted_epoch_s = *dev_epoch;
 
                 // Accumulate deltas — ALL PLC registers have bit-15 flag, use diff_counter for everything
-                uint32_t delta_timer = diff_counter_safe(timer1Hz, st.last_timer1Hz, st.rc_timer1Hz, 5000, 3, line, "entrada_horno", "timer1Hz");
+                uint32_t delta_timer = diff_counter_safe(timer1Hz, st.last_timer1Hz, st.rc_timer1Hz, ctx.with("timer1Hz"));
                 st.acc_timer1Hz += delta_timer;
 
-                st.acc_numero_grades += diff_counter_safe(numero_grades, st.last_numero_grades, st.rc_numero_grades, 5000, 3, line, "entrada_horno", "numero_grades");
+                st.acc_numero_grades += diff_counter_safe(numero_grades, st.last_numero_grades, st.rc_numero_grades, ctx.with("numero_grades"));
 
-                st.acc_parada_mcf_cantidad += diff_counter_safe(parada_mcf_cantidad, st.last_parada_mcf_cantidad, st.rc_parada_mcf_cantidad, 5000, 3, line, "entrada_horno", "parada_mcf_cantidad");
+                st.acc_parada_mcf_cantidad += diff_counter_safe(parada_mcf_cantidad, st.last_parada_mcf_cantidad, st.rc_parada_mcf_cantidad, ctx.with("parada_mcf_cantidad"));
 
-                st.acc_parada_mcf_tiempo_s += diff_counter_safe(parada_mcf_tiempo, st.last_parada_mcf_tiempo, st.rc_parada_mcf_tiempo, 5000, 3, line, "entrada_horno", "parada_mcf_tiempo");
+                st.acc_parada_mcf_tiempo_s += diff_counter_safe(parada_mcf_tiempo, st.last_parada_mcf_tiempo, st.rc_parada_mcf_tiempo, ctx.with("parada_mcf_tiempo"));
 
-                uint32_t delta_mcf = diff_counter_safe(metrica_mcf_cantidad, st.last_metrica_mcf_cantidad, st.rc_metrica_mcf_cantidad, 5000, 3, line, "entrada_horno", "metrica_mcf_cantidad");
+                uint32_t delta_mcf = diff_counter_safe(metrica_mcf_cantidad, st.last_metrica_mcf_cantidad, st.rc_metrica_mcf_cantidad, ctx.with("metrica_mcf_cantidad"));
                 st.acc_metrica_mcf_cantidad += delta_mcf;
 
-                st.acc_metrica_mcf_tiempo_ds += diff_counter_safe(metrica_mcf_tiempo, st.last_metrica_mcf_tiempo, st.rc_metrica_mcf_tiempo, 5000, 3, line, "entrada_horno", "metrica_mcf_tiempo");
+                st.acc_metrica_mcf_tiempo_ds += diff_counter_safe(metrica_mcf_tiempo, st.last_metrica_mcf_tiempo, st.rc_metrica_mcf_tiempo, ctx.with("metrica_mcf_tiempo"));
 
-                st.acc_metrica_formador_cantidad += diff_counter_safe(metrica_formador_cantidad, st.last_metrica_formador_cantidad, st.rc_metrica_formador_cantidad, 5000, 3, line, "entrada_horno", "metrica_formador_cantidad");
+                st.acc_metrica_formador_cantidad += diff_counter_safe(metrica_formador_cantidad, st.last_metrica_formador_cantidad, st.rc_metrica_formador_cantidad, ctx.with("metrica_formador_cantidad"));
 
-                st.acc_metrica_formador_tiempo_ds += diff_counter_safe(metrica_formador_tiempo, st.last_metrica_formador_tiempo, st.rc_metrica_formador_tiempo, 5000, 3, line, "entrada_horno", "metrica_formador_tiempo");
+                st.acc_metrica_formador_tiempo_ds += diff_counter_safe(metrica_formador_tiempo, st.last_metrica_formador_tiempo, st.rc_metrica_formador_tiempo, ctx.with("metrica_formador_tiempo"));
 
-                st.acc_falha_forno_cantidad += diff_counter_safe(falha_forno_cantidad, st.last_falha_forno_cantidad, st.rc_falha_forno_cantidad, 5000, 3, line, "entrada_horno", "falha_forno_cantidad");
+                st.acc_falha_forno_cantidad += diff_counter_safe(falha_forno_cantidad, st.last_falha_forno_cantidad, st.rc_falha_forno_cantidad, ctx.with("falha_forno_cantidad"));
 
-                st.acc_falha_forno_tiempo_s += diff_counter_safe(falha_forno_tiempo, st.last_falha_forno_tiempo, st.rc_falha_forno_tiempo, 5000, 3, line, "entrada_horno", "falha_forno_tiempo");
+                st.acc_falha_forno_tiempo_s += diff_counter_safe(falha_forno_tiempo, st.last_falha_forno_tiempo, st.rc_falha_forno_tiempo, ctx.with("falha_forno_tiempo"));
 
                 // Void detection: if no units entered this interval, count elapsed time as void
                 // delta_mcf == 0 means sensor saw zero new pieces since last message
@@ -1687,6 +2696,12 @@ public:
             acc_falha_forno_cantidad_out = st.acc_falha_forno_cantidad;
             acc_falha_forno_tiempo_s_out = st.acc_falha_forno_tiempo_s;
             acc_sin_entrada_s_out = st.acc_sin_entrada_s;
+
+            // Guardar tras procesar el mensaje, dentro del mismo mutex que protege
+            // el estado: un corte de energía no da oportunidad de cerrar limpio, así
+            // que no vale dejarlo solo en SIGTERM.
+            unobserved_s = st.acc_unobserved_s;
+            persist_state(st, "entrada_horno", line, shiftNum);
         }
 
         // === Build output JSON with CORRECT semantic field names ===
@@ -1737,6 +2752,7 @@ public:
         prod["sin_entrada_turno_s"] = acc_sin_entrada_s_out;
 
         prod["timestamp_device"] = device_timestamp(msg);
+        add_unobserved_marker(prod, unobserved_s);
 
         // Alarms
         json qual;
@@ -1782,6 +2798,9 @@ private:
         int shift = 0;
 
         uint16_t last_accepted_timer1Hz = 0;
+        // Época del último mensaje ACEPTADO, para medir el hueco (D2).
+        // Semántica y unidad distintas a last_accepted_time (dedup): no reutilizar.
+        int64_t last_accepted_epoch_s = 0;
 
         // All 16-bit counters - last values and accumulators
         uint16_t last_timer1Hz = 0;
@@ -1856,6 +2875,135 @@ private:
         // -1.0f = not yet initialized (uses floor threshold until first valid sample).
         float ema_metrica_ciclos     = -1.0f;
         float ema_barreira1_cantidad = -1.0f;
+
+        // Segundos del turno en curso que nadie observó (huecos por reinicio).
+        int64_t acc_unobserved_s = 0;
+        // Traza de re-siembra ya emitida por la restauración. No se serializa.
+        bool suppress_reseed_log = false;
+
+        // Serialización generada a partir de los miembros del struct: se
+        // persisten TODOS (acumuladores, tracking de raw, contadores de
+        // rechazo, EMA y estado de deduplicación), no solo los acc_*.
+        nlohmann::json to_json() const {
+            nlohmann::json j;
+            j["v"] = celima::kStateSchemaVersion;
+            j["acc_unobserved_s"] = acc_unobserved_s;
+            j["initialized"] = initialized;
+            j["shift"] = shift;
+            j["last_accepted_timer1Hz"] = last_accepted_timer1Hz;
+            j["last_accepted_epoch_s"] = last_accepted_epoch_s;
+            j["last_timer1Hz"] = last_timer1Hz;
+            j["rc_timer1Hz"] = rc_timer1Hz;
+            j["acc_timer1Hz"] = acc_timer1Hz;
+            j["acc_tiempo_operacion_s"] = acc_tiempo_operacion_s;
+            j["last_paradas_cantidad"] = last_paradas_cantidad;
+            j["rc_paradas_cantidad"] = rc_paradas_cantidad;
+            j["acc_paradas_cantidad"] = acc_paradas_cantidad;
+            j["last_paradas_tempo"] = last_paradas_tempo;
+            j["rc_paradas_tempo"] = rc_paradas_tempo;
+            j["acc_paradas_tempo"] = acc_paradas_tempo;
+            j["last_metrica_ciclos"] = last_metrica_ciclos;
+            j["rc_metrica_ciclos"] = rc_metrica_ciclos;
+            j["acc_metrica_ciclos"] = acc_metrica_ciclos;
+            j["last_metrica_tiempo"] = last_metrica_tiempo;
+            j["rc_metrica_tiempo"] = rc_metrica_tiempo;
+            j["acc_metrica_tiempo"] = acc_metrica_tiempo;
+            j["last_bancalinos_q301"] = last_bancalinos_q301;
+            j["rc_bancalinos_q301"] = rc_bancalinos_q301;
+            j["acc_bancalinos_q301"] = acc_bancalinos_q301;
+            j["last_bancalinos_q300"] = last_bancalinos_q300;
+            j["rc_bancalinos_q300"] = rc_bancalinos_q300;
+            j["acc_bancalinos_q300"] = acc_bancalinos_q300;
+            j["last_bancalinos_comb1"] = last_bancalinos_comb1;
+            j["rc_bancalinos_comb1"] = rc_bancalinos_comb1;
+            j["acc_bancalinos_comb1"] = acc_bancalinos_comb1;
+            j["last_bancalinos_comb2"] = last_bancalinos_comb2;
+            j["rc_bancalinos_comb2"] = rc_bancalinos_comb2;
+            j["acc_bancalinos_comb2"] = acc_bancalinos_comb2;
+            j["last_bancalinos_total"] = last_bancalinos_total;
+            j["rc_bancalinos_total"] = rc_bancalinos_total;
+            j["acc_bancalinos_total"] = acc_bancalinos_total;
+            j["last_parada_escolha_cantidad"] = last_parada_escolha_cantidad;
+            j["rc_parada_escolha_cantidad"] = rc_parada_escolha_cantidad;
+            j["acc_parada_escolha_cantidad"] = acc_parada_escolha_cantidad;
+            j["last_parada_escolha_tempo"] = last_parada_escolha_tempo;
+            j["rc_parada_escolha_tempo"] = rc_parada_escolha_tempo;
+            j["acc_parada_escolha_tempo"] = acc_parada_escolha_tempo;
+            j["last_sentido_escolha_cantidad"] = last_sentido_escolha_cantidad;
+            j["rc_sentido_escolha_cantidad"] = rc_sentido_escolha_cantidad;
+            j["acc_sentido_escolha_cantidad"] = acc_sentido_escolha_cantidad;
+            j["last_sentido_escolha_tiempo"] = last_sentido_escolha_tiempo;
+            j["rc_sentido_escolha_tiempo"] = rc_sentido_escolha_tiempo;
+            j["acc_sentido_escolha_tiempo"] = acc_sentido_escolha_tiempo;
+            j["last_barreira1_cantidad"] = last_barreira1_cantidad;
+            j["rc_barreira1_cantidad"] = rc_barreira1_cantidad;
+            j["acc_barreira1_cantidad"] = acc_barreira1_cantidad;
+            j["last_barreira1_tiempo"] = last_barreira1_tiempo;
+            j["rc_barreira1_tiempo"] = rc_barreira1_tiempo;
+            j["acc_barreira1_tiempo"] = acc_barreira1_tiempo;
+            j["ema_metrica_ciclos"] = ema_metrica_ciclos;
+            j["ema_barreira1_cantidad"] = ema_barreira1_cantidad;
+            return j;
+        }
+
+        void from_json(const nlohmann::json &j) {
+            acc_unobserved_s = j.value("acc_unobserved_s", acc_unobserved_s);
+            initialized = j.value("initialized", initialized);
+            shift = j.value("shift", shift);
+            last_accepted_timer1Hz = j.value("last_accepted_timer1Hz", last_accepted_timer1Hz);
+            last_accepted_epoch_s = j.value("last_accepted_epoch_s", last_accepted_epoch_s);
+            last_timer1Hz = j.value("last_timer1Hz", last_timer1Hz);
+            rc_timer1Hz = j.value("rc_timer1Hz", rc_timer1Hz);
+            acc_timer1Hz = j.value("acc_timer1Hz", acc_timer1Hz);
+            acc_tiempo_operacion_s = j.value("acc_tiempo_operacion_s", acc_tiempo_operacion_s);
+            last_paradas_cantidad = j.value("last_paradas_cantidad", last_paradas_cantidad);
+            rc_paradas_cantidad = j.value("rc_paradas_cantidad", rc_paradas_cantidad);
+            acc_paradas_cantidad = j.value("acc_paradas_cantidad", acc_paradas_cantidad);
+            last_paradas_tempo = j.value("last_paradas_tempo", last_paradas_tempo);
+            rc_paradas_tempo = j.value("rc_paradas_tempo", rc_paradas_tempo);
+            acc_paradas_tempo = j.value("acc_paradas_tempo", acc_paradas_tempo);
+            last_metrica_ciclos = j.value("last_metrica_ciclos", last_metrica_ciclos);
+            rc_metrica_ciclos = j.value("rc_metrica_ciclos", rc_metrica_ciclos);
+            acc_metrica_ciclos = j.value("acc_metrica_ciclos", acc_metrica_ciclos);
+            last_metrica_tiempo = j.value("last_metrica_tiempo", last_metrica_tiempo);
+            rc_metrica_tiempo = j.value("rc_metrica_tiempo", rc_metrica_tiempo);
+            acc_metrica_tiempo = j.value("acc_metrica_tiempo", acc_metrica_tiempo);
+            last_bancalinos_q301 = j.value("last_bancalinos_q301", last_bancalinos_q301);
+            rc_bancalinos_q301 = j.value("rc_bancalinos_q301", rc_bancalinos_q301);
+            acc_bancalinos_q301 = j.value("acc_bancalinos_q301", acc_bancalinos_q301);
+            last_bancalinos_q300 = j.value("last_bancalinos_q300", last_bancalinos_q300);
+            rc_bancalinos_q300 = j.value("rc_bancalinos_q300", rc_bancalinos_q300);
+            acc_bancalinos_q300 = j.value("acc_bancalinos_q300", acc_bancalinos_q300);
+            last_bancalinos_comb1 = j.value("last_bancalinos_comb1", last_bancalinos_comb1);
+            rc_bancalinos_comb1 = j.value("rc_bancalinos_comb1", rc_bancalinos_comb1);
+            acc_bancalinos_comb1 = j.value("acc_bancalinos_comb1", acc_bancalinos_comb1);
+            last_bancalinos_comb2 = j.value("last_bancalinos_comb2", last_bancalinos_comb2);
+            rc_bancalinos_comb2 = j.value("rc_bancalinos_comb2", rc_bancalinos_comb2);
+            acc_bancalinos_comb2 = j.value("acc_bancalinos_comb2", acc_bancalinos_comb2);
+            last_bancalinos_total = j.value("last_bancalinos_total", last_bancalinos_total);
+            rc_bancalinos_total = j.value("rc_bancalinos_total", rc_bancalinos_total);
+            acc_bancalinos_total = j.value("acc_bancalinos_total", acc_bancalinos_total);
+            last_parada_escolha_cantidad = j.value("last_parada_escolha_cantidad", last_parada_escolha_cantidad);
+            rc_parada_escolha_cantidad = j.value("rc_parada_escolha_cantidad", rc_parada_escolha_cantidad);
+            acc_parada_escolha_cantidad = j.value("acc_parada_escolha_cantidad", acc_parada_escolha_cantidad);
+            last_parada_escolha_tempo = j.value("last_parada_escolha_tempo", last_parada_escolha_tempo);
+            rc_parada_escolha_tempo = j.value("rc_parada_escolha_tempo", rc_parada_escolha_tempo);
+            acc_parada_escolha_tempo = j.value("acc_parada_escolha_tempo", acc_parada_escolha_tempo);
+            last_sentido_escolha_cantidad = j.value("last_sentido_escolha_cantidad", last_sentido_escolha_cantidad);
+            rc_sentido_escolha_cantidad = j.value("rc_sentido_escolha_cantidad", rc_sentido_escolha_cantidad);
+            acc_sentido_escolha_cantidad = j.value("acc_sentido_escolha_cantidad", acc_sentido_escolha_cantidad);
+            last_sentido_escolha_tiempo = j.value("last_sentido_escolha_tiempo", last_sentido_escolha_tiempo);
+            rc_sentido_escolha_tiempo = j.value("rc_sentido_escolha_tiempo", rc_sentido_escolha_tiempo);
+            acc_sentido_escolha_tiempo = j.value("acc_sentido_escolha_tiempo", acc_sentido_escolha_tiempo);
+            last_barreira1_cantidad = j.value("last_barreira1_cantidad", last_barreira1_cantidad);
+            rc_barreira1_cantidad = j.value("rc_barreira1_cantidad", rc_barreira1_cantidad);
+            acc_barreira1_cantidad = j.value("acc_barreira1_cantidad", acc_barreira1_cantidad);
+            last_barreira1_tiempo = j.value("last_barreira1_tiempo", last_barreira1_tiempo);
+            rc_barreira1_tiempo = j.value("rc_barreira1_tiempo", rc_barreira1_tiempo);
+            acc_barreira1_tiempo = j.value("acc_barreira1_tiempo", acc_barreira1_tiempo);
+            ema_metrica_ciclos = j.value("ema_metrica_ciclos", ema_metrica_ciclos);
+            ema_barreira1_cantidad = j.value("ema_barreira1_cantidad", ema_barreira1_cantidad);
+        }
     };
 
     static std::mutex mtx_;
@@ -1876,6 +3024,8 @@ public:
 
         // === Read header fields ===
         int line = jsonu::get_opt<int>(msg, "lineID").value_or(0);
+        const auto dev_epoch = device_epoch_s(msg);
+        int64_t unobserved_s = 0;   // segundos del turno sin observar
         int alarms = jsonu::get_opt<int>(msg, "alarms").value_or(0);
         int checksum = jsonu::get_opt<int>(msg, "checksum").value_or(0);
         int deviceType = jsonu::get_opt<int>(msg, "deviceType").value_or(0);
@@ -1951,20 +3101,45 @@ public:
         {
             std::lock_guard<std::mutex> lock(mtx_);
             State &st = states_[line];
+            // Restauración del estado persistido, una vez por clave y arranque.
+            // Va PRIMERO: decide si este mensaje continúa el acumulador o lo pone a
+            // cero, y deja last_accepted_epoch_s en su sitio para que el hueco de
+            // abajo sea el real y no cero.
+            const int64_t restart_gap_s =
+                restore_state_if_needed(st, "salida_horno", line, shiftNum, dev_epoch);
+            if (restart_gap_s > 0 && st.initialized)
+                st.acc_unobserved_s += restart_gap_s;   // caso 4: hueco dentro del turno
+
+            CounterCtx ctx{};
+            ctx.line = line;
+            ctx.proc = "salida_horno";
+            ctx.rate_max_per_s = celima::rates().rate_per_s(line, ctx.proc);
+            ctx.margin         = celima::rates().margin();
+            // Hueco desde el último mensaje aceptado de esta clave. Sin epoch de
+            // dispositivo queda en 0 y la cota declara el delta implausible.
+            if (dev_epoch && st.last_accepted_epoch_s > 0)
+                ctx.elapsed_s = static_cast<double>(*dev_epoch - st.last_accepted_epoch_s);
 
             if (!st.initialized || st.shift != shiftNum) {
                 // reseed: una vez por procesador y línea, antes de pisar el estado.
-                celima::log::state_event("reseed", line, "salida_horno",
-                    st.initialized
-                        ? ("reason=shift_change shift_prev=" + std::to_string(st.shift) +
-                           " shift_new=" + std::to_string(shiftNum))
-                        : ("reason=first_message shift=" + std::to_string(shiftNum)));
+                // suppress_reseed_log lo pone la restauración cuando ya emitió la
+                // traza del cambio de turno a través del reinicio.
+                if (!st.suppress_reseed_log)
+                    celima::log::state_event("reseed", line, "salida_horno",
+                        st.initialized
+                            ? ("reason=shift_change shift_prev=" + std::to_string(st.shift) +
+                               " shift_new=" + std::to_string(shiftNum))
+                            : ("reason=first_message shift=" + std::to_string(shiftNum)));
                 // New shift - reset all accumulators and store initial values
                 st = State();
+                // Los segundos no observados pertenecen al turno: 0 en un cambio de
+                // turno normal, el hueco en un cambio a través de un reinicio (caso 2).
+                st.acc_unobserved_s = restart_gap_s;
                 st.initialized = true;
                 st.shift = shiftNum;
 
                 st.last_accepted_timer1Hz = timer1Hz;
+                if (dev_epoch) st.last_accepted_epoch_s = *dev_epoch;
                 st.last_timer1Hz = timer1Hz;
                 st.last_paradas_cantidad = paradas_cantidad;
                 st.last_paradas_tempo = paradas_tempo;
@@ -1990,6 +3165,7 @@ public:
                     return {};
                 }
                 st.last_accepted_timer1Hz = timer1Hz;
+                if (dev_epoch) st.last_accepted_epoch_s = *dev_epoch;
 
                 // Corrupt-frame detection using counter fields only.
                 // Time fields (~1869/interval) exceed any useful detection floor and
@@ -2014,39 +3190,39 @@ public:
                     spike_ema_update(st.ema_barreira1_cantidad, rd_b1c);
 
                     // Accumulate deltas — ALL PLC registers have bit-15 flag, use diff_counter for everything
-                    uint16_t delta_timer = diff_counter_safe(timer1Hz, st.last_timer1Hz, st.rc_timer1Hz, 5000, 3, line, "salida_horno", "timer1Hz");
+                    uint16_t delta_timer = diff_counter_safe(timer1Hz, st.last_timer1Hz, st.rc_timer1Hz, ctx.with("timer1Hz"));
                     st.acc_timer1Hz += delta_timer;
                     st.acc_tiempo_operacion_s += delta_timer;
 
-                    st.acc_paradas_cantidad += diff_counter_safe(paradas_cantidad, st.last_paradas_cantidad, st.rc_paradas_cantidad, 5000, 3, line, "salida_horno", "paradas_cantidad");
+                    st.acc_paradas_cantidad += diff_counter_safe(paradas_cantidad, st.last_paradas_cantidad, st.rc_paradas_cantidad, ctx.with("paradas_cantidad"));
 
-                    st.acc_paradas_tempo += diff_counter_safe(paradas_tempo, st.last_paradas_tempo, st.rc_paradas_tempo, 5000, 3, line, "salida_horno", "paradas_tempo");
+                    st.acc_paradas_tempo += diff_counter_safe(paradas_tempo, st.last_paradas_tempo, st.rc_paradas_tempo, ctx.with("paradas_tempo"));
 
-                    st.acc_metrica_ciclos += diff_counter_safe(metrica_ciclos, st.last_metrica_ciclos, st.rc_metrica_ciclos, 5000, 3, line, "salida_horno", "metrica_ciclos");
+                    st.acc_metrica_ciclos += diff_counter_safe(metrica_ciclos, st.last_metrica_ciclos, st.rc_metrica_ciclos, ctx.with("metrica_ciclos"));
 
-                    st.acc_metrica_tiempo += diff_counter_safe(metrica_tiempo, st.last_metrica_tiempo, st.rc_metrica_tiempo, 5000, 3, line, "salida_horno", "metrica_tiempo");
+                    st.acc_metrica_tiempo += diff_counter_safe(metrica_tiempo, st.last_metrica_tiempo, st.rc_metrica_tiempo, ctx.with("metrica_tiempo"));
 
-                    st.acc_bancalinos_q301 += diff_counter_safe(bancalinos_q301, st.last_bancalinos_q301, st.rc_bancalinos_q301, 5000, 3, line, "salida_horno", "bancalinos_q301");
+                    st.acc_bancalinos_q301 += diff_counter_safe(bancalinos_q301, st.last_bancalinos_q301, st.rc_bancalinos_q301, ctx.with("bancalinos_q301"));
 
-                    st.acc_bancalinos_q300 += diff_counter_safe(bancalinos_q300, st.last_bancalinos_q300, st.rc_bancalinos_q300, 5000, 3, line, "salida_horno", "bancalinos_q300");
+                    st.acc_bancalinos_q300 += diff_counter_safe(bancalinos_q300, st.last_bancalinos_q300, st.rc_bancalinos_q300, ctx.with("bancalinos_q300"));
 
-                    st.acc_bancalinos_comb1 += diff_counter_safe(bancalinos_comb1, st.last_bancalinos_comb1, st.rc_bancalinos_comb1, 5000, 3, line, "salida_horno", "bancalinos_comb1");
+                    st.acc_bancalinos_comb1 += diff_counter_safe(bancalinos_comb1, st.last_bancalinos_comb1, st.rc_bancalinos_comb1, ctx.with("bancalinos_comb1"));
 
-                    st.acc_bancalinos_comb2 += diff_counter_safe(bancalinos_comb2, st.last_bancalinos_comb2, st.rc_bancalinos_comb2, 5000, 3, line, "salida_horno", "bancalinos_comb2");
+                    st.acc_bancalinos_comb2 += diff_counter_safe(bancalinos_comb2, st.last_bancalinos_comb2, st.rc_bancalinos_comb2, ctx.with("bancalinos_comb2"));
 
-                    st.acc_bancalinos_total += diff_counter_safe(bancalinos_total, st.last_bancalinos_total, st.rc_bancalinos_total, 5000, 3, line, "salida_horno", "bancalinos_total");
+                    st.acc_bancalinos_total += diff_counter_safe(bancalinos_total, st.last_bancalinos_total, st.rc_bancalinos_total, ctx.with("bancalinos_total"));
 
-                    st.acc_parada_escolha_cantidad += diff_counter_safe(parada_escolha_cantidad, st.last_parada_escolha_cantidad, st.rc_parada_escolha_cantidad, 5000, 3, line, "salida_horno", "parada_escolha_cantidad");
+                    st.acc_parada_escolha_cantidad += diff_counter_safe(parada_escolha_cantidad, st.last_parada_escolha_cantidad, st.rc_parada_escolha_cantidad, ctx.with("parada_escolha_cantidad"));
 
-                    st.acc_parada_escolha_tempo += diff_counter_safe(parada_escolha_tempo, st.last_parada_escolha_tempo, st.rc_parada_escolha_tempo, 5000, 3, line, "salida_horno", "parada_escolha_tempo");
+                    st.acc_parada_escolha_tempo += diff_counter_safe(parada_escolha_tempo, st.last_parada_escolha_tempo, st.rc_parada_escolha_tempo, ctx.with("parada_escolha_tempo"));
 
-                    st.acc_sentido_escolha_cantidad += diff_counter_safe(sentido_escolha_cantidad, st.last_sentido_escolha_cantidad, st.rc_sentido_escolha_cantidad, 5000, 3, line, "salida_horno", "sentido_escolha_cantidad");
+                    st.acc_sentido_escolha_cantidad += diff_counter_safe(sentido_escolha_cantidad, st.last_sentido_escolha_cantidad, st.rc_sentido_escolha_cantidad, ctx.with("sentido_escolha_cantidad"));
 
-                    st.acc_sentido_escolha_tiempo += diff_counter_safe(sentido_escolha_tiempo, st.last_sentido_escolha_tiempo, st.rc_sentido_escolha_tiempo, 5000, 3, line, "salida_horno", "sentido_escolha_tiempo");
+                    st.acc_sentido_escolha_tiempo += diff_counter_safe(sentido_escolha_tiempo, st.last_sentido_escolha_tiempo, st.rc_sentido_escolha_tiempo, ctx.with("sentido_escolha_tiempo"));
 
-                    st.acc_barreira1_cantidad += diff_counter_safe(barreira1_cantidad, st.last_barreira1_cantidad, st.rc_barreira1_cantidad, 5000, 3, line, "salida_horno", "barreira1_cantidad");
+                    st.acc_barreira1_cantidad += diff_counter_safe(barreira1_cantidad, st.last_barreira1_cantidad, st.rc_barreira1_cantidad, ctx.with("barreira1_cantidad"));
 
-                    st.acc_barreira1_tiempo += diff_counter_safe(barreira1_tiempo, st.last_barreira1_tiempo, st.rc_barreira1_tiempo, 5000, 3, line, "salida_horno", "barreira1_tiempo");
+                    st.acc_barreira1_tiempo += diff_counter_safe(barreira1_tiempo, st.last_barreira1_tiempo, st.rc_barreira1_tiempo, ctx.with("barreira1_tiempo"));
                 }
             }
 
@@ -2068,6 +3244,12 @@ public:
             acc_sentido_escolha_tiempo_out = st.acc_sentido_escolha_tiempo;
             acc_barreira1_cantidad_out = st.acc_barreira1_cantidad;
             acc_barreira1_tiempo_out = st.acc_barreira1_tiempo;
+
+            // Guardar tras procesar el mensaje, dentro del mismo mutex que protege
+            // el estado: un corte de energía no da oportunidad de cerrar limpio, así
+            // que no vale dejarlo solo en SIGTERM.
+            unobserved_s = st.acc_unobserved_s;
+            persist_state(st, "salida_horno", line, shiftNum);
         }
 
         // === Build output JSON with BACKWARD COMPATIBLE field names ===
@@ -2144,6 +3326,7 @@ public:
         prod["paradaEscolhaTempo_turno"] = acc_parada_escolha_tempo_out;  // firmware Arduino ya corrige alineamiento de bit
 
         prod["timestamp_device"] = device_timestamp(msg);
+        add_unobserved_marker(prod, unobserved_s);
 
         // Alarms
         json qual;

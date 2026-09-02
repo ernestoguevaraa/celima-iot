@@ -6,6 +6,10 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=/etc/default/iot-celima-mqtt
+# Crea /var/lib/iot-celima-mqtt con los permisos correctos, incluso cuando el
+# servicio deje de correr como root. ProtectSystem/ProtectHome/PrivateTmp
+# dejan fuera cualquier otra ubicación.
+StateDirectory=iot-celima-mqtt
 ExecStart=/usr/local/bin/iot-celima-mqtt
 Restart=on-failure
 RestartSec=3

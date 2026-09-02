@@ -1,4 +1,6 @@
 #include "MqttApp.hpp"
+#include "RateConfig.hpp"
+#include "StateStore.hpp"
 #include <cstdlib>
 #include <iostream>
 #include <string>
@@ -35,6 +37,15 @@ int main(int argc, char** argv) {
             std::cerr << "[WARN] SHIFT_MODE inválido '" << sm << "', usando 3.\n";
     }
     std::cout << "[CONFIG] Modo de turnos: " << shift_mode << "\n";
+
+    // Cota de plausibilidad: tasas por línea y máquina. Si el archivo falta o
+    // no parsea, load_from_env() lo registra y sigue con el valor por defecto
+    // (conservador), nunca aborta.
+    celima::rates().load_from_env();
+
+    // Persistencia del estado de turno. Si la base no se puede abrir, se
+    // registra y el servicio sigue solo en memoria: nunca aborta por esto.
+    celima::init_state_store_from_env();
 
     if (argc > 1) broker = argv[1];
     if (argc > 2) client = argv[2];

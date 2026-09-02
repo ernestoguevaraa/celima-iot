@@ -1,0 +1,37 @@
+// Tasas máximas de producción por línea y máquina, en unidades por hora.
+//
+// Alimentan la cota de plausibilidad escalada por tiempo:
+//
+//     max_plausible = (tasa / 3600) * segundos_de_hueco * margin
+//
+// Con el techo mínimo de 5000 por delta, así que en intervalos normales
+// (~180 s) esto no cambia nada: solo decide cuánta producción se puede
+// recuperar tras un hueco largo (reinicio del servicio o del host).
+//
+// REGLA: ante la duda, un valor BAJO. Tasa baja -> cota baja -> más descartes
+// -> total subcontado, que es el lado seguro del error. Un total bajo se
+// investiga; uno inflado se reporta como producción real y nadie lo cuestiona.
+//
+// Las entradas de "lines" están vacías A PROPÓSITO: las tasas por línea y
+// máquina deben derivarse del percentil 99 de los deltas observados
+// (los *_raw y los [STATE] delta_rejected del journal), no de una estimación.
+// Mientras estén vacías, todas las claves usan default_rate_per_h.
+//
+// Formato, con los nombres de máquina tal como aparecen en los tópicos ISA-95
+// y en los eventos [STATE]:
+//
+//   "lines": {
+//     "1": { "prensa_hidraulica1": 1500, "salida_secador": 1400 },
+//     "2": { "salida_horno": 900 }
+//   }
+//
+// Máquinas válidas: prensa_hidraulica1, prensa_hidraulica2, entrada_secador,
+// salida_secador, esmalte, entrada_horno, salida_horno, calidad.
+//
+// Tras editar: systemctl restart iot-celima-mqtt (se lee solo al arrancar).
+// El servicio registra en el journal qué cargó, o por qué no pudo.
+{
+  "default_rate_per_h": 600,
+  "margin": 1.5,
+  "lines": {}
+}

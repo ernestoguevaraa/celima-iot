@@ -39,6 +39,12 @@
 bin
 _pkg
 
+# Estado de runtime: la base de acumuladores de turno y sus ficheros WAL.
+# Nunca va al repo ni al paquete; la crea el servicio en StateDirectory=.
+*.db
+*.db-wal
+*.db-shm
+
 # debug information files
 *.dwo
 
