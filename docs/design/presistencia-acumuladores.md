@@ -1,10 +1,23 @@
 # Persistencia de estado de los acumuladores de turno
 
-Nota de diseño para implementar en `celima-iot`.
-Fecha original: 2026-08-27. **Revisado el 2026-09-02 contra `main@0ac7a9c`** (13 jul 2026), que es el
-código real desplegado. La versión anterior de este documento se escribió contra una copia de
-`MessageProcessor.cpp` de febrero y contenía dos afirmaciones falsas; están corregidas abajo y
-marcadas.
+Nota de diseño de `celima-iot`.
+Fecha original: 2026-08-27. Revisado el 2026-09-02 contra `main@0ac7a9c`, que era el código real
+desplegado; la versión anterior se había escrito contra una copia de `MessageProcessor.cpp` de
+febrero y contenía dos afirmaciones falsas, corregidas y marcadas abajo. **Actualizado el
+2026-09-03 contra `main@e860857`**, con D1 y D2 ya implementados y con el defecto D4 que apareció
+al implementarlos.
+
+## Estado
+
+| | estado |
+|---|---|
+| D1 — estado en RAM | **corregido** (`bf5afb3`), persistencia en SQLite |
+| D2 — cota plana | **corregido** (`bf5afb3` + `63386bb`), escalada por tiempo y por familia |
+| D3 — arranque desfasado PLC/PC | abierto; lo mitiga la migración a VM, no el código |
+| D4 — identidad de turno | **corregido** (`e860857`); lo creó la corrección de D1 |
+
+Los criterios de derivación de las tasas y sus pendientes viven en
+`docs/design/cota-plausibilidad-y-tasas.md`.
 
 ## Problema
 
@@ -65,6 +78,31 @@ entregar. Esa producción no está en ninguna base de datos.
 D3 no es un defecto del código, pero condiciona su diseño: determina cuánta producción debe
 recuperar el primer delta tras el hueco. Los huecos de 31 h y 26 h de agosto son D3, no D1.
 
+**D4 — la identidad de un turno no es su número.** *(Detectado el 2026-09-03, al revisar la
+implementación de D1 contra logs reales.)* La lógica de restauración comparaba `stored.shift !=
+shiftNum` para decidir si el estado guardado pertenecía al turno en curso. Pero el número de turno
+es 1, 2 o 3 y **se repite cada día**.
+
+Con un hueco de ~24 h o más —justo los de 26 h y 31 h documentados en D3— el número coincide y el
+estado del día anterior se restaura como si fuera del turno de hoy:
+
+```
+día 1, 15:17  cae el servicio           turno 1 (desde las 06:00 del día 1)
+día 2, 17:20  vuelve el servicio        turno 1 (desde las 06:00 del día 2)
+              stored.shift == shiftNum  -> "mismo turno" -> restaura los acumuladores de ayer
+```
+
+El turno de hoy arranca con el total de ayer: **inflación**, el error peligroso, y disparándose
+exactamente en el escenario que D3 describe.
+
+**Este defecto no existía antes de corregir D1.** Sin persistencia el estado moría con el proceso,
+así que el número de turno bastaba para decidir. Persistir es lo que lo creó — el mismo patrón que
+la regla de oro de abajo, y el segundo caso en este mismo trabajo.
+
+Corrección: `shift_start_epoch()` en `inc/Shift.hpp` devuelve la época del arranque del turno que
+contiene un instante dado, en hora local, restando 24 h cuando el turno cruzó medianoche. Comparar
+ese valor distingue dos instancias del mismo número. La restauración compara instancias, no números.
+
 ## Regla de oro del orden
 
 **D1 y D2 se corrigen en el mismo release.** Persistir el estado sin escalar la cota por tiempo
@@ -74,6 +112,11 @@ reporte corto por uno inflado, que es peor porque nadie lo cuestiona.
 
 Lo mismo ocurre al migrar a la VM aunque no se toque el código: la VM sigue encendida mientras la
 planta se apaga, así que el estado sobrevive y el riesgo de inflar queda expuesto igual.
+
+**El patrón se repitió una segunda vez.** D4 no existía mientras el estado moría con el proceso;
+apareció al persistirlo. La lección operativa: cada vez que se alarga la vida del estado, hay que
+volver a preguntarse qué suposiciones dependían de que fuera efímero. En este caso, que el número
+de turno identificaba un turno.
 
 La VM **sí** resuelve D3 en su mayor parte, porque elimina la espera del botón. No del todo: sigue
 habiendo desfase entre el arranque de los PLC y el de los servicios, ahora de minutos.
@@ -169,20 +212,50 @@ Por clave `(procesador, línea)`:
 - todos los `last_*` / `prev_ref`
 - `reject_count` y las EMA de detección de picos, para no reiniciar la heurística en cada arranque
 - `shift`
-- `updated_at` — **imprescindible**, sin él no se calcula la cota ni se mide el hueco
+- `updated_at` — **imprescindible** por partida doble: sin él no se calcula la cota, no se mide el
+  hueco y no se puede identificar la instancia de turno del estado guardado (D4)
 
 **Incluye a `CalidadProcessor`.** *(Corregido: la versión anterior lo excluía.)* Ver abajo.
 
 ## Lógica de restauración al arrancar
 
-1. No hay estado guardado → sembrar, `acc_* = 0`. Comportamiento actual.
-2. `stored.shift != shiftNum` → `acc_* = 0`, sembrar.
-3. Mismo turno, hueco corto → restaurar todo y continuar normal.
-4. Mismo turno, hueco largo → restaurar los `acc_*` y aplicar la cota escalada al primer delta. Se
-   conserva el total del turno y no se adivina lo ocurrido en el hueco.
-5. El hueco abarcó una o más fronteras de turno (caso típico de D3) → acumuladores a cero, sin
-   arrastre, y el turno en curso se marca como incompleto: parte de él transcurrió sin que nadie
-   escuchara y no es recuperable por ninguna vía.
+La comparación es por **instancia de turno**, no por número (ver D4):
+
+```
+shift_start_epoch(stored.updated_at) == shift_start_epoch(timestamp_del_mensaje)
+```
+
+1. No hay estado guardado → sembrar, `acc_* = 0`.
+2. Distinta instancia de turno → `acc_* = 0`, sembrar. Cubre tanto el cambio de turno normal como
+   el hueco de más de un día que cae en el mismo número.
+3. Misma instancia, hueco corto → restaurar todo y continuar normal.
+4. Misma instancia, hueco largo → restaurar los `acc_*` y aplicar la cota escalada al primer delta.
+   Se conserva el total del turno y no se adivina lo ocurrido en el hueco.
+5. El hueco abarcó una o más fronteras de turno (caso típico de D3) → cae en el caso 2 por
+   construcción: acumuladores a cero, sin arrastre, y el turno en curso queda marcado como
+   incompleto.
+
+`gap_short` separa los casos 3 y 4. **El intervalo real medido en planta es 187 s**, no los 180
+nominales —el reloj del Arduino corre algo largo— y **entrada horno publica cada ~127 s**. Un
+`gap_short` calculado como múltiplo del nominal debe partir del valor real de cada clase.
+
+### Qué se recupera y qué no
+
+El caso 4 recupera lo que la cota permite, y la cota depende de la familia del contador. Con el
+módulo de 16 bits, el horizonte es:
+
+| familia | tasa | recuperación posible hasta |
+|---|---:|---:|
+| evento (~900 u/h) | 0,25/s | 48,5 h |
+| `*_tiempo_s`, `timer1Hz` | 1 tick/s | 12,1 h |
+| `*_tiempo_ds` | 10 ticks/s | **1,2 h** |
+
+Es decir: **tras un corte largo se recupera la producción pero no el tiempo de operación**. Un
+contador de decisegundos avanza 36.000 por hora y da la vuelta cada 1,8 h, así que su delta es
+ambiguo por construcción pasada una hora de hueco. En los cortes de 5 h y 28 h registrados no hay
+nada que hacer. La corrección de las familias acotó el problema a huecos de menos de una hora; no
+lo eliminó, y conviene no darlo por resuelto. Detalle en
+`docs/design/cota-plausibilidad-y-tasas.md`.
 
 ## Almacenamiento
 
@@ -213,8 +286,10 @@ comparando `timer1Hz_turno` entre tópicos del journal. Una línea de log habrí
 **Marcar el turno incompleto.** Ante un hueco largo, además de re-sembrar, publicar una marca —mejor
 los segundos de turno no observados— junto al total. Como el pipeline hacia AWS **no admite corregir
 datos ya enviados**, un total bajo sin marca es indistinguible de un turno flojo y nadie podrá
-reexpresarlo. Depende de que el `boxer-patrol-edge-processor` propague campos desconocidos: hay que
-confirmarlo antes de implementarlo.
+reexpresarlo. Depende de que el `boxer-patrol-edge-processor` propague campos desconocidos. **Implementado pero
+desactivado por defecto** tras `CELIMA_INCOMPLETE_SHIFT_MARKER=1`, a la espera de esa confirmación:
+publicar un campo que el siguiente salto descarta no sirve de nada, y añadirlo sin avisar cambia el
+contrato de la trama.
 
 ## Pruebas que conviene cubrir
 
@@ -232,6 +307,22 @@ El repo **no tiene ninguna prueba ni framework**; esto implica montarlo.
   camino de los 3 rechazos.
 - `SHIFT_MODE=2` y `SHIFT_MODE=3` → fronteras correctas en ambos.
 - `current_shift_localtime()` con `TZ=UTC` → la prueba de fronteras **debe fallar**.
+- **Hueco de ~24 h que cae en el mismo número de turno → NO se restauran los acumuladores** (D4).
+  Es el caso que un test por número de turno deja pasar en verde.
+- Turno que cruza medianoche (18:00 y 22:00): `shift_start_epoch` debe devolver el arranque de
+  ayer, no el de hoy.
+- El fixture de replay debe ser físicamente coherente: `timer1Hz` avanza exactamente los segundos
+  transcurridos, y los acumuladores de tiempo a 1 y 10 ticks/s según su familia.
+
+## Tramas que el decoder no pudo interpretar
+
+Al revisar tráfico real apareció una clase de trama que llega a `celima/data` sin ser una lectura
+válida del PLC: el decoder del network server no pudo interpretarla. Procesarlas contamina los
+acumuladores con valores que no vienen de ningún contador.
+
+`is_decoder_error()` las detecta y `handle_celima_data` corta antes de crear el procesador, así que
+ni se acumulan ni se publican. Es un filtro de entrada, no una cota: la cota protege de deltas
+absurdos entre lecturas válidas, no de tramas que no son lecturas.
 
 ## Evidencia de campo: incidente del 1 de septiembre de 2026
 
