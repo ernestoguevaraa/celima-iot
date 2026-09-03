@@ -39,6 +39,18 @@ std::unique_ptr<IMessageProcessor> createProcessor(DeviceType dt);
  */
 std::unique_ptr<IMessageProcessor> createDefaultProcessor();
 
+/**
+ * Trama que el decoder del gateway no pudo interpretar. No se procesa ni se
+ * publica nada de ella.
+ *
+ * El caso cotidiano son los pings de 1 byte que los Arduino mandan para que el
+ * gateway no los desconecte (10,7% del tráfico medido): llegan sin deviceType.
+ * Pero el descarte va en el enrutado y no en el procesador por defecto, porque
+ * una trama con _error Y un deviceType válido llegaría a su procesador real con
+ * los contadores a cero, y eso sí toca acumuladores.
+ */
+bool is_decoder_error(const nlohmann::json& msg);
+
 bool detect_global_shift_change(int currentShift);
 void reset_all_processor_states();
 

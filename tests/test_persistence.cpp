@@ -119,7 +119,9 @@ TEST_CASE("se guarda en cada mensaje aceptado, no solo al salir") {
 }
 
 TEST_CASE("hueco largo dentro del turno: recupera y marca los no observados") {
-    testsup::pin_local_hour(10);
+    // 07:00 + 5 h = 12:03, dentro del mismo turno (S1 = 06–14 en modo 3). Si se
+    // fijara a las 10:00 el hueco cruzaría las 14:00 y sería el caso 2.
+    testsup::pin_local_hour(7);
     testsup::rates_for_tests();
     install_memory_store();
     simulate_restart();
@@ -149,7 +151,11 @@ TEST_CASE("hueco largo dentro del turno: recupera y marca los no observados") {
 }
 
 TEST_CASE("hueco que excede el módulo: re-siembra sin sumar") {
-    testsup::pin_local_hour(10);
+    // El módulo solo es alcanzable dentro de un mismo turno para los contadores
+    // de tiempo: a 10 ticks/s la cota llega a 65.536 en 1,2 h. Un contador de
+    // evento necesitaría 12 h, y a esas alturas ya cambió el turno, que es otro
+    // caso (el 2). 07:00 + 2 h = 09:00, mismo turno.
+    testsup::pin_local_hour(7);
     testsup::rates_for_tests();
     install_memory_store();
     simulate_restart();
@@ -161,17 +167,20 @@ TEST_CASE("hueco que excede el módulo: re-siembra sin sumar") {
     }
     simulate_restart();
 
-    // 15 h después: la cota alcanzaría el módulo de 65.536, así que el delta es
-    // ambiguo por construcción y no se intenta recuperar.
-    json m = testsup::make_frame(3, 5, 300);
-    m["ingreso_elevador_cantidad"] = 40000;
+    json m = testsup::make_frame(3, 5, 41);        // +2 h
+    m["ingreso_elevador_tiempo_ds"] = 40000;       // familia tiempo_ds
 
     auto proc = createProcessor(DeviceType::Entrada_secador);
     std::vector<Publication> pubs;
     const std::string log = capture_streams([&] { pubs = proc->process(m, kPfx, 3); });
 
-    CHECK(count_lines(log, {"[STATE] delta_rejected", "reason=ambiguous_module"}) >= 1);
-    CHECK(turno_ingreso(pubs) == 64);              // se conserva el total, no se infla
+    CHECK(count_lines(log, {"[STATE] delta_rejected", "family=tiempo_ds",
+                            "reason=ambiguous_module"}) >= 1);
+    // El de evento se restaura y recupera el hueco: 64 previos + 40 intervalos.
+    CHECK(turno_ingreso(pubs) == 64 + 64 * 40);
+    // El de tiempo conserva lo restaurado pero NO suma el delta del hueco, que
+    // es ambiguo: se queda en los 64 que traía de antes del corte.
+    CHECK(json::parse(pubs[1].payload)["ingreso_elevador_tiempo_turno_ds"] == 64);
 
     celima::set_state_store(nullptr);
 }
@@ -237,7 +246,7 @@ TEST_CASE("estado con versión de esquema desconocida: se ignora y re-siembra") 
         json bad;
         bad["v"] = celima::kStateSchemaVersion + 1;
         bad["acc_ingreso_elevador_cantidad"] = 999999;
-        REQUIRE(sq->save("entrada_secador", 8, 1, testsup::kBaseEpoch, bad));
+        REQUIRE(sq->save("entrada_secador", 8, 1, testsup::base_epoch(), bad));
 
         celima::StoredState out;
         const std::string log = capture_streams([&] {
@@ -310,7 +319,7 @@ TEST_CASE("base corrupta o no abrible: el servicio se comporta como hoy") {
 
 TEST_CASE("calidad también persiste: es tan vulnerable a D1 como las demás") {
     testsup::pin_local_hour(10);
-    testsup::rates_for_tests();
+    testsup::rates_for_tests(1350.0);
     install_memory_store();
     simulate_restart();
 
@@ -391,9 +400,92 @@ TEST_CASE("marcador de turno incompleto: apagado por defecto, publicable a deman
     set_incomplete_shift_marker_for_tests(true);
     prod = json::parse(proc->process(testsup::make_frame(3, 12, 102), kPfx, 3)[1].payload);
     REQUIRE(prod.contains("turno_segundos_no_observados"));
-    // 100 intervalos de 180 s entre la última trama vista y el regreso.
-    CHECK(prod["turno_segundos_no_observados"].get<int64_t>() == 100 * 180);
+    // El hueco de 5 h cruzó la frontera de las 14:00, así que el turno en curso
+    // empezó ahí y lo no observado es desde su arranque hasta la primera trama
+    // —no el hueco completo, que incluye tiempo del turno anterior y podía
+    // acabar superando la duración del turno.
+    const int64_t no_obs = prod["turno_segundos_no_observados"].get<int64_t>();
+    CHECK(no_obs > 0);
+    CHECK(no_obs < 8 * 3600);                    // nunca más que el turno
+    CHECK(no_obs == 3600 + 101 * 180 - 5 * 3600 + 0);
 
     clear_incomplete_shift_marker_override();
+    celima::set_state_store(nullptr);
+}
+
+TEST_CASE("un hueco que abarca un turno completo no arrastra el total anterior") {
+    // El turno se identificaba solo por su número (1/2/3), sin fecha. Un hueco
+    // de ~24 h cae en el MISMO número de turno, así que la restauración lo
+    // tomaba por "mismo turno" y devolvía los acumuladores del día anterior
+    // como total del turno de hoy. Los huecos documentados de D3 son de 26 h y
+    // 31 h: es el caso real, no uno teórico.
+    testsup::pin_local_hour(10);
+    testsup::rates_for_tests();
+    install_memory_store();
+    simulate_restart();
+
+    {
+        auto proc = createProcessor(DeviceType::Entrada_secador);
+        proc->process(testsup::make_frame(3, 20, 0), kPfx, 3);
+        for (int tick = 1; tick <= 20; ++tick)
+            proc->process(testsup::make_frame(3, 20, tick), kPfx, 3);
+        // 20 intervalos * 64 = 1280 acumulados en el turno de ayer
+        CHECK(turno_ingreso(proc->process(testsup::make_frame(3, 20, 21), kPfx, 3)) == 1344);
+    }
+    simulate_restart();
+
+    // Vuelve 24 h después: mismo número de turno, otro turno.
+    auto proc = createProcessor(DeviceType::Entrada_secador);
+    const std::string log = capture_streams([&] {
+        proc->process(testsup::make_frame(3, 20, 21 + 480), kPfx, 3);   // +24 h
+    });
+    CHECK(count_lines(log, {"[STATE] reseed", "reason=shift_change_across_restart"}) == 1);
+    // La trama que re-siembra publica 0, y la siguiente suma un intervalo: el
+    // total de ayer no vuelve.
+    CHECK(turno_ingreso(proc->process(testsup::make_frame(3, 20, 22 + 480), kPfx, 3)) == 64);
+
+    celima::set_state_store(nullptr);
+}
+
+TEST_CASE("calidad no arrastra el delta del hueco al turno nuevo") {
+    // OJO con la tasa: con la de los tests (3.600 u/h) un hueco de 14 h da una
+    // cota que alcanza el módulo, el delta sale ambiguo y el fallo queda
+    // tapado. Con la tasa real de planta para calidad (1.350 u/h) la cota es
+    // 28.350, el delta del corte se acepta, y se ve el arrastre.
+    // Los 7 procesadores de máquina dejan el estado sin inicializar en el caso
+    // 2, así que la rama normal lo re-siembra con la trama actual y el delta
+    // del hueco se descarta. Calidad restauraba su RawTrack con baseline_set
+    // puesto, de modo que el delta de todo el corte se acreditaba al turno
+    // nuevo. Debe comportarse igual que los demás.
+    testsup::pin_local_hour(10);
+    testsup::rates_for_tests(1350.0);
+    install_memory_store();
+    simulate_restart();
+
+    auto quebrados = [](const std::vector<Publication>& pubs) {
+        REQUIRE(pubs.size() == 1);
+        return json::parse(pubs[0].payload)["quebrados"].get<int64_t>();
+    };
+
+    {
+        auto proc = createProcessor(DeviceType::Calidad);
+        proc->process(testsup::make_frame(8, 21, 0), kPfx, 3);      // ancla
+        proc->process(testsup::make_frame(8, 21, 1), kPfx, 3);
+        CHECK(quebrados(proc->process(testsup::make_frame(8, 21, 2), kPfx, 3)) == 128);
+    }
+    simulate_restart();
+    testsup::pin_local_hour(15);            // el turno cambió durante el corte
+
+    auto proc = createProcessor(DeviceType::Calidad);
+    std::vector<Publication> pubs;
+    const std::string log = capture_streams([&] {
+        pubs = proc->process(testsup::make_frame(8, 21, 280), kPfx, 3);   // +14 h
+    });
+    CHECK(count_lines(log, {"[STATE] reseed", "proc=calidad",
+                            "reason=shift_change_across_restart"}) == 1);
+    // Turno nuevo: cero, y sin el delta del corte.
+    if (!pubs.empty()) CHECK(quebrados(pubs) == 0);
+    CHECK(quebrados(proc->process(testsup::make_frame(8, 21, 281), kPfx, 3)) == 64);
+
     celima::set_state_store(nullptr);
 }

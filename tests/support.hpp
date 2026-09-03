@@ -185,9 +185,20 @@ inline const std::vector<const char*>& frame_fields(int dt)
     }
 }
 
-// epoch base fijo: 2026-09-02T08:00:00Z
-inline constexpr int64_t kBaseEpoch = 1788336000;
-inline constexpr int     kInterval  = 180;
+// Época de la primera trama: la hora en punto actual, fijada una sola vez.
+//
+// Tiene que ser relativa al reloj y no una constante absoluta: la identidad de
+// la instancia de turno se calcula en hora local, y pin_local_hour() mueve TZ
+// según la hora real de ejecución. Con una época fija, la hora local de las
+// tramas cambiaba de un día a otro y los tests de hueco cruzaban —o no— una
+// frontera de turno según cuándo se lanzara la suite. Así la trama del tick 0
+// cae siempre en la hora en punto que fijó pin_local_hour().
+inline int64_t base_epoch()
+{
+    static const int64_t b = (static_cast<int64_t>(std::time(nullptr)) / 3600) * 3600;
+    return b;
+}
+inline constexpr int kInterval = 180;
 
 // Intervalo de publicación por clase de dispositivo: entrada_horno (6) publica
 // cada ~120 s; el resto, cada ~180 s.
@@ -202,7 +213,7 @@ inline nlohmann::json make_frame(int dt, int line, int tick, int step = 64,
     m["lineID"]      = line;
     m["alarms"]      = 0;
     m["checksum"]    = 42;
-    m["gatewayTime"] = iso_utc(kBaseEpoch + elapsed);
+    m["gatewayTime"] = iso_utc(base_epoch() + elapsed);
     // timer1Hz es un contador libre a 1 Hz: avanza exactamente los segundos
     // transcurridos, no un incremento arbitrario.
     if (dt >= 3 && dt <= 7)
@@ -233,6 +244,8 @@ inline std::string replay_file(const std::string& path, int shift_mode)
         auto jopt = jsonu::parse(line, err);
         if (!jopt) continue;
         auto& j = *jopt;
+
+        if (is_decoder_error(j)) continue;
 
         const int devTypeInt = j.value("deviceType", 0);
         auto dt = deviceTypeFromInt(devTypeInt);

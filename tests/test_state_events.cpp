@@ -163,7 +163,7 @@ TEST_CASE("una retransmisión nunca suma dos veces, en ningún procesador") {
         // Misma trama —contadores idénticos— con gatewayTime 30 s más tarde,
         // que es el reintento tal como lo ve el servicio.
         json retry = testsup::make_frame(dt, 1, 1);
-        retry["gatewayTime"] = testsup::iso_utc(testsup::kBaseEpoch + testsup::kInterval + 30);
+        retry["gatewayTime"] = testsup::iso_utc(testsup::base_epoch() + testsup::kInterval + 30);
 
         auto pubs2 = proc->process(retry, kPfx, 3);
         if (pubs2.empty()) continue;        // descartada por dedup: caso ideal
@@ -182,13 +182,11 @@ TEST_CASE("una retransmisión nunca suma dos veces, en ningún procesador") {
     }
 }
 
-TEST_CASE("las tramas que el decoder no pudo interpretar no publican nada") {
+TEST_CASE("las tramas que el decoder no pudo interpretar se descartan en el enrutado") {
     // Los Arduino mandan un ping de 1 byte para que el gateway no los
-    // desconecte; su decoder intenta parsearlo y emite un _error sin
-    // deviceType. Son el 10,7% del tráfico medido en 24 h, y cada uno publicaba
-    // dos mensajes de relleno en tópicos con doble barra.
-    auto def = createDefaultProcessor();
-
+    // desconecte; su decoder intenta parsearlo y emite un _error. Son el 10,7%
+    // del tráfico medido en 24 h, y cada uno publicaba dos mensajes de relleno
+    // en tópicos con doble barra.
     json ping;
     ping["_error"] = "11 bytes requeridos, recibidos: 1";
     ping["applicationID"] = 1;
@@ -196,29 +194,41 @@ TEST_CASE("las tramas que el decoder no pudo interpretar no publican nada") {
     ping["deviceName"] = "e6-cal";
     ping["gatewayTime"] = "2026-09-02T14:27:37-05:00";
 
-    std::vector<Publication> pubs;
-    std::string log = capture_streams([&] { pubs = def->process(ping, kPfx, 3); });
-    CHECK(pubs.empty());
+    bool caught = false;
+    std::string log = capture_streams([&] { caught = is_decoder_error(ping); });
+    CHECK(caught);
     CHECK(count_lines(log, {"[STATE] frame_ignored", "reason=decoder_error",
                             "devEUI=a8610a35392a7f05"}) == 1);
 
     // El mismo error no se vuelve a registrar: son ~1.200 pings al día.
-    log = capture_streams([&] { pubs = def->process(ping, kPfx, 3); });
-    CHECK(pubs.empty());
+    log = capture_streams([&] { caught = is_decoder_error(ping); });
+    CHECK(caught);
     CHECK(log.empty());
 
     // Un error distinto del decoder sí se ve: es señal de algo nuevo.
     json otro = ping;
     otro["_error"] = "checksum inválido";
-    log = capture_streams([&] { pubs = def->process(otro, kPfx, 3); });
-    CHECK(pubs.empty());
+    log = capture_streams([&] { caught = is_decoder_error(otro); });
+    CHECK(caught);
     CHECK(count_lines(log, {"[STATE] frame_ignored", "err=\"checksum inválido\""}) == 1);
 
-    // Un deviceType desconocido SIN _error mantiene el comportamiento anterior:
-    // esto no cambia el enrutado, solo descarta lo que no se pudo decodificar.
+    // El caso que el guard tiene que cubrir y por el que no vale ponerlo en
+    // DefaultProcessor: _error CON deviceType válido. Sin esto llegaría a su
+    // procesador real con todos los contadores a cero.
+    json con_dt = ping;
+    con_dt["_error"] = "trama truncada";
+    con_dt["deviceType"] = 3;
+    con_dt["lineID"] = 2;
+    log = capture_streams([&] { caught = is_decoder_error(con_dt); });
+    CHECK(caught);
+    CHECK(count_lines(log, {"[STATE] frame_ignored", "line=2", "deviceType=3"}) == 1);
+
+    // Una trama sana no se toca, ni siquiera con un deviceType desconocido:
+    // esto descarta lo que no se pudo decodificar, no cambia el enrutado.
+    CHECK_FALSE(is_decoder_error(testsup::make_frame(3, 1, 0)));
     json desconocido;
     desconocido["deviceType"] = 99;
     desconocido["lineID"] = 1;
-    desconocido["gatewayTime"] = "2026-09-02T14:27:37-05:00";
-    CHECK(def->process(desconocido, kPfx, 3).size() == 2);
+    CHECK_FALSE(is_decoder_error(desconocido));
+    CHECK(createDefaultProcessor()->process(desconocido, kPfx, 3).size() == 2);
 }

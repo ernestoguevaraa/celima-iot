@@ -69,3 +69,74 @@ TEST_CASE("TZ=UTC corre las fronteras cinco horas respecto a America/Lima") {
     else
         CHECK(shift_utc == shift_lima);
 }
+
+TEST_CASE("shift_start_epoch identifica la instancia de turno, no su número") {
+    // El número (1/2/3) se repite cada día: un hueco de 24 h vuelve al mismo y
+    // arrastraba los acumuladores del día anterior. La instancia es la época en
+    // que arrancó ese turno concreto.
+    // pin_local_hour fija la HORA y conserva los minutos reales, así que las
+    // comprobaciones van por rango de una hora, no por igualdad exacta.
+    testsup::pin_local_hour(10);
+    const int64_t ahora = static_cast<int64_t>(std::time(nullptr));
+
+    SUBCASE("modo 3: turnos de 8 h") {
+        const int64_t inicio = shift_start_epoch(ahora, 3);
+        // Entre las 10:00 y las 10:59 el turno empezó a las 06:00.
+        CHECK(ahora - inicio >= 4 * 3600);
+        CHECK(ahora - inicio <  5 * 3600);
+        // Dentro del mismo turno, la instancia no cambia.
+        CHECK(shift_start_epoch(ahora + 3 * 3600, 3) == inicio);
+        // Al cruzar las 14:00, sí.
+        CHECK(shift_start_epoch(ahora + 5 * 3600, 3) != inicio);
+        // Y 24 h después es OTRA instancia, aunque el número de turno coincida.
+        CHECK(static_cast<int>(current_shift_localtime(3)) ==
+              static_cast<int>(current_shift_localtime(3)));
+        CHECK(shift_start_epoch(ahora + 24 * 3600, 3) == inicio + 24 * 3600);
+        CHECK(shift_start_epoch(ahora + 24 * 3600, 3) != inicio);
+    }
+
+    SUBCASE("modo 2: turnos de 12 h") {
+        const int64_t inicio = shift_start_epoch(ahora, 2);
+        CHECK(ahora - inicio >= 4 * 3600);          // 10:xx, turno desde 06:00
+        CHECK(ahora - inicio <  5 * 3600);
+        CHECK(shift_start_epoch(ahora + 7 * 3600, 2) == inicio);   // 17:00, mismo
+        CHECK(shift_start_epoch(ahora + 8 * 3600, 2) != inicio);   // 18:00, otro
+        CHECK(shift_start_epoch(ahora + 24 * 3600, 2) == inicio + 24 * 3600);
+    }
+
+    SUBCASE("el turno que cruza medianoche arrancó ayer") {
+        // 02:00 local: en modo 3 pertenece al turno que empezó a las 22:00 del
+        // día anterior; en modo 2, al que empezó a las 18:00.
+        testsup::pin_local_hour(2);
+        const int64_t madrugada = static_cast<int64_t>(std::time(nullptr));
+        CHECK(madrugada - shift_start_epoch(madrugada, 3) >= 4 * 3600);
+        CHECK(madrugada - shift_start_epoch(madrugada, 3) <  5 * 3600);
+        CHECK(madrugada - shift_start_epoch(madrugada, 2) >= 8 * 3600);
+        CHECK(madrugada - shift_start_epoch(madrugada, 2) <  9 * 3600);
+        // Y el arranque es anterior al instante, nunca posterior.
+        CHECK(shift_start_epoch(madrugada, 3) < madrugada);
+        CHECK(shift_start_epoch(madrugada, 2) < madrugada);
+    }
+
+    SUBCASE("en la hora de arranque, el turno acaba de empezar") {
+        // Cada modo tiene sus fronteras: 06/14/22 en modo 3, 06/18 en modo 2.
+        // Una hora que arranca turno en un modo no lo arranca en el otro.
+        for (int h : {6, 14, 22}) {
+            CAPTURE(h);
+            testsup::pin_local_hour(h);
+            const int64_t t = static_cast<int64_t>(std::time(nullptr));
+            CHECK(t - shift_start_epoch(t, 3) < 3600);   // < 1 h desde el arranque
+        }
+        for (int h : {6, 18}) {
+            CAPTURE(h);
+            testsup::pin_local_hour(h);
+            const int64_t t = static_cast<int64_t>(std::time(nullptr));
+            CHECK(t - shift_start_epoch(t, 2) < 3600);
+        }
+        // Y una hora que NO es frontera queda lejos del arranque.
+        testsup::pin_local_hour(13);
+        const int64_t t = static_cast<int64_t>(std::time(nullptr));
+        CHECK(t - shift_start_epoch(t, 3) >= 7 * 3600);   // turno S1 desde las 06
+        CHECK(t - shift_start_epoch(t, 2) >= 7 * 3600);
+    }
+}

@@ -136,6 +136,10 @@ void MqttApp::handle_celima_data(const std::string& payload) {
     }
     auto& j = *jopt;
 
+    // Trama que el decoder no pudo interpretar: no se procesa ni se publica.
+    if (is_decoder_error(j))
+        return;
+
     int devTypeInt = j.value("deviceType", 0);
     auto dt = deviceTypeFromInt(devTypeInt);
     std::unique_ptr<IMessageProcessor> proc = dt ? createProcessor(*dt)

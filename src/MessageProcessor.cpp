@@ -32,6 +32,34 @@ static bool mark_restore_attempted(const char* proc, int line)
     return g_restored_keys.insert(std::string(proc) + "/" + std::to_string(line)).second;
 }
 
+bool is_decoder_error(const nlohmann::json& msg)
+{
+    if (!msg.contains("_error")) return false;
+
+    const std::string err = msg["_error"].is_string()
+                              ? msg.value("_error", std::string{})
+                              : msg["_error"].dump();
+    // Se registra el primer error de cada texto distinto y se calla el resto:
+    // así un error nuevo del decoder se ve, y los ~1.200 pings diarios no
+    // inundan el journal. Descartar en silencio un 10% del tráfico es justo lo
+    // que luego nadie puede reconstruir.
+    static std::mutex seen_mtx;
+    static std::set<std::string> seen;
+    bool first = false;
+    {
+        std::lock_guard<std::mutex> lock(seen_mtx);
+        first = seen.insert(err).second;
+    }
+    if (first) {
+        celima::log::state_event("frame_ignored", msg.value("lineID", -1), "decoder",
+            "reason=decoder_error deviceType=" +
+            std::to_string(msg.value("deviceType", 0)) +
+            " devEUI=" + jsonu::get_opt<std::string>(msg, "devEUI").value_or("?") +
+            " err=\"" + err + "\"");
+    }
+    return true;
+}
+
 void reset_global_shift_state()
 {
     g_last_global_shift.store(-1, std::memory_order_relaxed);
@@ -248,9 +276,14 @@ DeltaResult diff_counter_scaled(uint16_t curr, uint16_t prev, const CounterCtx &
 // el hueco fue corto o no hay nada restaurado.
 template <typename StateT>
 static int64_t restore_state_if_needed(StateT &st, const char* proc, int line,
-                                       int shiftNum,
+                                       int shiftNum, int shift_mode,
                                        const std::optional<int64_t>& dev_epoch)
 {
+    // Sin época de dispositivo no se puede decidir si el estado guardado
+    // pertenece a este turno. En lugar de adivinar, se deja el intento sin
+    // consumir: lo resuelve la primera trama que traiga gatewayTime utilizable.
+    if (!dev_epoch) return 0;
+
     if (!mark_restore_attempted(proc, line)) return 0;
 
     celima::IStateStore* store = celima::state_store();
@@ -259,19 +292,32 @@ static int64_t restore_state_if_needed(StateT &st, const char* proc, int line,
     celima::StoredState stored;
     if (!store->load(proc, line, stored)) return 0;   // caso 1: sin estado guardado
 
-    if (stored.shift != shiftNum) {
+    // Mismo turno significa la MISMA instancia de turno, no el mismo número.
+    // Un hueco de ~24 h vuelve al mismo número y arrastraría el total del día
+    // anterior; los huecos reales de D3 son de 26 h y 31 h.
+    const bool misma_instancia =
+        stored.updated_at > 0 &&
+        shift_start_epoch(stored.updated_at, shift_mode) ==
+            shift_start_epoch(*dev_epoch, shift_mode);
+
+    if (stored.shift != shiftNum || !misma_instancia) {
         // Caso 2: el turno cambió mientras el proceso no estaba. Acumuladores a
         // cero y sin arrastre — parte del turno transcurrió sin que nadie
         // escuchara, y ese delta no pertenece al turno nuevo. El estado queda
         // sin inicializar a propósito: lo siembra la rama normal con esta trama.
         celima::log::state_event("reseed", line, proc,
             "reason=shift_change_across_restart shift_prev=" + std::to_string(stored.shift) +
-            " shift_new=" + std::to_string(shiftNum));
+            " shift_new=" + std::to_string(shiftNum) +
+            " gap_s=" + std::to_string(stored.updated_at > 0
+                                         ? *dev_epoch - stored.updated_at : 0));
         st.suppress_reseed_log = true;    // no duplicar la traza de la rama normal
-        int64_t gap = 0;
-        if (dev_epoch && stored.updated_at > 0)
-            gap = *dev_epoch - stored.updated_at;
-        return gap > 0 ? gap : 0;
+
+        // No observado de ESTE turno: desde su arranque hasta la primera trama,
+        // no el hueco completo. El hueco puede abarcar turnos enteros y sus
+        // segundos no pertenecen al turno en curso — con el hueco entero,
+        // turno_segundos_no_observados podía superar la duración del turno.
+        const int64_t desde_inicio = *dev_epoch - shift_start_epoch(*dev_epoch, shift_mode);
+        return desde_inicio > 0 ? desde_inicio : 0;
     }
 
     // Casos 3 y 4: mismo turno. Se restaura TODO, incluido el tracking del raw
@@ -317,8 +363,10 @@ static void persist_calidad_state(const RawT &rt, const AccT &sa, int line, int 
 // Devuelve los segundos no observados que aporta este arranque.
 template <typename RawT, typename AccT>
 static int64_t restore_calidad_state(RawT &rt, AccT &sa, int line, int shift,
+                                     int shift_mode,
                                      const std::optional<int64_t>& dev_epoch)
 {
+    if (!dev_epoch) return 0;                 // se resuelve en la trama siguiente
     if (!mark_restore_attempted("calidad", line)) return 0;
 
     celima::IStateStore* store = celima::state_store();
@@ -328,23 +376,33 @@ static int64_t restore_calidad_state(RawT &rt, AccT &sa, int line, int shift,
     if (!store->load("calidad", line, stored)) return 0;
     if (!stored.state.contains("raw") || !stored.state.contains("acc")) return 0;
 
-    // El tracking del raw se restaura siempre: no depende del turno.
-    rt.from_json(stored.state["raw"]);
+    const int64_t gap = (stored.updated_at > 0) ? (*dev_epoch - stored.updated_at) : 0;
+    const bool misma_instancia =
+        stored.updated_at > 0 &&
+        shift_start_epoch(stored.updated_at, shift_mode) ==
+            shift_start_epoch(*dev_epoch, shift_mode);
 
-    int64_t gap = 0;
-    if (dev_epoch && stored.updated_at > 0)
-        gap = *dev_epoch - stored.updated_at;
-
-    if (stored.shift != shift) {
-        // Caso 2: el turno cambió con el proceso caído. Acumulador a cero, sin
-        // arrastre; la rama normal lo inicializa con esta trama.
+    if (stored.shift != shift || !misma_instancia) {
+        // Caso 2: el turno cambió con el proceso caído. Acumulador a cero y
+        // SIN arrastre, igual que los siete procesadores de máquina.
+        //
+        // El raw tampoco se restaura aquí: con el baseline puesto, el delta de
+        // todo el corte se calcularía contra el valor de antes del hueco y se
+        // acreditaría íntegro al turno nuevo. Dejándolo sin anclar, la rama
+        // normal re-ancla con esta trama y el delta del hueco se descarta, que
+        // es lo que hacen los demás. (Fuera del caso 2 el raw sí persiste a
+        // través de los cambios de turno, que es su diseño.)
         celima::log::state_event("reseed", line, "calidad",
             "reason=shift_change_across_restart shift_prev=" + std::to_string(stored.shift) +
-            " shift_new=" + std::to_string(shift));
+            " shift_new=" + std::to_string(shift) +
+            " gap_s=" + std::to_string(gap));
         sa.suppress_reseed_log = true;
-        return gap > 0 ? gap : 0;
+        const int64_t desde_inicio = *dev_epoch - shift_start_epoch(*dev_epoch, shift_mode);
+        return desde_inicio > 0 ? desde_inicio : 0;
     }
 
+    // El tracking del raw persiste a través de los cambios de turno.
+    rt.from_json(stored.state["raw"]);
     sa.from_json(stored.state["acc"]);
     sa.initialized = true;
     sa.shift = shift;
@@ -510,39 +568,6 @@ class DefaultProcessor : public IMessageProcessor
 public:
     std::vector<Publication> process(const json &msg, const std::string &isa95_prefix, int shift_mode = 3) override
     {
-        // Trama que el decoder del gateway no pudo interpretar: no se publica
-        // nada.
-        //
-        // El caso real son los pings de 1 byte que los Arduino mandan para que
-        // el gateway no los desconecte; su decoder intenta parsearlos y emite
-        // {"_error": "11 bytes requeridos, recibidos: 1"} sin deviceType, que
-        // caía aquí. Medido sobre 24 h: 1.192 de 11.180 tramas (10,7%), y cada
-        // una publicaba dos mensajes de relleno (quantity=0, alarms=0, con hora
-        // de servidor) en tópicos con doble barra, que llegaban al edge
-        // processor y a InfluxDB como si fueran producción.
-        //
-        // Se registra el primer error de cada tipo y se calla el resto: así un
-        // error nuevo del decoder se ve, y los ~1.200 pings diarios no inundan
-        // el journal.
-        if (msg.contains("_error")) {
-            const std::string err = msg["_error"].is_string()
-                                      ? msg.value("_error", std::string{})
-                                      : msg["_error"].dump();
-            static std::mutex seen_mtx;
-            static std::set<std::string> seen;
-            bool first = false;
-            {
-                std::lock_guard<std::mutex> lock(seen_mtx);
-                first = seen.insert(err).second;
-            }
-            if (first) {
-                celima::log::state_event("frame_ignored", -1, "decoder",
-                    "reason=decoder_error devEUI=" +
-                    jsonu::get_opt<std::string>(msg, "devEUI").value_or("?") +
-                    " err=\"" + err + "\"");
-            }
-            return {};
-        }
 
         json out;
         out["source"] = "celima/data";
@@ -755,7 +780,7 @@ public:
 
             // Restauración del estado persistido, una vez por clave y arranque.
             const int64_t restart_gap_s =
-                restore_calidad_state(rt, sa, line_id, shift_now, dev_epoch);
+                restore_calidad_state(rt, sa, line_id, shift_now, shift_mode, dev_epoch);
             if (restart_gap_s > 0 && sa.initialized)
                 sa.acc_unobserved_s += restart_gap_s;   // caso 4: hueco dentro del turno
 
@@ -804,6 +829,7 @@ public:
                         " q2=" + std::to_string(raw_q2) +
                         " q6=" + std::to_string(raw_q6) +
                         " broken=" + std::to_string(raw_broken));
+                    persist_calidad_state(rt, sa, line_id, shift_now);
                     return {};
                 }
 
@@ -1055,7 +1081,7 @@ public:
             // cero, y deja last_accepted_epoch_s en su sitio para que el hueco de
             // abajo sea el real y no cero.
             const int64_t restart_gap_s =
-                restore_state_if_needed(st, "prensa_hidraulica1", line, shiftNum, dev_epoch);
+                restore_state_if_needed(st, "prensa_hidraulica1", line, shiftNum, shift_mode, dev_epoch);
             if (restart_gap_s > 0 && st.initialized)
                 st.acc_unobserved_s += restart_gap_s;   // caso 4: hueco dentro del turno
 
@@ -1349,7 +1375,7 @@ public:
             // cero, y deja last_accepted_epoch_s en su sitio para que el hueco de
             // abajo sea el real y no cero.
             const int64_t restart_gap_s =
-                restore_state_if_needed(st, "prensa_hidraulica2", line, shiftNum, dev_epoch);
+                restore_state_if_needed(st, "prensa_hidraulica2", line, shiftNum, shift_mode, dev_epoch);
             if (restart_gap_s > 0 && st.initialized)
                 st.acc_unobserved_s += restart_gap_s;   // caso 4: hueco dentro del turno
 
@@ -1718,7 +1744,7 @@ public:
             // cero, y deja last_accepted_epoch_s en su sitio para que el hueco de
             // abajo sea el real y no cero.
             const int64_t restart_gap_s =
-                restore_state_if_needed(st, "entrada_secador", line, shiftNum, dev_epoch);
+                restore_state_if_needed(st, "entrada_secador", line, shiftNum, shift_mode, dev_epoch);
             if (restart_gap_s > 0 && st.initialized)
                 st.acc_unobserved_s += restart_gap_s;   // caso 4: hueco dentro del turno
 
@@ -2042,7 +2068,7 @@ public:
             // cero, y deja last_accepted_epoch_s en su sitio para que el hueco de
             // abajo sea el real y no cero.
             const int64_t restart_gap_s =
-                restore_state_if_needed(st, "salida_secador", line, shiftNum, dev_epoch);
+                restore_state_if_needed(st, "salida_secador", line, shiftNum, shift_mode, dev_epoch);
             if (restart_gap_s > 0 && st.initialized)
                 st.acc_unobserved_s += restart_gap_s;   // caso 4: hueco dentro del turno
 
@@ -2334,7 +2360,7 @@ public:
             // cero, y deja last_accepted_epoch_s en su sitio para que el hueco de
             // abajo sea el real y no cero.
             const int64_t restart_gap_s =
-                restore_state_if_needed(st, "esmalte", line, shiftNum, dev_epoch);
+                restore_state_if_needed(st, "esmalte", line, shiftNum, shift_mode, dev_epoch);
             if (restart_gap_s > 0 && st.initialized)
                 st.acc_unobserved_s += restart_gap_s;   // caso 4: hueco dentro del turno
 
@@ -2733,7 +2759,7 @@ public:
             // cero, y deja last_accepted_epoch_s en su sitio para que el hueco de
             // abajo sea el real y no cero.
             const int64_t restart_gap_s =
-                restore_state_if_needed(st, "entrada_horno", line, shiftNum, dev_epoch);
+                restore_state_if_needed(st, "entrada_horno", line, shiftNum, shift_mode, dev_epoch);
             if (restart_gap_s > 0 && st.initialized)
                 st.acc_unobserved_s += restart_gap_s;   // caso 4: hueco dentro del turno
 
@@ -3240,7 +3266,7 @@ public:
             // cero, y deja last_accepted_epoch_s en su sitio para que el hueco de
             // abajo sea el real y no cero.
             const int64_t restart_gap_s =
-                restore_state_if_needed(st, "salida_horno", line, shiftNum, dev_epoch);
+                restore_state_if_needed(st, "salida_horno", line, shiftNum, shift_mode, dev_epoch);
             if (restart_gap_s > 0 && st.initialized)
                 st.acc_unobserved_s += restart_gap_s;   // caso 4: hueco dentro del turno
 
