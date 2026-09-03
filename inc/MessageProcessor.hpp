@@ -54,6 +54,29 @@ void set_incomplete_shift_marker_for_tests(bool on);
 void clear_incomplete_shift_marker_override();
 
 /**
+ * Familia de un contador. Conviven dos con ~50x de diferencia de velocidad, y
+ * una sola tasa por máquina no puede cubrir ambas (pendiente P1 de
+ * docs/design/cota-plausibilidad-y-tasas.md):
+ *
+ *  - Event: contadores de evento (piezas, pisadas, paradas, bancalinos). Su
+ *    tasa se mide y sale de rates.json.
+ *  - TimeSeconds / TimeDeciseconds: acumuladores de tiempo del PLC. Su máximo
+ *    NO se mide, es analítico: 1 y 10 ticks por segundo. Medirlos solo mete
+ *    ruido, y dimensionarlos con la tasa de producción hacía que tras un hueco
+ *    largo se recuperase la producción pero no el tiempo de operación — un
+ *    turno internamente inconsistente que nadie sabría explicar.
+ */
+enum class CounterFamily { Event, TimeSeconds, TimeDeciseconds };
+
+/**
+ * Familia de (procesador, campo). Lo desconocido cae en Event, que usa la tasa
+ * configurada: es el lado conservador, porque una tasa de tiempo aplicada por
+ * error a un contador de evento agranda la cota, y agrandar la cota es lo que
+ * deja pasar un delta absurdo como producción real.
+ */
+CounterFamily counter_family_for(const char* proc, const char* field);
+
+/**
  * Contexto de un contador, para la aritmética de deltas y para etiquetar los
  * eventos [STATE]. Un argumento en lugar de siete: los procesadores lo
  * construyen una vez por mensaje y lo reutilizan con with(<campo>).

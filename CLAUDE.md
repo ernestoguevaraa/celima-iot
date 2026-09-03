@@ -42,7 +42,7 @@ make test GOLDEN_OUT=tests/data/celima_data_replay.golden   # regenerar el golde
 ```
 
 The suite is doctest (vendored at [tests/doctest.h](tests/doctest.h), MIT, header-only — no runtime
-dependency, not linked into the release binary): 33 cases across
+dependency, not linked into the release binary): 38 cases across
 [test_replay.cpp](tests/test_replay.cpp) (golden), [test_state_events.cpp](tests/test_state_events.cpp),
 [test_scaled_bound.cpp](tests/test_scaled_bound.cpp), [test_persistence.cpp](tests/test_persistence.cpp)
 and [test_shifts.cpp](tests/test_shifts.cpp). Its core is a deterministic replay:
@@ -93,9 +93,12 @@ Two deployment artifacts, treated differently on purpose:
 - **`rates.json` is configuration and ships in the package.** [packaging/rates.json](packaging/rates.json)
   is installed to `/usr/share/iot-celima-mqtt/` and copied to `/etc/iot-celima-mqtt/` by postinst
   *only if absent*, so a reinstall never overwrites what the plant edited. It is not a dpkg conffile
-  — same convention as `defaults.env`. The template documents its own format in comments, which is
-  why the parser is called with `ignore_comments`. Its `lines` map is empty on purpose: unmeasured
-  rates would be worse than the conservative default.
+  — same convention as `defaults.env`. **Strict JSON, no comments**, so `jq` and CI linters can read
+  it; the reasoning behind every number lives in
+  [docs/design/cota-plausibilidad-y-tasas.md](docs/design/cota-plausibilidad-y-tasas.md), and the
+  rates themselves are derived with [scripts/derive_rates.py](scripts/derive_rates.py) from 30 days
+  of journal. A comment in the file is rejected with `[CONFIG] rates file not usable` and the
+  conservative default — visible, and the safe side.
 - **`state.db` is runtime state and must never be packaged or committed.** systemd's
   `StateDirectory=iot-celima-mqtt` creates the directory and the service creates the schema. If dpkg
   owned that file, an upgrade or a purge could take real production totals with it. `*.db` and its
@@ -302,10 +305,21 @@ Léelas antes de tocar [src/MessageProcessor.cpp](src/MessageProcessor.cpp).
   la recuperación de huecos largos es más corta de lo que podría ser — lo que subcuenta, que es el
   lado seguro. Derivarlas de los `[STATE] delta_rejected` y los `*_raw` del journal es trabajo
   pendiente, y no requiere tocar código: es un archivo de configuración.
-- **Un rate por máquina no distingue unidades.** Los campos `*_tiempo_ds` avanzan hasta 10 ticks/s y
-  dan la vuelta al módulo cada ~1,8 h, mientras la tasa configurada es de piezas por hora. En
-  intervalos normales no importa (manda el techo mínimo de `max_valid`), pero tras un hueco largo esos
-  campos se re-siembran en lugar de recuperarse. Tasas por campo son el refinamiento obvio.
+- **Los contadores de tiempo no usan la tasa configurada.** Conviven dos familias con ~50x de
+  diferencia, así que `counter_family_for(proc, field)` clasifica cada contador y `diff_counter_scaled`
+  usa el máximo analítico: 1 tick/s para `tiempo_s`, 10 para `tiempo_ds`. La tabla está en
+  [src/MessageProcessor.cpp](src/MessageProcessor.cpp) y lista **solo** los de tiempo; lo que no está
+  cae en `Event` y usa la tasa medida, que es el lado conservador. **Marcar como tiempo un contador de
+  evento agranda su cota 40x y es el error peligroso**, así que ante la duda no se lista. La
+  clasificación no se deduce del sufijo: en las prensas `metrica_tiempo` son decisegundos y en salida
+  horno `paradas_tempo` son segundos. Un test estructural recorre los sitios de llamada del propio
+  código y se pone rojo si aparece un contador de tiempo sin clasificar.
+- **La ventana recuperable depende de la familia, y para `tiempo_ds` es corta.** A 10 ticks/s el
+  contador de 16 bits da la vuelta en 1,8 h, así que pasado ~1,2 h de hueco su delta es ambiguo por
+  construcción y se re-siembra. No hay configuración que lo cambie. Los de segundos aguantan ~12 h y
+  los de evento, según la tasa, entre 26 y 87 h.
+- **Una tasa alta no es "más segura por si acaso": recorta el horizonte de recuperación**, porque la
+  cota alcanza antes el módulo de 65.536. Tenlo presente antes de subir un número "por margen".
 - **El buffering de stdout ya está corregido** (`std::cout << std::unitbuf;` como primera sentencia de
   `main()`). No lo quites ni metas salida antes de esa línea: sin ella, stdout bajo systemd es un pipe
   con buffer de bloque de 4 KB, los logs llegaban al journal con hasta 36 s de retraso y cada parada
@@ -313,7 +327,7 @@ Léelas antes de tocar [src/MessageProcessor.cpp](src/MessageProcessor.cpp).
   bytes; después, todo lo ya emitido.
 - **Los caminos de estado dejan rastro `[STATE]`**, vía `celima::log::state_event()`
   ([inc/Logging.hpp](inc/Logging.hpp)): `reseed` (`reason=first_message|shift_change|shift_change_across_restart`),
-  `delta_rejected` (con `reason`, `max_plausible` y `elapsed_s`), `reanchor`, `restored`, `gap`,
+  `delta_rejected` (con `reason`, `max_plausible`, `elapsed_s` y `family`), `reanchor`, `restored`, `gap`,
   `shift_first_observed`, `shift_change_global`, `stored_state_ignored` y `store_error`. Si añades lógica de descarte o de re-siembra,
   emítela por ahí — en silencio no es reconstruible: tras el incidente del 1 de septiembre identificar
   la re-siembra exigió comparar `timer1Hz_turno` entre tópicos del journal. Dos reglas al hacerlo:

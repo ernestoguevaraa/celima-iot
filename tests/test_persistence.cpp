@@ -141,7 +141,8 @@ TEST_CASE("hueco largo dentro del turno: recupera y marca los no observados") {
 
     CHECK(count_lines(log, {"[STATE] gap", "proc=entrada_secador", "line=4",
                             "reason=restart"}) == 1);
-    CHECK(count_lines(log, {"[STATE] delta_rejected"}) == 0);
+    CHECK(count_lines(log, {"[STATE] delta_rejected",
+                            "field=ingreso_elevador_cantidad"}) == 0);
     CHECK(turno_ingreso(pubs) == 64 + 6000);       // el hueco se recupera
 
     celima::set_state_store(nullptr);

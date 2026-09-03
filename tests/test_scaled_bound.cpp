@@ -99,11 +99,23 @@ TEST_CASE("un hueco legítimo no dispara el camino de los 3 rechazos") {
     std::vector<Publication> pubs;
     const std::string log = capture_streams([&] { pubs = secador->process(m, kPfx, 3); });
 
-    CHECK(count_lines(log, {"[STATE] delta_rejected"}) == 0);
+    // El contador de producción se recupera sin disparar el re-anclaje.
+    CHECK(count_lines(log, {"[STATE] delta_rejected",
+                            "field=ingreso_elevador_cantidad"}) == 0);
     CHECK(count_lines(log, {"[STATE] reanchor"}) == 0);
     REQUIRE(pubs.size() == 2);
     const json prod = json::parse(pubs[1].payload);
     CHECK(prod["ingreso_elevador_turno"] == 6000);   // recuperado, no perdido
+
+    // Los acumuladores de tiempo en decisegundos SÍ se descartan aquí, y es
+    // correcto: a 10 ticks/s el contador de 16 bits da la vuelta en 1,8 h, así
+    // que tras 5 h su delta es ambiguo por construcción. No hay configuración
+    // que lo arregle; es el módulo del contador contra la velocidad del tick.
+    CHECK(count_lines(log, {"[STATE] delta_rejected", "family=tiempo_ds",
+                            "reason=ambiguous_module"}) == 3);
+    // Los de segundos, en cambio, sí se recuperan: 1 tick/s no agota el módulo
+    // hasta las ~12 h.
+    CHECK(count_lines(log, {"[STATE] delta_rejected", "family=tiempo_s"}) == 0);
 }
 
 TEST_CASE("gatewayTime ausente: implausible, sin caer a la hora del servidor") {
@@ -163,6 +175,15 @@ TEST_CASE("RateConfig: archivo ausente o corrupto no tumba el servicio") {
     log = capture_streams([&] { CHECK_FALSE(celima::rates().load_file(bad)); });
     CHECK(count_lines(log, {"[CONFIG] rates file not usable"}) == 1);
 
+    // JSON estricto: un comentario se rechaza. Es deliberado — rates.json tiene
+    // que abrirse con jq y con los linters de CI, y un archivo que el servicio
+    // acepta pero jq no es peor que uno que se rechaza con un log visible.
+    const std::string commented = std::string(testsup::tmpdir()) + "/rates_comment.json";
+    REQUIRE(testsup::write_file(commented,
+        "// tasas\n{\"default_rate_per_h\": 900}\n"));
+    log = capture_streams([&] { CHECK_FALSE(celima::rates().load_file(commented)); });
+    CHECK(count_lines(log, {"[CONFIG] rates file not usable"}) == 1);
+
     // Una tasa absurda tampoco se acepta.
     const std::string zero = std::string(testsup::tmpdir()) + "/rates_zero.json";
     REQUIRE(testsup::write_file(zero, R"({"default_rate_per_h": 0})"));
@@ -173,18 +194,134 @@ TEST_CASE("RateConfig: archivo ausente o corrupto no tumba el servicio") {
     celima::rates().reset_for_tests();
 }
 
-TEST_CASE("la plantilla que se instala en /etc se carga tal cual") {
-    // packaging/rates.json documenta el formato en comentarios; si el parser
-    // deja de tolerarlos, el servicio caería al valor por defecto en silencio.
+TEST_CASE("el rates.json que se instala en /etc es válido y lleva tasas medidas") {
+    // Comprueba la forma, no los números: las tasas se re-derivan del journal
+    // cada cierto tiempo (pendiente P5 de docs/design/cota-plausibilidad-y-tasas.md)
+    // y este test no debe obligar a tocarlo en cada revisión.
     celima::rates().reset_for_tests();
     const std::string log = capture_streams([&] {
         REQUIRE(celima::rates().load_file("packaging/rates.json"));
     });
     CHECK(count_lines(log, {"[CONFIG] rates cargadas de"}) == 1);
-    CHECK(celima::rates().default_rate_per_h() == doctest::Approx(600.0));
-    CHECK(celima::rates().margin() == doctest::Approx(1.5));
-    // "lines" vacío a propósito: sin tasas medidas, todo cae al valor conservador.
-    CHECK(celima::rates().rate_per_s(1, "prensa_hidraulica1")
-          == doctest::Approx(600.0 / 3600.0));
+    CHECK(celima::rates().default_rate_per_h() > 0.0);
+    CHECK(celima::rates().margin() > 0.0);
+
+    // El archivo trae tasas por línea y máquina, no es ya la plantilla vacía:
+    // al menos una clave conocida resuelve a algo distinto del valor por defecto.
+    const double def = celima::rates().default_rate_per_h() / 3600.0;
+    int overrides = 0;
+    for (const auto& [line, machine] : std::vector<std::pair<int, const char*>>{
+             {1, "prensa_hidraulica1"}, {2, "salida_horno"},
+             {3, "esmalte"}, {4, "entrada_secador"}}) {
+        const double r = celima::rates().rate_per_s(line, machine);
+        CHECK(r > 0.0);
+        if (r != doctest::Approx(def)) ++overrides;
+    }
+    CHECK_MESSAGE(overrides > 0,
+                  "packaging/rates.json no trae tasas por línea: todo cae al valor por defecto");
+
     celima::rates().reset_for_tests();
+}
+
+TEST_CASE("el horizonte de recuperación se acorta cuando sube la tasa") {
+    // Contraintuitivo y documentado en cota-plausibilidad-y-tasas.md §2: una
+    // tasa alta NO es más segura, recorta la ventana recuperable, porque la
+    // cota alcanza antes el módulo de 65.536 y el delta pasa a ser ambiguo.
+    const double margin = 1.5;
+    auto recovers = [&](double rate_per_h, double gap_h) {
+        CounterCtx c = ctx_for(gap_h * 3600.0, rate_per_h, margin);
+        return diff_counter_scaled(1500, 1000, c).plausible;   // delta pequeño
+    };
+
+    // 500 u/h: un corte de 28 h sigue siendo recuperable.
+    CHECK(recovers(500, 28));
+    // 6.000 u/h (esmalte): pasadas ~7 h el delta ya es ambiguo.
+    CHECK(recovers(6000, 6));
+    CHECK_FALSE(recovers(6000, 8));
+}
+
+TEST_CASE("familias de contador: la tabla clasifica lo que debe") {
+    using F = CounterFamily;
+    // Evento: usa la tasa medida de rates.json.
+    CHECK(counter_family_for("entrada_secador", "ingreso_elevador_cantidad") == F::Event);
+    CHECK(counter_family_for("prensa_hidraulica1", "pisadas") == F::Event);
+    CHECK(counter_family_for("calidad", "totalBroken") == F::Event);
+    // Segundos: 1 tick/s.
+    CHECK(counter_family_for("entrada_secador", "timer1Hz") == F::TimeSeconds);
+    CHECK(counter_family_for("entrada_horno", "falha_forno_tiempo") == F::TimeSeconds);
+    // Decisegundos: 10 ticks/s. En las prensas el nombre no lo delata (se
+    // acumula con ×0,1), y es justo el caso que un clasificador por sufijo
+    // habría fallado.
+    CHECK(counter_family_for("prensa_hidraulica1", "metrica_tiempo") == F::TimeDeciseconds);
+    CHECK(counter_family_for("entrada_secador", "bancalino_l1_tiempo") == F::TimeDeciseconds);
+    // Lo desconocido cae en Event, que es el lado conservador.
+    CHECK(counter_family_for("entrada_secador", "campo_que_no_existe") == F::Event);
+    CHECK(counter_family_for("procesador_nuevo", "timer1Hz") == F::Event);
+    CHECK(counter_family_for(nullptr, nullptr) == F::Event);
+}
+
+TEST_CASE("ningún contador de tiempo se queda sin clasificar") {
+    // Guarda estructural contra el defecto P1: deriva la expectativa de los
+    // propios sitios de llamada del código, no de la tabla. Si alguien añade un
+    // contador de tiempo y olvida clasificarlo, esto se pone rojo en lugar de
+    // dejar que su acumulador se descarte en silencio tras cada hueco.
+    const std::string src = testsup::read_file("src/MessageProcessor.cpp");
+    REQUIRE_MESSAGE(!src.empty(), "ejecuta la suite desde la raíz del repo");
+
+    std::istringstream in(src);
+    std::string line, proc;
+    int sites = 0, unclassified = 0;
+    std::string missing;
+    while (std::getline(in, line)) {
+        const auto p = line.find("ctx.proc = \"");
+        if (p != std::string::npos) {
+            const auto a = p + 12;
+            proc = line.substr(a, line.find('"', a) - a);
+            continue;
+        }
+        size_t w = 0;
+        while ((w = line.find("ctx.with(\"", w)) != std::string::npos) {
+            const auto a = w + 10;
+            const std::string field = line.substr(a, line.find('"', a) - a);
+            w = a;
+            ++sites;
+            const bool looks_like_time =
+                field.find("tiempo") != std::string::npos ||
+                field.find("tempo")  != std::string::npos ||
+                field.find("timer")  != std::string::npos;
+            if (looks_like_time &&
+                counter_family_for(proc.c_str(), field.c_str()) == CounterFamily::Event) {
+                ++unclassified;
+                missing += " " + proc + "/" + field;
+            }
+        }
+    }
+    // Si el patrón de llamada cambia, este test no debe pasar en vacío.
+    CHECK(sites >= 50);
+    CHECK_MESSAGE(unclassified == 0, "contadores de tiempo sin familia:" << missing);
+}
+
+TEST_CASE("P1: un hueco corto ya recupera los acumuladores de tiempo") {
+    // Antes, la tasa de producción de la máquina (450 u/h en L1/entrada_secador)
+    // dejaba la cota 40x corta para un contador de 10 ticks/s: el tiempo de
+    // operación se descartaba en cualquier hueco de más de unos minutos.
+    const double gap = 30 * 60.0;                  // 30 min
+    const uint16_t delta_real = 18000;             // 10 ticks/s * 1800 s
+
+    CounterCtx as_event = ctx_for(gap, 450.0);     // tasa de producción
+    as_event.proc = "entrada_secador";
+    as_event.field = "ingreso_elevador_cantidad";  // familia Event
+    CHECK_FALSE(diff_counter_scaled(1000 + delta_real, 1000, as_event).plausible);
+
+    CounterCtx as_ds = as_event;
+    as_ds.field = "ingreso_elevador_tiempo";       // familia tiempo_ds
+    const auto r = diff_counter_scaled(1000 + delta_real, 1000, as_ds);
+    CHECK(r.plausible);                            // ahora sí se recupera
+    CHECK(r.max_plausible == doctest::Approx(10.0 * gap * 1.5));
+
+    // Pero el módulo sigue mandando: a 10 ticks/s la ventana recuperable acaba
+    // hacia 1,2 h, y más allá el delta es ambiguo por construcción.
+    CounterCtx beyond = as_ds;
+    beyond.elapsed_s = 1.5 * 3600.0;
+    CHECK(std::string(diff_counter_scaled(1500, 1000, beyond).reason) == "ambiguous_module");
 }

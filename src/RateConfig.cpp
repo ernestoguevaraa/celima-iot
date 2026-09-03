@@ -27,11 +27,13 @@ bool RateConfig::apply_json(const std::string& text, std::string& err)
 {
     json j;
     try {
-        // ignore_comments: este archivo lo edita alguien a mano en planta y la
-        // plantilla que se instala documenta el formato en comentarios. Sin esto
-        // el archivo se rechazaría y el servicio caería al valor por defecto en
-        // silencio, que es justo el fallo que nadie nota.
-        j = json::parse(text, nullptr, /*allow_exceptions=*/true, /*ignore_comments=*/true);
+        // JSON estricto, sin comentarios: rates.json tiene que abrirse con jq,
+        // con los linters de CI y con cualquier parser sin sorpresas. La
+        // explicación de los números vive en
+        // docs/design/cota-plausibilidad-y-tasas.md, no en el archivo.
+        // Un comentario aquí se rechaza y queda en el journal como
+        // "rates file not usable", con cota conservadora: visible y seguro.
+        j = json::parse(text);
     } catch (const std::exception& e) {
         err = e.what();
         return false;

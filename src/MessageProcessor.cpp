@@ -11,6 +11,7 @@
 #include <set>
 #include <atomic>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 using json = nlohmann::json;
 
@@ -86,6 +87,90 @@ bool detect_global_shift_change(int currentShift)
 // prev_ref into a range that makes ALL subsequent valid readings appear as
 // huge deltas (via 16-bit wraparound), freezing the accumulator forever.
 // ---------------------------------------------------------------------------
+// Clasificación de contadores por familia (pendiente P1).
+//
+// Se lista SOLO lo que es tiempo; todo lo demás es Event por defecto. La
+// clasificación no se deduce del sufijo del nombre porque los nombres se
+// contradicen entre procesadores: en las prensas `metrica_tiempo` son
+// decisegundos (se multiplica por 0,1 al acumular), mientras que en salida
+// horno `paradas_tempo` son segundos. La unidad la fija el acumulador destino
+// (`acc_*_s` / `acc_*_ds`) y el comentario CF100 del código, no la etiqueta.
+//
+// REVISAR ANTES DE AMPLIAR: marcar como tiempo un contador de evento agranda su
+// cota 40x y es el error peligroso. Ante la duda, no lo listes: Event usa la
+// tasa medida y subcuenta, que es el lado seguro.
+namespace {
+
+struct FamilyEntry {
+    const char*   proc;
+    const char*   field;
+    CounterFamily family;
+};
+
+constexpr CounterFamily kS  = CounterFamily::TimeSeconds;       // 1 tick/s
+constexpr CounterFamily kDs = CounterFamily::TimeDeciseconds;   // 10 ticks/s
+
+constexpr FamilyEntry kCounterFamilies[] = {
+    // prensas: D29006 son decisegundos (acumulado con ×0,1), D29004 segundos
+    {"prensa_hidraulica1", "metrica_tiempo",           kDs},
+    {"prensa_hidraulica1", "paradas_tiempo",           kS },
+    {"prensa_hidraulica2", "metrica_tiempo",           kDs},
+    {"prensa_hidraulica2", "paradas_tiempo",           kS },
+
+    {"entrada_secador",    "timer1Hz",                 kS },
+    {"entrada_secador",    "paradas_tempo",            kS },
+    {"entrada_secador",    "ingreso_elevador_tiempo",  kDs},
+    {"entrada_secador",    "bancalino_l1_tiempo",      kDs},
+    {"entrada_secador",    "bancalino_l2_tiempo",      kDs},
+
+    {"salida_secador",     "timer1Hz",                 kS },
+    {"salida_secador",     "parada_mds_tiempo",        kS },
+    {"salida_secador",     "metrica_mds_tiempo",       kDs},
+
+    {"esmalte",            "timer1Hz",                 kS },
+    {"esmalte",            "parada_esm_tiempo",        kS },
+    {"esmalte",            "metrica_esm_tiempo",       kDs},
+
+    {"entrada_horno",      "timer1Hz",                 kS },
+    {"entrada_horno",      "parada_mcf_tiempo",        kS },
+    {"entrada_horno",      "metrica_mcf_tiempo",       kDs},
+    {"entrada_horno",      "metrica_formador_tiempo",  kDs},
+    {"entrada_horno",      "falha_forno_tiempo",       kS },
+
+    // salida horno publica estos tres con nombres heredados que suenan a
+    // cantidad (cantidad_total, cambioSentidoTotal, cambioBarreraTotal), pero
+    // el código los anota como CF100 = 0,1 s por tick, igual que sus gemelos de
+    // entrada horno. Si el mapa del PLC dijera otra cosa, quitarlos de aquí.
+    {"salida_horno",       "timer1Hz",                 kS },
+    {"salida_horno",       "paradas_tempo",            kS },
+    {"salida_horno",       "metrica_tiempo",           kDs},
+    {"salida_horno",       "parada_escolha_tempo",     kS },
+    {"salida_horno",       "sentido_escolha_tiempo",   kDs},
+    {"salida_horno",       "barreira1_tiempo",         kDs},
+};
+
+const char* family_name(CounterFamily f)
+{
+    switch (f) {
+        case CounterFamily::TimeSeconds:      return "tiempo_s";
+        case CounterFamily::TimeDeciseconds:  return "tiempo_ds";
+        case CounterFamily::Event:            break;
+    }
+    return "evento";
+}
+
+} // namespace
+
+CounterFamily counter_family_for(const char* proc, const char* field)
+{
+    if (!proc || !field) return CounterFamily::Event;
+    for (const auto& e : kCounterFamilies)
+        if (std::strcmp(e.proc, proc) == 0 && std::strcmp(e.field, field) == 0)
+            return e.family;
+    return CounterFamily::Event;
+}
+
+// ---------------------------------------------------------------------------
 // Cota de plausibilidad escalada por tiempo (D2).
 //
 // El techo fijo de 5000 se agota en ~3,9 h de producción a la tasa medida de L1
@@ -112,13 +197,26 @@ DeltaResult diff_counter_scaled(uint16_t curr, uint16_t prev, const CounterCtx &
         return r;
     }
 
-    // 2) Configuración de tasa ausente o absurda: subcontar es el lado seguro.
-    if (ctx.rate_max_per_s <= 0.0) {
+    // 2) La tasa depende de la familia del contador. Los de tiempo tienen un
+    //    máximo analítico (1 y 10 ticks/s) y NO usan la tasa configurada, que
+    //    está dimensionada para producción y los dejaría 40x cortos: tras un
+    //    hueco largo se recuperaba la producción pero no el tiempo de operación.
+    const CounterFamily family = counter_family_for(ctx.proc, ctx.field);
+    double rate_per_s = ctx.rate_max_per_s;
+    switch (family) {
+        case CounterFamily::TimeSeconds:     rate_per_s = 1.0;  break;
+        case CounterFamily::TimeDeciseconds: rate_per_s = 10.0; break;
+        case CounterFamily::Event:                              break;
+    }
+
+    // Configuración de tasa ausente o absurda: subcontar es el lado seguro.
+    // Solo afecta a los contadores de evento; los de tiempo no dependen de ella.
+    if (rate_per_s <= 0.0) {
         r.reason = "no_rate";
         return r;
     }
 
-    const double scaled = ctx.rate_max_per_s * ctx.elapsed_s * ctx.margin;
+    const double scaled = rate_per_s * ctx.elapsed_s * ctx.margin;
 
     // 3) Límite duro: si la cota alcanza el módulo, el contador pudo dar más de
     //    una vuelta y el delta es ambiguo por construcción. Sin más aritmética.
@@ -330,6 +428,7 @@ uint32_t safe_delta_u16(uint16_t prev, uint16_t curr, const CounterCtx &ctx)
         " raw_delta=" + std::to_string(r.value) +
         " max_plausible=" + std::to_string(r.max_plausible) +
         " elapsed_s=" + std::to_string(static_cast<int64_t>(ctx.elapsed_s)) +
+        " family=" + family_name(counter_family_for(ctx.proc, ctx.field)) +
         " reason=" + r.reason);
     return 0;
 }
@@ -363,6 +462,7 @@ static uint16_t diff_counter_safe(uint16_t curr, uint16_t &prev_ref,
         " raw_delta=" + std::to_string(r.value) +
         " max_plausible=" + std::to_string(r.max_plausible) +
         " elapsed_s=" + std::to_string(static_cast<int64_t>(ctx.elapsed_s)) +
+        " family=" + family_name(counter_family_for(ctx.proc, ctx.field)) +
         " reason=" + r.reason +
         " reject_count=" + std::to_string(static_cast<int>(reject_count)));
     if (reject_count >= ctx.max_rejects) {
