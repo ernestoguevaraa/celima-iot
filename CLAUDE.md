@@ -42,7 +42,7 @@ make test GOLDEN_OUT=tests/data/celima_data_replay.golden   # regenerar el golde
 ```
 
 The suite is doctest (vendored at [tests/doctest.h](tests/doctest.h), MIT, header-only — no runtime
-dependency, not linked into the release binary): 38 cases across
+dependency, not linked into the release binary): 39 cases across
 [test_replay.cpp](tests/test_replay.cpp) (golden), [test_state_events.cpp](tests/test_state_events.cpp),
 [test_scaled_bound.cpp](tests/test_scaled_bound.cpp), [test_persistence.cpp](tests/test_persistence.cpp)
 and [test_shifts.cpp](tests/test_shifts.cpp). Its core is a deterministic replay:
@@ -61,6 +61,16 @@ Two things make the suite deterministic regardless of when it runs: `testsup::pi
 Beyond the suite, verification means running the binary against a broker and reading its stdout
 (every accepted frame logs `[PUB QoS1] <topic> <- <payload>`, and state events log `[STATE] <event>
 line=<n> proc=<name> ...`), or in production via `journalctl -u iot-celima-mqtt.service`.
+
+The fixture is synthetic, but the numbers it models were measured on a 24 h capture of real
+`celima/data` traffic (11.180 frames, 2026-09-02 → 09-03). What that capture settled, so nobody has
+to re-derive it: `gatewayTime` was present and parseable in **every** frame, so the "a missing
+`gatewayTime` stops the line counting" hazard is real but not currently occurring; retries are always
+re-stamped by the gateway, land 1–26 s after the original, and are cleanly separable from a stalled
+machine republishing identical counters at ≥179 s; `timer1Hz` tracks `gatewayTime` to ±1 s typically,
+not exactly. Capturing it again is a `journalctl -o short-iso ... | grep -F '[celima/data]'` away —
+keep the reception timestamp, it is what makes the retry analysis possible. Those logs are
+gitignored: they are production data and weigh megabytes.
 
 ## Configuration
 
@@ -120,7 +130,15 @@ Flow, all inside one process:
    `celima/error`, `celima/join`, `celima/ACK`; only `celima/data` is processed. `clean_session=false`
    + `automatic_reconnect`. Publishes QoS 1 fire-and-forget.
 3. Routing: `deviceType` (int) → `DeviceType` enum ([inc/DeviceTypes.hpp](inc/DeviceTypes.hpp)) →
-   `createProcessor()` factory. Unknown types fall through to `DefaultProcessor`.
+   `createProcessor()` factory. Unknown types fall through to `DefaultProcessor`, whose two
+   publications are placeholder scaffolding (`quantity: 0`, `alarms: 0`, server time, and a
+   double-slash topic because the prefix already ends in `/`). A frame carrying `_error` — the
+   gateway decoder failed to parse it — publishes **nothing**: those are the 1-byte keep-alive pings
+   the Arduinos send so the gateway does not drop them, 10,7% of the traffic measured over 24 h, and
+   each one used to emit two of those placeholder messages into InfluxDB. The first occurrence of
+   each distinct `_error` string logs `[STATE] frame_ignored`; repeats are silent, so a *new* decoder
+   error is still visible. The raw `[celima/data]` ingest line is unaffected — the pings still show
+   up there, which is where you want them for forensics.
 4. Before dispatch, `detect_global_shift_change()` compares the current shift against a global atomic;
    on change it calls `reset_all_processor_states()`, zeroing every processor's static state. The
    **first** message after boot deliberately does *not* count as a change — see the trap below.
@@ -168,16 +186,33 @@ Every processor is structurally the same; deviations are almost always deliberat
 - Restoring is a *boot* event, not a shift event: the "already consulted the store" set is a
   process-scoped static, not a state field, because `reset_all_processor_states()` wipes state on
   every shift change and would otherwise re-read the DB and mislabel it as an across-restart change.
-- Duplicate-frame rejection (the network server republishes frames; interval ~180 s, retry ~30 s):
-  processors that receive `timer1Hz` (a free-running 1 Hz counter) drop a frame whose `timer1Hz`
-  equals the last accepted one. PH1/PH2 have no `timer1Hz` and instead compare all four counters
-  within a 120 s window. Calidad dedups on `gatewayTime` + identical raw counters.
+- **Publish interval, measured over 24 h of plant traffic: 187 s for most classes, 127 s for
+  `entrada_horno`, 180 s for `calidad`.** The Arduino clock runs slightly long, hence 187 and not 180.
+  Nothing in the code hardcodes it — the bound derives the gap from `gatewayTime` — but it is the
+  number behind `CELIMA_GAP_SHORT_S`, the dedup window and the cost of a rejection.
+- Duplicate-frame rejection. Duplicates are routine, not exceptional: the Arduino retries a frame up
+  to 3 times (~30 s apart) until the LoRaWAN gateway ACKs it, and **those ACKs get lost on the way
+  back**, so a delivered frame is often retransmitted anyway. The gateway re-stamps `gatewayTime` on
+  the retry, so the copy does *not* arrive with the original timestamp. Three different mechanisms
+  catch it: processors with `timer1Hz` (a free-running 1 Hz counter) drop a frame whose `timer1Hz`
+  equals the last accepted one — the payload is byte-identical, so this always fires; PH1/PH2 have no
+  `timer1Hz` and compare all four counters within a 120 s window; calidad compares `gatewayTime` +
+  raw counters, so a re-stamped retry slips through, is accepted, and contributes a delta of 0 — it
+  publishes a redundant message but never double-counts. A test drives all eight processors with a
+  re-stamped retry and asserts no `*_turno` total moves.
+- **The 120 s dedup window is calibrated, and the 24 h capture confirms both edges.** Real retries
+  land 1–26 s after the original (p50 = 5 s), so the window has ~4,6x margin; and a *stalled* machine
+  republishes identical counters at its normal interval (≥179 s), which must NOT be deduped because
+  it is a legitimate frame. The window sits between the two on purpose — do not widen it past ~150 s.
+- **`timer1Hz` is not an exact clock.** Its delta matches the `gatewayTime` delta in only 58% of real
+  pairs; ±1 s is routine and ±6 s happens. The 1,5 margin on the `tiempo_s` bound absorbs it, and the
+  fixture guard allows ±10 s for the same reason.
 - Output is built with `nlohmann::json` and returned via `make_pub(topic, json)`.
 
 ### Counter arithmetic — read before touching
 
-Field counters are `uint16_t` PLC registers sampled every ~3 minutes, so every published total is a
-sum of deltas, and every hard-won fix here is about a specific field failure mode. The layers:
+Field counters are `uint16_t` PLC registers sampled every ~3 minutes (~2 in `entrada_horno`), so
+every published total is a sum of deltas, and every hard-won fix here is about a specific field failure mode. The layers:
 
 - `CounterCtx` ([inc/MessageProcessor.hpp](inc/MessageProcessor.hpp)) carries everything a delta
   needs: `line`/`proc`/`field` (labels only, for `[STATE]`), `elapsed_s`, `rate_max_per_s`, `margin`,
@@ -296,9 +331,9 @@ Léelas antes de tocar [src/MessageProcessor.cpp](src/MessageProcessor.cpp).
   de contar mientras el campo falte. Es la consecuencia deliberada de no caer a la hora del servidor,
   y por eso deja rastro (`delta_rejected ... reason=no_elapsed`) en lugar de fallar en silencio. Si
   aparece en el journal, es un problema del gateway, no del cálculo.
-- **Un rechazo de cota cuesta ~9 minutos de producción.** Cuando la cota rechaza, `prev_ref` no
+- **Un rechazo de cota cuesta tres tramas de producción.** Cuando la cota rechaza, `prev_ref` no
   avanza, así que los dos mensajes siguientes también se rechazan y solo el tercero fuerza el
-  re-anclaje: a ~180 s de intervalo, tres tramas. Con la cota escalada esto ya no se dispara en huecos
+  re-anclaje: ~9 min a 180 s de intervalo, ~6 min en `entrada_horno`, que publica cada 120 s. Con la cota escalada esto ya no se dispara en huecos
   legítimos; si lo ves en el journal, es corrupción real o un cambio de banco de registros.
 - **Las tasas por línea y máquina siguen sin medirse.** `default_rate_per_h = 600` es un valor
   conservador puesto a mano, no derivado del percentil 99 de los deltas observados. Mientras siga así,
@@ -321,14 +356,20 @@ Léelas antes de tocar [src/MessageProcessor.cpp](src/MessageProcessor.cpp).
 - **Una tasa alta no es "más segura por si acaso": recorta el horizonte de recuperación**, porque la
   cota alcanza antes el módulo de 65.536. Tenlo presente antes de subir un número "por margen".
 - **El buffering de stdout ya está corregido** (`std::cout << std::unitbuf;` como primera sentencia de
-  `main()`). No lo quites ni metas salida antes de esa línea: sin ella, stdout bajo systemd es un pipe
+  `main()`), aunque **el efecto en planta aún no está medido**: en la captura de 24 h, hecha con el
+  binario anterior, la latencia entre el sello del gateway y la línea del journal daba p50 = 8 s con
+  ráfagas de hasta 7 líneas en el mismo segundo —130 veces más de lo que daría el azar—, consistente
+  con un buffer de 4 KB a los ~500 B/s que crece el journal. Para separar eso de la latencia de radio
+  y del network server hay que comparar contra la marca de recepción del `boxer-patrol-edge-processor`,
+  no contra `gatewayTime`. No lo quites ni metas salida antes de esa línea: sin ella, stdout bajo systemd es un pipe
   con buffer de bloque de 4 KB, los logs llegaban al journal con hasta 36 s de retraso y cada parada
   dura se llevaba las líneas que explicaban la caída. Medido: con `kill -9`, antes sobrevivían 0
   bytes; después, todo lo ya emitido.
 - **Los caminos de estado dejan rastro `[STATE]`**, vía `celima::log::state_event()`
   ([inc/Logging.hpp](inc/Logging.hpp)): `reseed` (`reason=first_message|shift_change|shift_change_across_restart`),
   `delta_rejected` (con `reason`, `max_plausible`, `elapsed_s` y `family`), `reanchor`, `restored`, `gap`,
-  `shift_first_observed`, `shift_change_global`, `stored_state_ignored` y `store_error`. Si añades lógica de descarte o de re-siembra,
+  `shift_first_observed`, `shift_change_global`, `frame_ignored`, `stored_state_ignored` y
+  `store_error`. Si añades lógica de descarte o de re-siembra,
   emítela por ahí — en silencio no es reconstruible: tras el incidente del 1 de septiembre identificar
   la re-siembra exigió comparar `timer1Hz_turno` entre tópicos del journal. Dos reglas al hacerlo:
   nada de logging en la rama de acumulación normal (~36.000 mensajes/día, el journal ya crece
@@ -361,6 +402,18 @@ Léelas antes de tocar [src/MessageProcessor.cpp](src/MessageProcessor.cpp).
 - Para reconstruir un turno perdido, la única fuente es el journal (retención ~7 semanas, menos los
   4 KB que se pierden en cada parada dura): InfluxDB guarda solo un subconjunto de lo publicado, sin
   los contadores crudos. El procedimiento está en el documento de diseño.
+- **Hay dispositivos apagados por fallos de join de LoRaWAN**, y por eso `rates.json` tiene más
+  entradas que dispositivos emitiendo. En la captura de 24 h del 2026-09-02 reportaban **20 de las 26
+  claves configuradas**; las seis silenciosas son L1/`entrada_secador`, L1/`prensa_hidraulica2`,
+  L1/`salida_horno`, L2/`entrada_horno`, L2/`esmalte` y L3/`esmalte`. Se pidió reiniciar esos
+  Arduinos, así que **no borres esas entradas**: la configuración sobra sin coste —una clave sin
+  tráfico nunca se consulta— y hace falta cuando el dispositivo vuelva. Ojo con leer el documento de
+  tasas sin esto en mente: da `prensa_hidraulica2` como en servicio con 8.275 muestras, y en esas
+  24 h no envió ninguna.
+- **L4/`esmalte` es un dispositivo enfermo, no una línea parada.** En la misma captura mandó 70 de las
+  ~480 tramas esperadas y provocó 8 de los 33 huecos mayores de 600 s, el peor de 2,9 h. Es el que
+  explica la anomalía del 1 de septiembre que el documento de persistencia dejó anotada. Sus tasas
+  derivadas (L3 y L4 de esmalte) salen de muy pocas muestras.
 
 ### Diseño de referencia
 

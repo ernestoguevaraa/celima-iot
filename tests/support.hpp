@@ -189,17 +189,24 @@ inline const std::vector<const char*>& frame_fields(int dt)
 inline constexpr int64_t kBaseEpoch = 1788336000;
 inline constexpr int     kInterval  = 180;
 
+// Intervalo de publicación por clase de dispositivo: entrada_horno (6) publica
+// cada ~120 s; el resto, cada ~180 s.
+inline constexpr int frame_interval(int dt) { return dt == 6 ? 120 : 180; }
+
 inline nlohmann::json make_frame(int dt, int line, int tick, int step = 64,
                                  int base = 1000)
 {
+    const int64_t elapsed = static_cast<int64_t>(tick) * frame_interval(dt);
     nlohmann::json m;
     m["deviceType"]  = dt;
     m["lineID"]      = line;
     m["alarms"]      = 0;
     m["checksum"]    = 42;
-    m["gatewayTime"] = iso_utc(kBaseEpoch + static_cast<int64_t>(tick) * kInterval);
+    m["gatewayTime"] = iso_utc(kBaseEpoch + elapsed);
+    // timer1Hz es un contador libre a 1 Hz: avanza exactamente los segundos
+    // transcurridos, no un incremento arbitrario.
     if (dt >= 3 && dt <= 7)
-        m["timer1Hz"] = static_cast<uint16_t>(base + tick * kInterval);
+        m["timer1Hz"] = static_cast<uint16_t>(base + elapsed);
     for (const char* f : frame_fields(dt))
         m[f] = static_cast<uint16_t>(base + tick * step);
     if (dt == 8)

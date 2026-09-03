@@ -510,6 +510,40 @@ class DefaultProcessor : public IMessageProcessor
 public:
     std::vector<Publication> process(const json &msg, const std::string &isa95_prefix, int shift_mode = 3) override
     {
+        // Trama que el decoder del gateway no pudo interpretar: no se publica
+        // nada.
+        //
+        // El caso real son los pings de 1 byte que los Arduino mandan para que
+        // el gateway no los desconecte; su decoder intenta parsearlos y emite
+        // {"_error": "11 bytes requeridos, recibidos: 1"} sin deviceType, que
+        // caía aquí. Medido sobre 24 h: 1.192 de 11.180 tramas (10,7%), y cada
+        // una publicaba dos mensajes de relleno (quantity=0, alarms=0, con hora
+        // de servidor) en tópicos con doble barra, que llegaban al edge
+        // processor y a InfluxDB como si fueran producción.
+        //
+        // Se registra el primer error de cada tipo y se calla el resto: así un
+        // error nuevo del decoder se ve, y los ~1.200 pings diarios no inundan
+        // el journal.
+        if (msg.contains("_error")) {
+            const std::string err = msg["_error"].is_string()
+                                      ? msg.value("_error", std::string{})
+                                      : msg["_error"].dump();
+            static std::mutex seen_mtx;
+            static std::set<std::string> seen;
+            bool first = false;
+            {
+                std::lock_guard<std::mutex> lock(seen_mtx);
+                first = seen.insert(err).second;
+            }
+            if (first) {
+                celima::log::state_event("frame_ignored", -1, "decoder",
+                    "reason=decoder_error devEUI=" +
+                    jsonu::get_opt<std::string>(msg, "devEUI").value_or("?") +
+                    " err=\"" + err + "\"");
+            }
+            return {};
+        }
+
         json out;
         out["source"] = "celima/data";
         out["observed"] = msg;

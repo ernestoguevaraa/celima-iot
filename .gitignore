@@ -39,6 +39,10 @@
 bin
 _pkg
 
+# Capturas del journal de planta: datos de producción, y pesan megas. Se usan
+# para derivar tasas y validar supuestos, no se versionan.
+tests/data/*.log
+
 # Estado de runtime: la base de acumuladores de turno y sus ficheros WAL.
 # Nunca va al repo ni al paquete; la crea el servicio en StateDirectory=.
 *.db

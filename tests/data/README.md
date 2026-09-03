@@ -4,8 +4,8 @@
 
 **Es un fixture sintético, no tráfico de planta.** Se generó con semilla fija
 (`20260902`) porque este repo no tiene acceso al journal de la PC industrial.
-Cubre lo que pide la spec —los 8 `deviceType` en 4 líneas, 20 intervalos de
-180 s ≈ 1 h por combinación, 641 tramas— y además fuerza a propósito tres casos:
+Cubre lo que pide la spec —los 8 `deviceType` en 4 líneas, 1 h de tráfico por
+combinación, 681 tramas— y además fuerza a propósito tres casos:
 
 | Caso | Dónde |
 |---|---|
@@ -15,6 +15,23 @@ Cubre lo que pide la spec —los 8 `deviceType` en 4 líneas, 20 intervalos de
 
 Todas las tramas llevan `gatewayTime`, para que `device_timestamp()` no caiga a
 la hora del servidor y el replay sea determinista.
+
+El fixture respeta dos propiedades físicas que antes no cumplía, y que un test
+comprueba en cada ejecución:
+
+- **El intervalo depende de la clase:** `entrada_horno` publica cada 120 s (30
+  tramas por hora) y el resto cada 180 s (20 tramas).
+- **`timer1Hz` avanza exactamente los segundos transcurridos**, con vuelta en
+  65.536. Es un contador libre a 1 Hz: no puede avanzar otra cosa. La versión
+  anterior le ponía incrementos al azar de hasta 360 por trama, que superan la
+  cota de su familia (`tiempo_s`, 1 tick/s) y pasaban solo porque manda el techo
+  mínimo de `max_valid` — el fixture estaba tapando esa comprobación.
+
+Una simplificación que queda: la trama repetida del intervalo 3 llega con el
+**mismo** `gatewayTime`. En planta el gateway re-sella la marca al recibir el
+reintento, así que la copia llega con una posterior. Ese caso —el que la
+deduplicación por ventana puede no reconocer— está cubierto en
+`tests/test_state_events.cpp`, no aquí.
 
 ### Sustituirlo por tráfico real
 
@@ -29,6 +46,10 @@ Graba al menos una hora. Dos avisos:
 
 - Descarta las tramas sin `gatewayTime`, o el golden dependerá de la hora del
   servidor y la prueba será inestable.
+- El journal trae las retransmisiones como líneas propias. Al derivar tasas
+  aparecen como pares de ~30 s con delta 0, que bajan el percentil (lado
+  conservador) pero acortan el intervalo del par siguiente. `derive_rates.py`
+  no las filtra hoy.
 - Tras sustituir el fixture hay que regenerar el golden (abajo), y conviene
   hacerlo con el binario **anterior** al cambio que estés validando.
 
