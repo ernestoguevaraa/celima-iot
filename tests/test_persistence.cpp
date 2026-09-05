@@ -489,3 +489,44 @@ TEST_CASE("calidad no arrastra el delta del hueco al turno nuevo") {
 
     celima::set_state_store(nullptr);
 }
+
+TEST_CASE("los acumuladores de nivel sobreviven al reinicio") {
+    // Sin esto se reintroduce D1 en los campos nuevos: el turno los pondría a
+    // cero en cada reinicio mientras numero_grades_turno continúa.
+    testsup::pin_local_hour(10);
+    testsup::rates_for_tests();
+    install_memory_store();
+    simulate_restart();
+
+    auto nivel_de = [](const std::vector<Publication>& pubs, const char* campo) {
+        REQUIRE(pubs.size() == 2);
+        return json::parse(pubs[1].payload)[campo].get<int64_t>();
+    };
+
+    {
+        auto horno = createProcessor(DeviceType::Entrada_horno);
+        const std::vector<int> nivel = {10, 14, 9, 0};   // +4, -5, -9 y un vacío
+        std::vector<Publication> pubs;
+        for (size_t i = 0; i < nivel.size(); ++i) {
+            json m = testsup::make_frame(6, 7, static_cast<int>(i));
+            m["numero_grades"] = nivel[i];
+            pubs = horno->process(m, kPfx, 3);
+        }
+        CHECK(nivel_de(pubs, "numero_grades_turno") == 4);
+        CHECK(nivel_de(pubs, "numero_grades_bajadas_turno") == 5 + 9);
+        CHECK(nivel_de(pubs, "buffer_vacio_turno_s") == 120);
+    }
+
+    simulate_restart();   // <-- caída y arranque
+
+    auto horno = createProcessor(DeviceType::Entrada_horno);
+    json m = testsup::make_frame(6, 7, 4);
+    m["numero_grades"] = 6;                 // +6 desde el 0 de antes del corte
+    const auto pubs = horno->process(m, kPfx, 3);
+
+    CHECK(nivel_de(pubs, "numero_grades_turno") == 4 + 6);
+    CHECK(nivel_de(pubs, "numero_grades_bajadas_turno") == 14);   // restaurado
+    CHECK(nivel_de(pubs, "buffer_vacio_turno_s") == 120);         // restaurado
+
+    celima::set_state_store(nullptr);
+}

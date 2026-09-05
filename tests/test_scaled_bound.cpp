@@ -325,3 +325,119 @@ TEST_CASE("P1: un hueco corto ya recupera los acumuladores de tiempo") {
     beyond.elapsed_s = 1.5 * 3600.0;
     CHECK(std::string(diff_counter_scaled(1500, 1000, beyond).reason) == "ambiguous_module");
 }
+
+// ---------------------------------------------------------------------------
+// Familia Level (defecto D5): numero_grades es el nivel del buffer de filas que
+// esperan entrar al horno. Sube al cargar y baja al desocuparse, así que la
+// resta sin signo convertía cada bajada en ~65.532: 836 rechazos al día, el 78%
+// de todos los del servicio.
+
+static CounterCtx ctx_level(uint16_t max_valid = 500)
+{
+    CounterCtx c = ctx_for(127, 900.0);        // intervalo real de entrada horno
+    c.proc = "entrada_horno";
+    c.field = "numero_grades";
+    c.max_valid = max_valid;
+    return c;
+}
+
+TEST_CASE("Level: el nivel se interpreta con signo") {
+    REQUIRE(counter_family_for("entrada_horno", "numero_grades") == CounterFamily::Level);
+    const auto ctx = ctx_level();
+
+    SUBCASE("bajada normal") {
+        // El caso medido en las cuatro líneas: curr = prev - 4.
+        const auto r = diff_counter_scaled(36, 40, ctx);
+        CHECK(r.signed_value == -4);
+        CHECK(r.value == 4);
+        CHECK(r.plausible);                    // antes daba 65.532 y se rechazaba
+    }
+    SUBCASE("subida normal") {
+        const auto r = diff_counter_scaled(41, 36, ctx);
+        CHECK(r.signed_value == 5);
+        CHECK(r.value == 5);
+        CHECK(r.plausible);
+    }
+    SUBCASE("sin movimiento") {
+        const auto r = diff_counter_scaled(40, 40, ctx);
+        CHECK(r.signed_value == 0);
+        CHECK(r.plausible);
+    }
+    SUBCASE("salto imposible") {
+        const auto r = diff_counter_scaled(9000, 40, ctx);
+        CHECK_FALSE(r.plausible);
+        CHECK(std::string(r.reason) == "level_jump");
+    }
+    SUBCASE("cruce del módulo con signo") {
+        // prev=2, curr=65534 es una bajada de 4, no una subida de 65.532. Es lo
+        // que hace correcto el int16_t frente a una resta condicional.
+        const auto r = diff_counter_scaled(65534, 2, ctx);
+        CHECK(r.signed_value == -4);
+        CHECK(r.plausible);
+    }
+    SUBCASE("un nivel no depende de la tasa ni del hueco") {
+        CounterCtx sin_tasa = ctx_level();
+        sin_tasa.rate_max_per_s = 0.0;         // configuración ausente
+        sin_tasa.elapsed_s = 0.0;              // sin hueco medible
+        const auto r = diff_counter_scaled(36, 40, sin_tasa);
+        CHECK(r.plausible);
+        CHECK(r.signed_value == -4);
+        CHECK(std::string(r.reason) != "no_rate");
+        CHECK(std::string(r.reason) != "no_elapsed");
+    }
+}
+
+TEST_CASE("Level: subidas, bajadas y buffer vacío en entrada horno") {
+    testsup::pin_local_hour(10);
+    reset_all_processor_states();
+    testsup::rates_for_tests();
+    celima::set_state_store(nullptr);
+
+    auto horno = createProcessor(DeviceType::Entrada_horno);
+
+    // Secuencia del nivel: siembra en 10, sube a 14 (+4), baja a 9 (-5),
+    // sube a 12 (+3), baja a 0 (-12), sigue en 0, sube a 6 (+6).
+    const std::vector<int> nivel = {10, 14, 9, 12, 0, 0, 6};
+    std::vector<Publication> pubs;
+    const std::string log = capture_streams([&] {
+        for (size_t i = 0; i < nivel.size(); ++i) {
+            json m = testsup::make_frame(6, 1, static_cast<int>(i));
+            m["numero_grades"] = nivel[i];
+            pubs = horno->process(m, kPfx, 3);
+        }
+    });
+
+    // Ni un solo rechazo: es justo el ruido que este cambio elimina.
+    CHECK(count_lines(log, {"delta_rejected", "field=numero_grades"}) == 0);
+
+    const json prod = json::parse(pubs[1].payload);
+    CHECK(prod["numero_grades_instantaneo"] == 6);          // crudo, sin tocar
+    CHECK(prod["numero_grades_turno"] == 4 + 3 + 6);        // subidas: 13
+    CHECK(prod["numero_grades_bajadas_turno"] == 5 + 12);   // bajadas: 17
+    // Dos tramas con el nivel a cero. Es muestreo: cada una cuenta su intervalo
+    // completo (120 s en entrada horno).
+    CHECK(prod["buffer_vacio_turno_s"] == 2 * 120);
+}
+
+TEST_CASE("Level: un salto imposible se rechaza y re-ancla como los demás") {
+    testsup::pin_local_hour(10);
+    reset_all_processor_states();
+    testsup::rates_for_tests();
+    celima::set_state_store(nullptr);
+
+    auto horno = createProcessor(DeviceType::Entrada_horno);
+    json m = testsup::make_frame(6, 2, 0);
+    m["numero_grades"] = 10;
+    horno->process(m, kPfx, 3);
+
+    const std::string log = capture_streams([&] {
+        for (int tick = 1; tick <= 3; ++tick) {
+            json f = testsup::make_frame(6, 2, tick);
+            f["numero_grades"] = 9000;         // fuera de cualquier nivel físico
+            horno->process(f, kPfx, 3);
+        }
+    });
+    CHECK(count_lines(log, {"delta_rejected", "field=numero_grades",
+                            "family=nivel", "reason=level_jump"}) == 3);
+    CHECK(count_lines(log, {"reanchor", "field=numero_grades"}) == 1);
+}

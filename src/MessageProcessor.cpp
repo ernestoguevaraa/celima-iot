@@ -117,7 +117,8 @@ bool detect_global_shift_change(int currentShift)
 // ---------------------------------------------------------------------------
 // Clasificación de contadores por familia (pendiente P1).
 //
-// Se lista SOLO lo que es tiempo; todo lo demás es Event por defecto. La
+// Se listan los contadores de tiempo y los de nivel; todo lo demás es Event por
+// defecto. La
 // clasificación no se deduce del sufijo del nombre porque los nombres se
 // contradicen entre procesadores: en las prensas `metrica_tiempo` son
 // decisegundos (se multiplica por 0,1 al acumular), mientras que en salida
@@ -137,6 +138,7 @@ struct FamilyEntry {
 
 constexpr CounterFamily kS  = CounterFamily::TimeSeconds;       // 1 tick/s
 constexpr CounterFamily kDs = CounterFamily::TimeDeciseconds;   // 10 ticks/s
+constexpr CounterFamily kLv = CounterFamily::Level;             // sube y baja
 
 constexpr FamilyEntry kCounterFamilies[] = {
     // prensas: D29006 son decisegundos (acumulado con ×0,1), D29004 segundos
@@ -160,6 +162,9 @@ constexpr FamilyEntry kCounterFamilies[] = {
     {"esmalte",            "metrica_esm_tiempo",       kDs},
 
     {"entrada_horno",      "timer1Hz",                 kS },
+    // Nivel del buffer de filas que esperan entrar al horno: sube al cargar y
+    // baja al desocuparse. No es un contador monótono (defecto D5).
+    {"entrada_horno",      "numero_grades",            kLv},
     {"entrada_horno",      "parada_mcf_tiempo",        kS },
     {"entrada_horno",      "metrica_mcf_tiempo",       kDs},
     {"entrada_horno",      "metrica_formador_tiempo",  kDs},
@@ -182,6 +187,7 @@ const char* family_name(CounterFamily f)
     switch (f) {
         case CounterFamily::TimeSeconds:      return "tiempo_s";
         case CounterFamily::TimeDeciseconds:  return "tiempo_ds";
+        case CounterFamily::Level:            return "nivel";
         case CounterFamily::Event:            break;
     }
     return "evento";
@@ -211,6 +217,7 @@ DeltaResult diff_counter_scaled(uint16_t curr, uint16_t prev, const CounterCtx &
 {
     DeltaResult r;
     r.value = static_cast<uint16_t>(curr - prev);   // misma resta sin máscara que siempre
+    r.signed_value = static_cast<int32_t>(r.value); // en toda familia salvo Level
 
     // El contador no se movió: no hay nada que acotar.
     if (r.value == 0) {
@@ -218,27 +225,46 @@ DeltaResult diff_counter_scaled(uint16_t curr, uint16_t prev, const CounterCtx &
         return r;
     }
 
-    // 1) Sin hueco medible no hay cota posible. Cubre el reloj hacia atrás y
+    const CounterFamily family = counter_family_for(ctx.proc, ctx.field);
+
+    // 1) Un nivel se interpreta con signo, y sin tasa ni hueco: va antes que
+    //    todo lo demás porque ninguna de las dos comprobaciones le aplica.
+    if (family == CounterFamily::Level) {
+        // Restar sin signo convierte una bajada de 4 unidades en 65.532, que es
+        // lo que llenaba el journal: 836 rechazos diarios de numero_grades, el
+        // 78% de todos los del servicio. Con int16_t la misma bajada es -4, y el
+        // cruce del módulo (prev=2, curr=65534) también sale -4.
+        r.signed_value  = static_cast<int16_t>(curr - prev);
+        r.value         = static_cast<uint16_t>(std::abs(r.signed_value));
+        r.max_plausible = static_cast<double>(ctx.max_valid);
+        r.plausible     = (std::abs(r.signed_value) <= static_cast<int32_t>(ctx.max_valid));
+        if (!r.plausible) r.reason = "level_jump";
+        return r;
+    }
+
+    // 2) Sin hueco medible no hay cota posible. Cubre el reloj hacia atrás y
     //    los timestamps duplicados. No se "arregla" un tiempo negativo.
     if (ctx.elapsed_s <= 0.0) {
         r.reason = "no_elapsed";
         return r;
     }
 
-    // 2) La tasa depende de la familia del contador. Los de tiempo tienen un
+    // 3) La tasa depende de la familia del contador. Los de tiempo tienen un
     //    máximo analítico (1 y 10 ticks/s) y NO usan la tasa configurada, que
     //    está dimensionada para producción y los dejaría 40x cortos: tras un
     //    hueco largo se recuperaba la producción pero no el tiempo de operación.
-    const CounterFamily family = counter_family_for(ctx.proc, ctx.field);
     double rate_per_s = ctx.rate_max_per_s;
     switch (family) {
         case CounterFamily::TimeSeconds:     rate_per_s = 1.0;  break;
         case CounterFamily::TimeDeciseconds: rate_per_s = 10.0; break;
         case CounterFamily::Event:                              break;
+        // Level ya salió por su propia rama, arriba: no llega aquí. Se enumera
+        // para que añadir una familia nueva sin tratarla ponga rojo el build.
+        case CounterFamily::Level:                              break;
     }
 
-    // Configuración de tasa ausente o absurda: subcontar es el lado seguro.
-    // Solo afecta a los contadores de evento; los de tiempo no dependen de ella.
+    //    Configuración ausente o absurda: subcontar es el lado seguro. Solo
+    //    afecta a los de evento; los de tiempo y nivel no dependen de ella.
     if (rate_per_s <= 0.0) {
         r.reason = "no_rate";
         return r;
@@ -259,6 +285,7 @@ DeltaResult diff_counter_scaled(uint16_t curr, uint16_t prev, const CounterCtx &
     //    normal —intervalos de ~180 s— se comporta exactamente igual que antes.
     r.max_plausible = std::max(scaled, static_cast<double>(ctx.max_valid));
     r.plausible = (static_cast<double>(r.value) <= r.max_plausible);
+    r.signed_value = static_cast<int32_t>(r.value);
     if (!r.plausible)
         r.reason = "over_bound";
     return r;
@@ -469,6 +496,43 @@ static void add_unobserved_marker(nlohmann::json &prod, int64_t unobserved_s)
 {
     if (publish_incomplete_shift_marker())
         prod["turno_segundos_no_observados"] = unobserved_s;
+}
+
+// Variante de diff_counter_safe() para la familia Level: devuelve el cambio CON
+// SIGNO. Comparte el re-anclaje por rechazos consecutivos y los eventos [STATE],
+// para no tener dos mecanismos de observabilidad distintos. diff_counter_safe()
+// no sirve aquí porque devuelve uint16_t y siempre suma.
+static int32_t diff_level_safe(uint16_t curr, uint16_t &prev_ref,
+                               uint8_t &reject_count,
+                               const CounterCtx &ctx)
+{
+    const DeltaResult r = diff_counter_scaled(curr, prev_ref, ctx);
+    if (r.plausible) {
+        prev_ref = curr;
+        reject_count = 0;
+        return r.signed_value;
+    }
+
+    const uint16_t prev_before = prev_ref;
+    reject_count++;
+    celima::log::state_event("delta_rejected", ctx.line, ctx.proc,
+        "field=" + std::string(ctx.field) +
+        " prev=" + std::to_string(prev_before) +
+        " curr=" + std::to_string(curr) +
+        " signed_delta=" + std::to_string(r.signed_value) +
+        " max_plausible=" + std::to_string(r.max_plausible) +
+        " family=" + family_name(counter_family_for(ctx.proc, ctx.field)) +
+        " reason=" + r.reason +
+        " reject_count=" + std::to_string(static_cast<int>(reject_count)));
+    if (reject_count >= ctx.max_rejects) {
+        prev_ref = curr;
+        reject_count = 0;
+        celima::log::state_event("reanchor", ctx.line, ctx.proc,
+            "field=" + std::string(ctx.field) +
+            " prev=" + std::to_string(prev_before) +
+            " curr=" + std::to_string(curr));
+    }
+    return 0;
 }
 
 uint32_t safe_delta_u16(uint16_t prev, uint16_t curr, const CounterCtx &ctx)
@@ -2550,7 +2614,9 @@ private:
         // Production: Número de Grades (D29007)
         uint16_t last_numero_grades = 0;
         uint8_t  rc_numero_grades = 0;
-        uint32_t acc_numero_grades = 0;
+        uint32_t acc_numero_grades = 0;          // suma de las SUBIDAS del nivel
+        uint32_t acc_numero_grades_bajadas = 0;  // suma de las bajadas, en absoluto
+        uint32_t acc_buffer_vacio_s = 0;         // segundos con el nivel a cero
 
         // Parada MCF - D29003, D29004
         uint16_t last_parada_mcf_cantidad = 0;
@@ -2613,6 +2679,8 @@ private:
             j["last_numero_grades"] = last_numero_grades;
             j["rc_numero_grades"] = rc_numero_grades;
             j["acc_numero_grades"] = acc_numero_grades;
+            j["acc_numero_grades_bajadas"] = acc_numero_grades_bajadas;
+            j["acc_buffer_vacio_s"] = acc_buffer_vacio_s;
             j["last_parada_mcf_cantidad"] = last_parada_mcf_cantidad;
             j["rc_parada_mcf_cantidad"] = rc_parada_mcf_cantidad;
             j["acc_parada_mcf_cantidad"] = acc_parada_mcf_cantidad;
@@ -2653,6 +2721,8 @@ private:
             last_numero_grades = j.value("last_numero_grades", last_numero_grades);
             rc_numero_grades = j.value("rc_numero_grades", rc_numero_grades);
             acc_numero_grades = j.value("acc_numero_grades", acc_numero_grades);
+            acc_numero_grades_bajadas = j.value("acc_numero_grades_bajadas", acc_numero_grades_bajadas);
+            acc_buffer_vacio_s = j.value("acc_buffer_vacio_s", acc_buffer_vacio_s);
             last_parada_mcf_cantidad = j.value("last_parada_mcf_cantidad", last_parada_mcf_cantidad);
             rc_parada_mcf_cantidad = j.value("rc_parada_mcf_cantidad", rc_parada_mcf_cantidad);
             acc_parada_mcf_cantidad = j.value("acc_parada_mcf_cantidad", acc_parada_mcf_cantidad);
@@ -2741,6 +2811,8 @@ public:
         // === Output accumulators ===
         uint32_t acc_timer1Hz_out = 0;
         uint32_t acc_numero_grades_out = 0;
+        uint32_t acc_numero_grades_bajadas_out = 0;
+        uint32_t acc_buffer_vacio_s_out = 0;
         uint32_t acc_parada_mcf_cantidad_out = 0;
         uint32_t acc_parada_mcf_tiempo_s_out = 0;
         uint32_t acc_metrica_mcf_cantidad_out = 0;
@@ -2818,7 +2890,15 @@ public:
                 uint32_t delta_timer = diff_counter_safe(timer1Hz, st.last_timer1Hz, st.rc_timer1Hz, ctx.with("timer1Hz"));
                 st.acc_timer1Hz += delta_timer;
 
-                st.acc_numero_grades += diff_counter_safe(numero_grades, st.last_numero_grades, st.rc_numero_grades, ctx.with("numero_grades"));
+                // numero_grades es un NIVEL, no un contador: subidas y bajadas
+                // por separado. La suma de subidas conserva exactamente el valor
+                // que numero_grades_turno viene publicando desde que la cota
+                // empezó a descartar las bajadas.
+                const int32_t d_nivel = diff_level_safe(numero_grades, st.last_numero_grades,
+                                                        st.rc_numero_grades,
+                                                        ctx.with("numero_grades", 500));
+                if (d_nivel > 0) st.acc_numero_grades += static_cast<uint32_t>(d_nivel);
+                else if (d_nivel < 0) st.acc_numero_grades_bajadas += static_cast<uint32_t>(-d_nivel);
 
                 st.acc_parada_mcf_cantidad += diff_counter_safe(parada_mcf_cantidad, st.last_parada_mcf_cantidad, st.rc_parada_mcf_cantidad, ctx.with("parada_mcf_cantidad"));
 
@@ -2842,11 +2922,21 @@ public:
                 if (delta_mcf == 0 && delta_timer > 0) {
                     st.acc_sin_entrada_s += delta_timer;  // firmware Arduino ya corrige alineamiento de bit
                 }
+
+                // Tiempo con el buffer vacío. APROXIMACIÓN POR MUESTREO: cuenta
+                // el intervalo entero si el nivel estaba a cero en el instante
+                // de la trama. Con tramas cada ~127 s, esa es la resolución —
+                // no es una medida exacta y no debe leerse como tal.
+                if (numero_grades == 0 && delta_timer > 0) {
+                    st.acc_buffer_vacio_s += delta_timer;
+                }
             }
 
             // Copy accumulated values to output
             acc_timer1Hz_out = st.acc_timer1Hz;
             acc_numero_grades_out = st.acc_numero_grades;
+            acc_numero_grades_bajadas_out = st.acc_numero_grades_bajadas;
+            acc_buffer_vacio_s_out = st.acc_buffer_vacio_s;
             acc_parada_mcf_cantidad_out = st.acc_parada_mcf_cantidad;
             acc_parada_mcf_tiempo_s_out = st.acc_parada_mcf_tiempo_s;
             acc_metrica_mcf_cantidad_out = st.acc_metrica_mcf_cantidad;
@@ -2877,8 +2967,12 @@ public:
         prod["timer1Hz_turno"] = acc_timer1Hz_out;  // firmware Arduino ya corrige alineamiento de bit
 
         // PRODUCTION COUNT - numero_grades (D29007)
-        prod["numero_grades_instantaneo"] = numero_grades;
-        prod["numero_grades_turno"] = acc_numero_grades_out;
+        prod["numero_grades_instantaneo"] = numero_grades;   // crudo del PLC, sin tocar
+        prod["numero_grades_turno"] = acc_numero_grades_out;  // subidas: MISMO VALOR que antes
+        // Campos NUEVOS con lo que antes se tiraba. No se reinterpreta ninguno
+        // existente: el dato que ya salió hacia AWS no se puede reexpresar.
+        prod["numero_grades_bajadas_turno"] = acc_numero_grades_bajadas_out;
+        prod["buffer_vacio_turno_s"] = acc_buffer_vacio_s_out;
 
         // Parada MCF - D29003, D29004
         prod["parada_mcf_instantaneo"] = parada_mcf_cantidad;

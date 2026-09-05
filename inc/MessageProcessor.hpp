@@ -77,8 +77,13 @@ void clear_incomplete_shift_marker_override();
  *    ruido, y dimensionarlos con la tasa de producción hacía que tras un hueco
  *    largo se recuperase la producción pero no el tiempo de operación — un
  *    turno internamente inconsistente que nadie sabría explicar.
+ *  - Level: registro de 16 bits que representa una magnitud instantánea
+ *    acotada, que sube y baja (defecto D5). La diferencia entre dos lecturas es
+ *    un CAMBIO CON SIGNO, no un incremento: restando sin signo, una bajada de 4
+ *    se convierte en 65.532. Un nivel no tiene tasa, así que su cota es
+ *    ctx.max_valid y no depende de elapsed_s.
  */
-enum class CounterFamily { Event, TimeSeconds, TimeDeciseconds };
+enum class CounterFamily { Event, TimeSeconds, TimeDeciseconds, Level };
 
 /**
  * Familia de (procesador, campo). Lo desconocido cae en Event, que usa la tasa
@@ -119,7 +124,11 @@ struct CounterCtx {
  * sumar 0; `reason` es lo que se emite en el evento [STATE] delta_rejected.
  */
 struct DeltaResult {
-    uint16_t    value         = 0;
+    uint16_t    value         = 0;    // magnitud
+    // Cambio con signo. Igual a `value` en todas las familias salvo Level,
+    // donde puede ser negativo: es lo que distingue una bajada de nivel de un
+    // salto de 65.532 hacia adelante.
+    int32_t     signed_value  = 0;
     bool        plausible     = false;
     double      max_plausible = 0.0;
     const char* reason        = "";

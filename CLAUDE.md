@@ -42,7 +42,7 @@ make test GOLDEN_OUT=tests/data/celima_data_replay.golden   # regenerar el golde
 ```
 
 The suite is doctest (vendored at [tests/doctest.h](tests/doctest.h), MIT, header-only — no runtime
-dependency, not linked into the release binary): 39 cases across
+dependency, not linked into the release binary): 48 cases across
 [test_replay.cpp](tests/test_replay.cpp) (golden), [test_state_events.cpp](tests/test_state_events.cpp),
 [test_scaled_bound.cpp](tests/test_scaled_bound.cpp), [test_persistence.cpp](tests/test_persistence.cpp)
 and [test_shifts.cpp](tests/test_shifts.cpp). Its core is a deterministic replay:
@@ -230,6 +230,13 @@ every published total is a sum of deltas, and every hard-won fix here is about a
   an accumulator for the rest of the shift).
 - `safe_delta_u16(prev, curr, ctx)` — the same bound for CalidadProcessor's monotonic accumulators,
   with `MAXR_BOXES`/`MAXR_BROKEN` as the floor. Calidad has no re-anchor path: it discards and logs.
+- `diff_level_safe(curr, prev_ref, reject_count, ctx)` — the `Level` counterpart, returning the
+  **signed** change. Same re-anchor and `[STATE]` events as `diff_counter_safe`; a level has no rate,
+  so its ceiling is `ctx.max_valid` (500 for `numero_grades`) and a breach logs `reason=level_jump`.
+  `entrada_horno` publishes the ups as `numero_grades_turno` — **the same value as before**, because
+  the bound was already discarding the downs — plus two new fields with what used to be thrown away:
+  `numero_grades_bajadas_turno` and `buffer_vacio_turno_s`. The latter is sampled per frame, so its
+  resolution is the ~127 s publish interval, not a stopwatch.
 - `spike_detected()` / `spike_ema_update()` — EMA-based corruption detection used by
   SalidaHornoProcessor: a frame is discarded only when ≥2 independent counters spike at once
   (`floor 300`, `10×` EMA), so a genuine burst on one counter is not thrown away.
@@ -340,11 +347,14 @@ Léelas antes de tocar [src/MessageProcessor.cpp](src/MessageProcessor.cpp).
   la recuperación de huecos largos es más corta de lo que podría ser — lo que subcuenta, que es el
   lado seguro. Derivarlas de los `[STATE] delta_rejected` y los `*_raw` del journal es trabajo
   pendiente, y no requiere tocar código: es un archivo de configuración.
-- **Los contadores de tiempo no usan la tasa configurada.** Conviven dos familias con ~50x de
-  diferencia, así que `counter_family_for(proc, field)` clasifica cada contador y `diff_counter_scaled`
-  usa el máximo analítico: 1 tick/s para `tiempo_s`, 10 para `tiempo_ds`. La tabla está en
-  [src/MessageProcessor.cpp](src/MessageProcessor.cpp) y lista **solo** los de tiempo; lo que no está
-  cae en `Event` y usa la tasa medida, que es el lado conservador. **Marcar como tiempo un contador de
+- **No todos los registros son contadores monótonos.** `counter_family_for(proc, field)` clasifica
+  cada uno y `diff_counter_scaled` aplica la aritmética que le toca. Los de **tiempo** no usan la tasa
+  configurada sino su máximo analítico (1 tick/s en `tiempo_s`, 10 en `tiempo_ds`); los de **nivel**
+  (`Level`) se leen con signo y sin tasa ni hueco, porque suben y bajan. Hoy el único nivel es
+  `entrada_horno`/`numero_grades`, el buffer de filas que esperan entrar al horno: restarlo sin signo
+  convertía cada bajada en ~65.532 y generaba 836 rechazos al día, el 78% de los del servicio
+  (defecto D5). La tabla está en [src/MessageProcessor.cpp](src/MessageProcessor.cpp) y lista **solo**
+  tiempo y nivel; lo que no está cae en `Event` y usa la tasa medida, que es el lado conservador. **Marcar como tiempo un contador de
   evento agranda su cota 40x y es el error peligroso**, así que ante la duda no se lista. La
   clasificación no se deduce del sufijo: en las prensas `metrica_tiempo` son decisegundos y en salida
   horno `paradas_tempo` son segundos. Un test estructural recorre los sitios de llamada del propio
