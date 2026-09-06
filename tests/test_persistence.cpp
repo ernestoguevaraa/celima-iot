@@ -152,35 +152,42 @@ TEST_CASE("hueco largo dentro del turno: recupera y marca los no observados") {
 
 TEST_CASE("hueco que excede el módulo: re-siembra sin sumar") {
     // El módulo solo es alcanzable dentro de un mismo turno para los contadores
-    // de tiempo: a 10 ticks/s la cota llega a 65.536 en 1,2 h. Un contador de
-    // evento necesitaría 12 h, y a esas alturas ya cambió el turno, que es otro
-    // caso (el 2). 07:00 + 2 h = 09:00, mismo turno.
+    // de tiempo puros: a 10 ticks/s la cota llega a 65.536 en 1,2 h. Un contador
+    // de evento necesitaría 12 h, y a esas alturas ya cambió el turno, que es
+    // otro caso (el 2). 07:00 + 2 h = 09:00, mismo turno.
+    //
+    // Se usa salida_horno/sentido_escolha_tiempo porque es el único tiempo_ds
+    // que queda: los demás migraron a LatchedTime en PR 3 y se acotan contra el
+    // reloj del turno, no contra la tasa.
     testsup::pin_local_hour(7);
     testsup::rates_for_tests();
     install_memory_store();
     simulate_restart();
 
     {
-        auto proc = createProcessor(DeviceType::Entrada_secador);
-        proc->process(testsup::make_frame(3, 5, 0), kPfx, 3);
-        proc->process(testsup::make_frame(3, 5, 1), kPfx, 3);      // acc = 64
+        auto proc = createProcessor(DeviceType::Salida_horno);
+        proc->process(testsup::make_frame(7, 5, 0), kPfx, 3);
+        proc->process(testsup::make_frame(7, 5, 1), kPfx, 3);      // acc = 64
     }
     simulate_restart();
 
-    json m = testsup::make_frame(3, 5, 41);        // +2 h
-    m["ingreso_elevador_tiempo_ds"] = 40000;       // familia tiempo_ds
+    json m = testsup::make_frame(7, 5, 41);        // +2 h
+    m["sentido_escolha_tiempo"] = 40000;           // familia tiempo_ds
+    // Los dos contadores que vigila la detección de picos se dejan quietos: si
+    // saltan a la vez, salida horno descarta la trama entera y no se llega a la
+    // aritmética que se quiere probar.
+    m["metrica_mdf_ciclos"] = 1000 + 64;
+    m["barreira1_cantidad"] = 1000 + 64;
 
-    auto proc = createProcessor(DeviceType::Entrada_secador);
+    auto proc = createProcessor(DeviceType::Salida_horno);
     std::vector<Publication> pubs;
     const std::string log = capture_streams([&] { pubs = proc->process(m, kPfx, 3); });
 
     CHECK(count_lines(log, {"[STATE] delta_rejected", "family=tiempo_ds",
                             "reason=ambiguous_module"}) >= 1);
-    // El de evento se restaura y recupera el hueco: 64 previos + 40 intervalos.
-    CHECK(turno_ingreso(pubs) == 64 + 64 * 40);
-    // El de tiempo conserva lo restaurado pero NO suma el delta del hueco, que
-    // es ambiguo: se queda en los 64 que traía de antes del corte.
-    CHECK(json::parse(pubs[1].payload)["ingreso_elevador_tiempo_turno_ds"] == 64);
+    // Conserva lo restaurado pero NO suma el delta del hueco, que es ambiguo:
+    // se queda en los 64 que traía de antes del corte.
+    CHECK(json::parse(pubs[1].payload)["cambioSentidoTotal_turno"] == 64);
 
     celima::set_state_store(nullptr);
 }
@@ -527,6 +534,52 @@ TEST_CASE("los acumuladores de nivel sobreviven al reinicio") {
     CHECK(nivel_de(pubs, "numero_grades_turno") == 4 + 6);
     CHECK(nivel_de(pubs, "numero_grades_bajadas_turno") == 14);   // restaurado
     CHECK(nivel_de(pubs, "buffer_vacio_turno_s") == 120);         // restaurado
+
+    celima::set_state_store(nullptr);
+}
+
+TEST_CASE("LatchedTime tras una restauración: el acumulado viene de la base") {
+    // La cota latcheada compara acc_current contra el reloj del turno, así que
+    // depende de que el acumulado restaurado llegue a diff_counter_scaled(). Si
+    // el call site pasara 0, la cota sería demasiado laxa justo tras un
+    // reinicio, que es cuando más importa.
+    testsup::pin_local_hour(10);
+    testsup::rates_for_tests();
+    install_memory_store();
+    simulate_restart();
+
+    auto banc = [](const std::vector<Publication>& pubs) {
+        REQUIRE(pubs.size() == 2);
+        return json::parse(pubs[1].payload)["bancalino_l1_tiempo_turno_ds"].get<int64_t>();
+    };
+
+    {
+        auto proc = createProcessor(DeviceType::Entrada_secador);
+        json m0 = testsup::make_frame(3, 30, 0);
+        m0["bancalino_l1_tiempo_ds"] = 1000;
+        proc->process(m0, kPfx, 3);
+        json m1 = testsup::make_frame(3, 30, 1);
+        m1["bancalino_l1_tiempo_ds"] = 1000 + 1870;      // un intervalo de reloj
+        CHECK(banc(proc->process(m1, kPfx, 3)) == 1870);
+    }
+
+    simulate_restart();   // <-- caída y arranque, mismo turno
+
+    auto proc = createProcessor(DeviceType::Entrada_secador);
+    json m2 = testsup::make_frame(3, 30, 2);
+    m2["bancalino_l1_tiempo_ds"] = 1000 + 1870 + 1870;
+    std::vector<Publication> pubs;
+    const std::string log = capture_streams([&] { pubs = proc->process(m2, kPfx, 3); });
+
+    CHECK(count_lines(log, {"[STATE] restored", "proc=entrada_secador"}) == 1);
+    CHECK(count_lines(log, {"delta_rejected", "field=bancalino_l1_tiempo"}) == 0);
+    CHECK(banc(pubs) == 1870 * 2);                       // continúa, no reinicia
+
+    // La cota sigue viva tras restaurar, pero es un guardarraíl contra un
+    // acumulado desbocado, no un filtro de deltas: al principio del turno el
+    // término de arrastre admite casi cualquier salto. Aquí se comprueba lo
+    // primero, que es lo que la cota sí garantiza.
+    CHECK(count_lines(log, {"no_shift_elapsed"}) == 0);
 
     celima::set_state_store(nullptr);
 }

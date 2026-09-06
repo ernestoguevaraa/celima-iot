@@ -57,9 +57,26 @@ Graba al menos una hora. Dos avisos:
 
 Publicaciones esperadas, una por línea, en formato `<topic>\t<payload>`.
 
-El golden que está en el repo se generó con el código de `main@0ac7a9c`, es
-decir **antes** del PR de observabilidad: es la evidencia de que añadir los
-eventos `[STATE]` no cambió ningún valor publicado (criterio de aceptación 1).
+### Procedencia, y qué garantiza exactamente
+
+El golden nació generado con el código de `main@0ac7a9c`, anterior al PR de
+observabilidad, y durante PR 1 y PR 2 se mantuvo **byte a byte** idéntico: esa
+era la evidencia de que ni la instrumentación ni la persistencia cambiaron un
+solo valor publicado.
+
+Desde PR 4 ya no es byte a byte ese golden: es ese mismo **más dos campos**
+(`numero_grades_bajadas_turno` y `buffer_vacio_turno_s` en
+`entrada_horno/production`). Lo que se sigue garantizando, y se comprobó campo a
+campo al regenerarlo, es más preciso que "no cambia nada":
+
+- mismo número de publicaciones y mismos tópicos;
+- ningún campo desaparecido;
+- **cero campos existentes con un valor distinto**.
+
+Esa es la propiedad que hay que preservar. Un PR puede añadir campos —el
+invariante del repo es añadir, nunca reinterpretar—, pero si al regenerar
+aparece un campo existente con otro valor, el PR está mal y hay que investigar
+antes de aceptar el golden nuevo.
 
 Regenerar:
 

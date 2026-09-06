@@ -77,13 +77,20 @@ void clear_incomplete_shift_marker_override();
  *    ruido, y dimensionarlos con la tasa de producción hacía que tras un hueco
  *    largo se recuperase la producción pero no el tiempo de operación — un
  *    turno internamente inconsistente que nadie sabría explicar.
+ *  - LatchedTime: acumulador de 16 bits que avanza a SALTOS, y cada salto vale
+ *    el tiempo transcurrido desde el evento anterior (defecto D6). El ladder
+ *    del PLC le suma un contador libre y lo reinicia en cada evento, así que se
+ *    congela mientras la máquina está parada y suelta el paro entero de golpe
+ *    en el primer evento tras el arranque. No tiene tasa: el incremento no
+ *    guarda relación con el intervalo entre tramas, y la única cota que se
+ *    puede afirmar es que el acumulado no supera el reloj del turno.
  *  - Level: registro de 16 bits que representa una magnitud instantánea
  *    acotada, que sube y baja (defecto D5). La diferencia entre dos lecturas es
  *    un CAMBIO CON SIGNO, no un incremento: restando sin signo, una bajada de 4
  *    se convierte en 65.532. Un nivel no tiene tasa, así que su cota es
  *    ctx.max_valid y no depende de elapsed_s.
  */
-enum class CounterFamily { Event, TimeSeconds, TimeDeciseconds, Level };
+enum class CounterFamily { Event, TimeSeconds, TimeDeciseconds, Level, LatchedTime };
 
 /**
  * Familia de (procesador, campo). Lo desconocido cae en Event, que usa la tasa
@@ -112,10 +119,21 @@ struct CounterCtx {
     uint16_t    max_valid      = 5000;  // techo mínimo: la cota escalada nunca es más estricta
     uint8_t     max_rejects    = 3;
 
+    // Solo para la familia LatchedTime, que se acota contra el reloj del turno
+    // en lugar de contra una tasa.
+    double      shift_elapsed_s = 0.0;  // transcurrido del turno en curso
+    uint32_t    acc_current     = 0;    // acumulado actual DE ESE campo, en ticks
+
     CounterCtx with(const char* f) const { CounterCtx c = *this; c.field = f; return c; }
     CounterCtx with(const char* f, uint16_t mv) const
     {
         CounterCtx c = *this; c.field = f; c.max_valid = mv; return c;
+    }
+    // Para los campos LatchedTime: su cota necesita el acumulado del propio
+    // campo, así que no basta con reutilizar el ctx del mensaje.
+    CounterCtx with_acc(const char* f, uint32_t acc) const
+    {
+        CounterCtx c = *this; c.field = f; c.acc_current = acc; return c;
     }
 };
 

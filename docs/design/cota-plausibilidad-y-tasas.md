@@ -220,6 +220,20 @@ por `totalBroken` (p99 1.343–1.700 u/h), que es un contador de rotura, no de p
 El razonamiento: subcontar piezas rotas hace que la calidad se vea mejor de lo que fue, lo cual es
 peor que subcontar producción. Queda escrito para que sea una decisión y no un accidente.
 
+### P7 — La atribución a turno de los campos latcheados es incorrecta
+
+Anotado desde PR 3 (§6 bis). El contador libre del PLC no se entera del cambio de
+turno, así que un paro que cruza las 06:00 o las 18:00 se atribuye **entero al
+turno siguiente**, aunque la mayor parte pertenezca al anterior. La aplicación no
+puede repartirlo: el PLC entrega el bulto sin dividir y no dice cuándo empezó.
+
+Para los `*_tiempo_ds` da igual —son réplicas del reloj y nadie los consume—, pero
+si alguna vez se publica `paro_latched` como métrica de paro de línea, esa métrica
+colocará en el turno equivocado justamente los paros más largos, que son los que
+más probabilidad tienen de cruzar una frontera. Para un dato de control de planta
+eso exige, como mínimo, marcar el evento como "a caballo" y publicar el instante
+además de la duración.
+
 ### P5 — Las tasas envejecen
 
 Salen de una foto de 30 días. Un cambio de formato, de velocidad de línea o de firmware las

@@ -350,7 +350,10 @@ Léelas antes de tocar [src/MessageProcessor.cpp](src/MessageProcessor.cpp).
 - **No todos los registros son contadores monótonos.** `counter_family_for(proc, field)` clasifica
   cada uno y `diff_counter_scaled` aplica la aritmética que le toca. Los de **tiempo** no usan la tasa
   configurada sino su máximo analítico (1 tick/s en `tiempo_s`, 10 en `tiempo_ds`); los de **nivel**
-  (`Level`) se leen con signo y sin tasa ni hueco, porque suben y bajan. Hoy el único nivel es
+  (`Level`) se leen con signo y sin tasa ni hueco, porque suben y bajan; y los
+  **latcheados** (`LatchedTime`) se acotan contra el reloj del turno más un módulo
+  de arrastre, porque su incremento vale el paro anterior y no guarda relación con
+  el intervalo entre tramas. Hoy el único nivel es
   `entrada_horno`/`numero_grades`, el buffer de filas que esperan entrar al horno: restarlo sin signo
   convertía cada bajada en ~65.532 y generaba 836 rechazos al día, el 78% de los del servicio
   (defecto D5). La tabla está en [src/MessageProcessor.cpp](src/MessageProcessor.cpp) y lista **solo**
@@ -359,6 +362,21 @@ Léelas antes de tocar [src/MessageProcessor.cpp](src/MessageProcessor.cpp).
   clasificación no se deduce del sufijo: en las prensas `metrica_tiempo` son decisegundos y en salida
   horno `paradas_tempo` son segundos. Un test estructural recorre los sitios de llamada del propio
   código y se pone rojo si aparece un contador de tiempo sin clasificar.
+- **`LatchedTime` es un guardarraíl, no un filtro.** Su cota es
+  `10 × reloj_del_turno × 1,05 + 65.536`, y ese sumando es el arrastre: el contador
+  libre del PLC no sabe de turnos, así que un paro que empieza a las 17:40 se
+  suelta entero en el turno de las 18:00. Al principio del turno el arrastre domina
+  y la cota admite casi cualquier delta; solo aprieta cuando el reloj del turno
+  crece. Para un latcheado la plausibilidad de un delta suelto **no es decidible
+  desde esta aplicación** —el salto vale el paro anterior y aquí no se sabe cuándo
+  ocurrió el evento previo—, así que lo único que detecta es un acumulado
+  desbocado. El filtrado de basura ya lo hace el Arduino validando contra W1.
+- **La atribución a turno de los latcheados es incorrecta por construcción**, y no
+  lo arregla ningún PR: un paro que cruza las 06:00 o las 18:00 se atribuye entero
+  al turno siguiente. Da igual mientras esos campos sean réplicas del reloj y nadie
+  los consuma, pero **si algún día se publica `paro_latched` como métrica de paro,
+  colocará en el turno equivocado justo los paros más largos**. Es el mismo patrón
+  que el defecto de identidad de turno que ya se corrigió en la restauración.
 - **La ventana recuperable depende de la familia, y para `tiempo_ds` es corta.** A 10 ticks/s el
   contador de 16 bits da la vuelta en 1,8 h, así que pasado ~1,2 h de hueco su delta es ambiguo por
   construcción y se re-siembra. No hay configuración que lo cambie. Los de segundos aguantan ~12 h y
@@ -377,7 +395,9 @@ Léelas antes de tocar [src/MessageProcessor.cpp](src/MessageProcessor.cpp).
   bytes; después, todo lo ya emitido.
 - **Los caminos de estado dejan rastro `[STATE]`**, vía `celima::log::state_event()`
   ([inc/Logging.hpp](inc/Logging.hpp)): `reseed` (`reason=first_message|shift_change|shift_change_across_restart`),
-  `delta_rejected` (con `reason`, `max_plausible`, `elapsed_s` y `family`), `reanchor`, `restored`, `gap`,
+  `delta_rejected` (con `reason`, `max_plausible`, `elapsed_s`, `family` y, en los
+  latcheados, `acc`/`turno_s`), `paro_latched` (un paro de línea con su duración
+  medida, el subproducto útil de la familia latcheada), `reanchor`, `restored`, `gap`,
   `shift_first_observed`, `shift_change_global`, `frame_ignored`, `stored_state_ignored` y
   `store_error`. Si añades lógica de descarte o de re-siembra,
   emítela por ahí — en silencio no es reconstruible: tras el incidente del 1 de septiembre identificar

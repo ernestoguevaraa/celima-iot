@@ -139,35 +139,36 @@ struct FamilyEntry {
 constexpr CounterFamily kS  = CounterFamily::TimeSeconds;       // 1 tick/s
 constexpr CounterFamily kDs = CounterFamily::TimeDeciseconds;   // 10 ticks/s
 constexpr CounterFamily kLv = CounterFamily::Level;             // sube y baja
+constexpr CounterFamily kLt = CounterFamily::LatchedTime;       // reloj latcheado
 
 constexpr FamilyEntry kCounterFamilies[] = {
     // prensas: D29006 son decisegundos (acumulado con ×0,1), D29004 segundos
-    {"prensa_hidraulica1", "metrica_tiempo",           kDs},
+    {"prensa_hidraulica1", "metrica_tiempo",           kLt},
     {"prensa_hidraulica1", "paradas_tiempo",           kS },
-    {"prensa_hidraulica2", "metrica_tiempo",           kDs},
+    {"prensa_hidraulica2", "metrica_tiempo",           kLt},
     {"prensa_hidraulica2", "paradas_tiempo",           kS },
 
     {"entrada_secador",    "timer1Hz",                 kS },
     {"entrada_secador",    "paradas_tempo",            kS },
-    {"entrada_secador",    "ingreso_elevador_tiempo",  kDs},
-    {"entrada_secador",    "bancalino_l1_tiempo",      kDs},
-    {"entrada_secador",    "bancalino_l2_tiempo",      kDs},
+    {"entrada_secador",    "ingreso_elevador_tiempo",  kLt},
+    {"entrada_secador",    "bancalino_l1_tiempo",      kLt},
+    {"entrada_secador",    "bancalino_l2_tiempo",      kLt},
 
     {"salida_secador",     "timer1Hz",                 kS },
     {"salida_secador",     "parada_mds_tiempo",        kS },
-    {"salida_secador",     "metrica_mds_tiempo",       kDs},
+    {"salida_secador",     "metrica_mds_tiempo",       kLt},
 
     {"esmalte",            "timer1Hz",                 kS },
     {"esmalte",            "parada_esm_tiempo",        kS },
-    {"esmalte",            "metrica_esm_tiempo",       kDs},
+    {"esmalte",            "metrica_esm_tiempo",       kLt},
 
     {"entrada_horno",      "timer1Hz",                 kS },
     // Nivel del buffer de filas que esperan entrar al horno: sube al cargar y
     // baja al desocuparse. No es un contador monótono (defecto D5).
     {"entrada_horno",      "numero_grades",            kLv},
     {"entrada_horno",      "parada_mcf_tiempo",        kS },
-    {"entrada_horno",      "metrica_mcf_tiempo",       kDs},
-    {"entrada_horno",      "metrica_formador_tiempo",  kDs},
+    {"entrada_horno",      "metrica_mcf_tiempo",       kLt},
+    {"entrada_horno",      "metrica_formador_tiempo",  kLt},
     {"entrada_horno",      "falha_forno_tiempo",       kS },
 
     // salida horno publica estos tres con nombres heredados que suenan a
@@ -176,10 +177,13 @@ constexpr FamilyEntry kCounterFamilies[] = {
     // entrada horno. Si el mapa del PLC dijera otra cosa, quitarlos de aquí.
     {"salida_horno",       "timer1Hz",                 kS },
     {"salida_horno",       "paradas_tempo",            kS },
-    {"salida_horno",       "metrica_tiempo",           kDs},
+    {"salida_horno",       "metrica_tiempo",           kLt},
     {"salida_horno",       "parada_escolha_tempo",     kS },
+    // NO migra a LatchedTime: 100% de deltas en cero en las tres líneas con
+    // tráfico durante 24 h, así que no hay firma que lo respalde. LatchedTime es
+    // más permisiva que kDs y clasificar de más es el error peligroso.
     {"salida_horno",       "sentido_escolha_tiempo",   kDs},
-    {"salida_horno",       "barreira1_tiempo",         kDs},
+    {"salida_horno",       "barreira1_tiempo",         kLt},
 };
 
 const char* family_name(CounterFamily f)
@@ -188,6 +192,7 @@ const char* family_name(CounterFamily f)
         case CounterFamily::TimeSeconds:      return "tiempo_s";
         case CounterFamily::TimeDeciseconds:  return "tiempo_ds";
         case CounterFamily::Level:            return "nivel";
+        case CounterFamily::LatchedTime:      return "tiempo_latcheado";
         case CounterFamily::Event:            break;
     }
     return "evento";
@@ -242,14 +247,53 @@ DeltaResult diff_counter_scaled(uint16_t curr, uint16_t prev, const CounterCtx &
         return r;
     }
 
-    // 2) Sin hueco medible no hay cota posible. Cubre el reloj hacia atrás y
+    // 2) Un acumulador latcheado tampoco tiene tasa: su incremento vale el paro
+    //    ANTERIOR, una magnitud sin relación con el intervalo entre tramas. Lo
+    //    único afirmable es que, siendo un reloj, su acumulado del turno no
+    //    puede superar el reloj del turno. Cota de un solo lado a propósito:
+    //    puede ir por debajo (arranca en el primer evento tras la re-siembra),
+    //    nunca por encima.
+    if (family == CounterFamily::LatchedTime) {
+        if (ctx.shift_elapsed_s <= 0.0) {
+            // Sin turno no hay cota; descartar es el lado seguro.
+            r.reason = "no_shift_elapsed";
+            return r;
+        }
+        // Techo: 10 ticks/s del reloj del turno, con un 5% para la deriva entre
+        // el reloj del PLC y el del gateway, MÁS un módulo de arrastre.
+        //
+        // El arrastre no es margen a ojo, es la cota física exacta. El contador
+        // libre del PLC no sabe nada de turnos: sigue corriendo a través de las
+        // 06:00 y las 18:00, así que un paro que empieza a las 17:40 y acaba a
+        // las 18:20 se suelta ENTERO dentro del turno nuevo, cuyo reloj lleva
+        // 1.200 s. Como el arrastre es un solo salto de un registro de 16 bits,
+        // no puede pasar de un módulo. Medido: sobre el turno completo la razón
+        // vuelve a 10,00 (L2 y L3), pero dentro del turno acc > 10 x elapsed.
+        //
+        // Lo que esta cota vale, dicho sin adornos: al principio del turno el
+        // término de arrastre domina y admite casi cualquier delta; al final
+        // domina el reloj. Para un LatchedTime la plausibilidad de un delta
+        // concreto NO es decidible desde aquí —el salto vale el paro anterior y
+        // la app no sabe cuándo ocurrió el evento previo—, así que esto es un
+        // guardarraíl contra un acumulado desbocado, no un filtro fino. Y está
+        // bien que lo sea: el Arduino ya descarta las tramas que no valida
+        // contra W1, así que aquí no llega basura que filtrar.
+        const double techo = 10.0 * ctx.shift_elapsed_s * 1.05 + 65536.0;
+        r.max_plausible = techo;
+        r.plausible = (static_cast<double>(ctx.acc_current) +
+                       static_cast<double>(r.value)) <= techo;
+        if (!r.plausible) r.reason = "over_shift_clock";
+        return r;
+    }
+
+    // 3) Sin hueco medible no hay cota posible. Cubre el reloj hacia atrás y
     //    los timestamps duplicados. No se "arregla" un tiempo negativo.
     if (ctx.elapsed_s <= 0.0) {
         r.reason = "no_elapsed";
         return r;
     }
 
-    // 3) La tasa depende de la familia del contador. Los de tiempo tienen un
+    // 4) La tasa depende de la familia del contador. Los de tiempo tienen un
     //    máximo analítico (1 y 10 ticks/s) y NO usan la tasa configurada, que
     //    está dimensionada para producción y los dejaría 40x cortos: tras un
     //    hueco largo se recuperaba la producción pero no el tiempo de operación.
@@ -261,6 +305,7 @@ DeltaResult diff_counter_scaled(uint16_t curr, uint16_t prev, const CounterCtx &
         // Level ya salió por su propia rama, arriba: no llega aquí. Se enumera
         // para que añadir una familia nueva sin tratarla ponga rojo el build.
         case CounterFamily::Level:                              break;
+        case CounterFamily::LatchedTime:                        break;
     }
 
     //    Configuración ausente o absurda: subcontar es el lado seguro. Solo
@@ -560,6 +605,13 @@ uint32_t safe_delta_u16(uint16_t prev, uint16_t curr, const CounterCtx &ctx)
 // [STATE]; no intervienen en la aritmética. Tienen valor por defecto para que
 // una llamada nueva sin contexto compile y se delate en el log como
 // "line=-1 proc=? field=?" en lugar de perderse en silencio.
+// Intervalo de publicación nominal de cada clase, en segundos. Solo se usa para
+// decidir a partir de qué salto un delta latcheado merece una traza.
+static int nominal_tx_interval_s(const char* proc)
+{
+    return (proc && std::strcmp(proc, "entrada_horno") == 0) ? 120 : 180;
+}
+
 static uint16_t diff_counter_safe(uint16_t curr, uint16_t &prev_ref,
                                    uint8_t &reject_count,
                                    const CounterCtx &ctx) {
@@ -567,6 +619,23 @@ static uint16_t diff_counter_safe(uint16_t curr, uint16_t &prev_ref,
     if (r.plausible) {
         prev_ref = curr;
         reject_count = 0;
+
+        // Un salto grande en un campo latcheado ES un paro de línea con su
+        // duración medida: hasta ahora se escribía como delta_rejected y se
+        // tiraba. Se emite como evento informativo, no como rechazo. Umbral:
+        // tres intervalos de transmisión; por debajo es operación normal.
+        //
+        // LÍMITE FÍSICO: el contador libre del PLC es de 16 bits a 10 Hz, así
+        // que da la vuelta a las 1,82 h. Un paro más largo produce un salto no
+        // solo grande sino EQUIVOCADO, corto en múltiplos de 6.553,6 s. No es
+        // corregible desde aquí; los casos cercanos al módulo se marcan.
+        if (counter_family_for(ctx.proc, ctx.field) == CounterFamily::LatchedTime &&
+            r.value > static_cast<uint32_t>(3 * 10 * nominal_tx_interval_s(ctx.proc))) {
+            celima::log::state_event("paro_latched", ctx.line, ctx.proc,
+                "field=" + std::string(ctx.field) +
+                " duracion_s=" + std::to_string(r.value / 10) +
+                (r.value > 60000 ? " AVISO=posible_wrap" : ""));
+        }
         return r.value;
     }
 
@@ -585,6 +654,12 @@ static uint16_t diff_counter_safe(uint16_t curr, uint16_t &prev_ref,
         " max_plausible=" + std::to_string(r.max_plausible) +
         " elapsed_s=" + std::to_string(static_cast<int64_t>(ctx.elapsed_s)) +
         " family=" + family_name(counter_family_for(ctx.proc, ctx.field)) +
+        // Un rechazo over_shift_clock es ilegible sin el acumulado y el reloj
+        // del turno contra el que se comparó.
+        (counter_family_for(ctx.proc, ctx.field) == CounterFamily::LatchedTime
+            ? " acc=" + std::to_string(ctx.acc_current) +
+              " turno_s=" + std::to_string(static_cast<int64_t>(ctx.shift_elapsed_s))
+            : std::string{}) +
         " reason=" + r.reason +
         " reject_count=" + std::to_string(static_cast<int>(reject_count)));
     if (reject_count >= ctx.max_rejects) {
@@ -904,6 +979,19 @@ public:
                 ctx.proc = "calidad";
                 ctx.rate_max_per_s = celima::rates().rate_per_s(line_id, ctx.proc);
                 ctx.margin         = celima::rates().margin();
+                // Reloj del turno, para la cota de la familia LatchedTime.
+                //
+                // Sale de dev_epoch y NO del reloj del host, aunque shiftNum sí
+                // venga del host: el acumulado que se compara contra este reloj
+                // se construyó con los deltas de esas mismas tramas, así que
+                // ambos lados tienen que medirse con la misma referencia. Con el
+                // reloj del host, reproducir tráfico histórico —o procesar
+                // tramas encoladas— compara un acumulado de N horas contra un
+                // turno de M, y rechaza todo. Sin dev_epoch la cota no es
+                // calculable y el delta se descarta, igual que el resto.
+                if (dev_epoch)
+                    ctx.shift_elapsed_s = static_cast<double>(
+                        *dev_epoch - shift_start_epoch(*dev_epoch, shift_mode));
                 if (dev_epoch && rt.last_accepted_epoch_s > 0)
                     ctx.elapsed_s = static_cast<double>(*dev_epoch - rt.last_accepted_epoch_s);
 
@@ -1154,6 +1242,18 @@ public:
             ctx.proc = "prensa_hidraulica1";
             ctx.rate_max_per_s = celima::rates().rate_per_s(line, ctx.proc);
             ctx.margin         = celima::rates().margin();
+            // Reloj del turno, para la cota de la familia LatchedTime.
+            //
+            // Sale de dev_epoch y NO del reloj del host: el acumulado que se
+            // compara contra este reloj se construyó con los deltas de esas mismas
+            // tramas, así que ambos lados tienen que medirse con la misma
+            // referencia. Con el reloj del host, reproducir tráfico histórico o
+            // procesar tramas encoladas compara un acumulado de N horas contra un
+            // turno de M y rechaza todo. Sin dev_epoch la cota no es calculable y
+            // el delta se descarta, igual que el resto.
+            if (dev_epoch)
+                ctx.shift_elapsed_s = static_cast<double>(
+                    *dev_epoch - shift_start_epoch(*dev_epoch, shift_mode));
             // Hueco desde el último mensaje aceptado de esta clave. Sin epoch de
             // dispositivo queda en 0 y la cota declara el delta implausible.
             if (dev_epoch && st.last_accepted_epoch_s > 0)
@@ -1214,7 +1314,9 @@ public:
                 st.acc_pisadas += delta_pisadas;
 
                 // D29006 - Metric time (deciseconds, bit-15 masked)
-                uint16_t delta_tiempo = diff_counter_safe(metrica_tiempo, st.last_metrica_tiempo, st.rc_metrica_tiempo, ctx.with("metrica_tiempo"));
+                uint16_t delta_tiempo = diff_counter_safe(metrica_tiempo, st.last_metrica_tiempo, st.rc_metrica_tiempo,
+                    // acc_metrica_tiempo_s está en SEGUNDOS y el campo en decisegundos.
+                    ctx.with_acc("metrica_tiempo", static_cast<uint32_t>(st.acc_metrica_tiempo_s * 10.0)));
                 st.acc_metrica_tiempo_s += delta_tiempo * 0.1;  // CF100 P_0_1s: 0.1s per tick (validated)
 
                 // D29003 - Stop count counter
@@ -1448,6 +1550,18 @@ public:
             ctx.proc = "prensa_hidraulica2";
             ctx.rate_max_per_s = celima::rates().rate_per_s(line, ctx.proc);
             ctx.margin         = celima::rates().margin();
+            // Reloj del turno, para la cota de la familia LatchedTime.
+            //
+            // Sale de dev_epoch y NO del reloj del host: el acumulado que se
+            // compara contra este reloj se construyó con los deltas de esas mismas
+            // tramas, así que ambos lados tienen que medirse con la misma
+            // referencia. Con el reloj del host, reproducir tráfico histórico o
+            // procesar tramas encoladas compara un acumulado de N horas contra un
+            // turno de M y rechaza todo. Sin dev_epoch la cota no es calculable y
+            // el delta se descarta, igual que el resto.
+            if (dev_epoch)
+                ctx.shift_elapsed_s = static_cast<double>(
+                    *dev_epoch - shift_start_epoch(*dev_epoch, shift_mode));
             // Hueco desde el último mensaje aceptado de esta clave. Sin epoch de
             // dispositivo queda en 0 y la cota declara el delta implausible.
             if (dev_epoch && st.last_accepted_epoch_s > 0)
@@ -1503,7 +1617,9 @@ public:
                 uint16_t delta_pisadas = diff_counter_safe(pisadas, st.last_pisadas, st.rc_pisadas, ctx.with("pisadas"));
                 st.acc_pisadas += delta_pisadas;
 
-                uint16_t delta_tiempo = diff_counter_safe(metrica_tiempo, st.last_metrica_tiempo, st.rc_metrica_tiempo, ctx.with("metrica_tiempo"));
+                uint16_t delta_tiempo = diff_counter_safe(metrica_tiempo, st.last_metrica_tiempo, st.rc_metrica_tiempo,
+                    // acc_metrica_tiempo_s está en SEGUNDOS y el campo en decisegundos.
+                    ctx.with_acc("metrica_tiempo", static_cast<uint32_t>(st.acc_metrica_tiempo_s * 10.0)));
                 st.acc_metrica_tiempo_s += delta_tiempo * 0.1;  // CF100 P_0_1s: 0.1s per tick (validated)
 
                 uint16_t delta_paradas = diff_counter_safe(paradas_count, st.last_paradas_count, st.rc_paradas_count, ctx.with("paradas_count"));
@@ -1817,6 +1933,18 @@ public:
             ctx.proc = "entrada_secador";
             ctx.rate_max_per_s = celima::rates().rate_per_s(line, ctx.proc);
             ctx.margin         = celima::rates().margin();
+            // Reloj del turno, para la cota de la familia LatchedTime.
+            //
+            // Sale de dev_epoch y NO del reloj del host: el acumulado que se
+            // compara contra este reloj se construyó con los deltas de esas mismas
+            // tramas, así que ambos lados tienen que medirse con la misma
+            // referencia. Con el reloj del host, reproducir tráfico histórico o
+            // procesar tramas encoladas compara un acumulado de N horas contra un
+            // turno de M y rechaza todo. Sin dev_epoch la cota no es calculable y
+            // el delta se descarta, igual que el resto.
+            if (dev_epoch)
+                ctx.shift_elapsed_s = static_cast<double>(
+                    *dev_epoch - shift_start_epoch(*dev_epoch, shift_mode));
             // Hueco desde el último mensaje aceptado de esta clave. Sin epoch de
             // dispositivo queda en 0 y la cota declara el delta implausible.
             if (dev_epoch && st.last_accepted_epoch_s > 0)
@@ -1872,21 +2000,21 @@ public:
 
                 st.acc_ingreso_elevador_cantidad += diff_counter_safe(ingreso_elevador_cantidad, st.last_ingreso_elevador_cantidad, st.rc_ingreso_elevador_cantidad, ctx.with("ingreso_elevador_cantidad"));
 
-                st.acc_ingreso_elevador_tiempo_ds += diff_counter_safe(ingreso_elevador_tiempo, st.last_ingreso_elevador_tiempo, st.rc_ingreso_elevador_tiempo, ctx.with("ingreso_elevador_tiempo"));
+                st.acc_ingreso_elevador_tiempo_ds += diff_counter_safe(ingreso_elevador_tiempo, st.last_ingreso_elevador_tiempo, st.rc_ingreso_elevador_tiempo, ctx.with_acc("ingreso_elevador_tiempo", st.acc_ingreso_elevador_tiempo_ds));
 
                 {
                     uint16_t d = diff_counter_safe(bancalino_l1_cantidad, st.last_bancalino_l1_cantidad, st.rc_bancalino_l1_cantidad, ctx.with("bancalino_l1_cantidad"));
                     st.acc_bancalino_l1_cantidad += (line == 2) ? d / 4 : d;
                 }
 
-                st.acc_bancalino_l1_tiempo_ds += diff_counter_safe(bancalino_l1_tiempo, st.last_bancalino_l1_tiempo, st.rc_bancalino_l1_tiempo, ctx.with("bancalino_l1_tiempo"));
+                st.acc_bancalino_l1_tiempo_ds += diff_counter_safe(bancalino_l1_tiempo, st.last_bancalino_l1_tiempo, st.rc_bancalino_l1_tiempo, ctx.with_acc("bancalino_l1_tiempo", st.acc_bancalino_l1_tiempo_ds));
 
                 {
                     uint16_t d = diff_counter_safe(bancalino_l2_cantidad, st.last_bancalino_l2_cantidad, st.rc_bancalino_l2_cantidad, ctx.with("bancalino_l2_cantidad"));
                     st.acc_bancalino_l2_cantidad += (line == 2) ? d / 4 : d;
                 }
 
-                st.acc_bancalino_l2_tiempo_ds += diff_counter_safe(bancalino_l2_tiempo, st.last_bancalino_l2_tiempo, st.rc_bancalino_l2_tiempo, ctx.with("bancalino_l2_tiempo"));
+                st.acc_bancalino_l2_tiempo_ds += diff_counter_safe(bancalino_l2_tiempo, st.last_bancalino_l2_tiempo, st.rc_bancalino_l2_tiempo, ctx.with_acc("bancalino_l2_tiempo", st.acc_bancalino_l2_tiempo_ds));
             }
 
             // Copy accumulated values to output
@@ -2141,6 +2269,18 @@ public:
             ctx.proc = "salida_secador";
             ctx.rate_max_per_s = celima::rates().rate_per_s(line, ctx.proc);
             ctx.margin         = celima::rates().margin();
+            // Reloj del turno, para la cota de la familia LatchedTime.
+            //
+            // Sale de dev_epoch y NO del reloj del host: el acumulado que se
+            // compara contra este reloj se construyó con los deltas de esas mismas
+            // tramas, así que ambos lados tienen que medirse con la misma
+            // referencia. Con el reloj del host, reproducir tráfico histórico o
+            // procesar tramas encoladas compara un acumulado de N horas contra un
+            // turno de M y rechaza todo. Sin dev_epoch la cota no es calculable y
+            // el delta se descarta, igual que el resto.
+            if (dev_epoch)
+                ctx.shift_elapsed_s = static_cast<double>(
+                    *dev_epoch - shift_start_epoch(*dev_epoch, shift_mode));
             // Hueco desde el último mensaje aceptado de esta clave. Sin epoch de
             // dispositivo queda en 0 y la cota declara el delta implausible.
             if (dev_epoch && st.last_accepted_epoch_s > 0)
@@ -2191,7 +2331,7 @@ public:
 
                 st.acc_metrica_mds_cantidad += diff_counter_safe(metrica_mds_cantidad, st.last_metrica_mds_cantidad, st.rc_metrica_mds_cantidad, ctx.with("metrica_mds_cantidad"));
 
-                st.acc_metrica_mds_tiempo_ds += diff_counter_safe(metrica_mds_tiempo, st.last_metrica_mds_tiempo, st.rc_metrica_mds_tiempo, ctx.with("metrica_mds_tiempo"));
+                st.acc_metrica_mds_tiempo_ds += diff_counter_safe(metrica_mds_tiempo, st.last_metrica_mds_tiempo, st.rc_metrica_mds_tiempo, ctx.with_acc("metrica_mds_tiempo", st.acc_metrica_mds_tiempo_ds));
             }
 
             // Copy accumulated values to output
@@ -2433,6 +2573,18 @@ public:
             ctx.proc = "esmalte";
             ctx.rate_max_per_s = celima::rates().rate_per_s(line, ctx.proc);
             ctx.margin         = celima::rates().margin();
+            // Reloj del turno, para la cota de la familia LatchedTime.
+            //
+            // Sale de dev_epoch y NO del reloj del host: el acumulado que se
+            // compara contra este reloj se construyó con los deltas de esas mismas
+            // tramas, así que ambos lados tienen que medirse con la misma
+            // referencia. Con el reloj del host, reproducir tráfico histórico o
+            // procesar tramas encoladas compara un acumulado de N horas contra un
+            // turno de M y rechaza todo. Sin dev_epoch la cota no es calculable y
+            // el delta se descarta, igual que el resto.
+            if (dev_epoch)
+                ctx.shift_elapsed_s = static_cast<double>(
+                    *dev_epoch - shift_start_epoch(*dev_epoch, shift_mode));
             // Hueco desde el último mensaje aceptado de esta clave. Sin epoch de
             // dispositivo queda en 0 y la cota declara el delta implausible.
             if (dev_epoch && st.last_accepted_epoch_s > 0)
@@ -2483,7 +2635,7 @@ public:
 
                 st.acc_metrica_esm_cantidad += diff_counter_safe(metrica_esm_cantidad, st.last_metrica_esm_cantidad, st.rc_metrica_esm_cantidad, ctx.with("metrica_esm_cantidad"));
 
-                st.acc_metrica_esm_tiempo_ds += diff_counter_safe(metrica_esm_tiempo, st.last_metrica_esm_tiempo, st.rc_metrica_esm_tiempo, ctx.with("metrica_esm_tiempo"));
+                st.acc_metrica_esm_tiempo_ds += diff_counter_safe(metrica_esm_tiempo, st.last_metrica_esm_tiempo, st.rc_metrica_esm_tiempo, ctx.with_acc("metrica_esm_tiempo", st.acc_metrica_esm_tiempo_ds));
             }
 
             // Copy accumulated values to output
@@ -2840,6 +2992,18 @@ public:
             ctx.proc = "entrada_horno";
             ctx.rate_max_per_s = celima::rates().rate_per_s(line, ctx.proc);
             ctx.margin         = celima::rates().margin();
+            // Reloj del turno, para la cota de la familia LatchedTime.
+            //
+            // Sale de dev_epoch y NO del reloj del host: el acumulado que se
+            // compara contra este reloj se construyó con los deltas de esas mismas
+            // tramas, así que ambos lados tienen que medirse con la misma
+            // referencia. Con el reloj del host, reproducir tráfico histórico o
+            // procesar tramas encoladas compara un acumulado de N horas contra un
+            // turno de M y rechaza todo. Sin dev_epoch la cota no es calculable y
+            // el delta se descarta, igual que el resto.
+            if (dev_epoch)
+                ctx.shift_elapsed_s = static_cast<double>(
+                    *dev_epoch - shift_start_epoch(*dev_epoch, shift_mode));
             // Hueco desde el último mensaje aceptado de esta clave. Sin epoch de
             // dispositivo queda en 0 y la cota declara el delta implausible.
             if (dev_epoch && st.last_accepted_epoch_s > 0)
@@ -2907,11 +3071,11 @@ public:
                 uint32_t delta_mcf = diff_counter_safe(metrica_mcf_cantidad, st.last_metrica_mcf_cantidad, st.rc_metrica_mcf_cantidad, ctx.with("metrica_mcf_cantidad"));
                 st.acc_metrica_mcf_cantidad += delta_mcf;
 
-                st.acc_metrica_mcf_tiempo_ds += diff_counter_safe(metrica_mcf_tiempo, st.last_metrica_mcf_tiempo, st.rc_metrica_mcf_tiempo, ctx.with("metrica_mcf_tiempo"));
+                st.acc_metrica_mcf_tiempo_ds += diff_counter_safe(metrica_mcf_tiempo, st.last_metrica_mcf_tiempo, st.rc_metrica_mcf_tiempo, ctx.with_acc("metrica_mcf_tiempo", st.acc_metrica_mcf_tiempo_ds));
 
                 st.acc_metrica_formador_cantidad += diff_counter_safe(metrica_formador_cantidad, st.last_metrica_formador_cantidad, st.rc_metrica_formador_cantidad, ctx.with("metrica_formador_cantidad"));
 
-                st.acc_metrica_formador_tiempo_ds += diff_counter_safe(metrica_formador_tiempo, st.last_metrica_formador_tiempo, st.rc_metrica_formador_tiempo, ctx.with("metrica_formador_tiempo"));
+                st.acc_metrica_formador_tiempo_ds += diff_counter_safe(metrica_formador_tiempo, st.last_metrica_formador_tiempo, st.rc_metrica_formador_tiempo, ctx.with_acc("metrica_formador_tiempo", st.acc_metrica_formador_tiempo_ds));
 
                 st.acc_falha_forno_cantidad += diff_counter_safe(falha_forno_cantidad, st.last_falha_forno_cantidad, st.rc_falha_forno_cantidad, ctx.with("falha_forno_cantidad"));
 
@@ -3369,6 +3533,18 @@ public:
             ctx.proc = "salida_horno";
             ctx.rate_max_per_s = celima::rates().rate_per_s(line, ctx.proc);
             ctx.margin         = celima::rates().margin();
+            // Reloj del turno, para la cota de la familia LatchedTime.
+            //
+            // Sale de dev_epoch y NO del reloj del host: el acumulado que se
+            // compara contra este reloj se construyó con los deltas de esas mismas
+            // tramas, así que ambos lados tienen que medirse con la misma
+            // referencia. Con el reloj del host, reproducir tráfico histórico o
+            // procesar tramas encoladas compara un acumulado de N horas contra un
+            // turno de M y rechaza todo. Sin dev_epoch la cota no es calculable y
+            // el delta se descarta, igual que el resto.
+            if (dev_epoch)
+                ctx.shift_elapsed_s = static_cast<double>(
+                    *dev_epoch - shift_start_epoch(*dev_epoch, shift_mode));
             // Hueco desde el último mensaje aceptado de esta clave. Sin epoch de
             // dispositivo queda en 0 y la cota declara el delta implausible.
             if (dev_epoch && st.last_accepted_epoch_s > 0)
@@ -3454,7 +3630,7 @@ public:
 
                     st.acc_metrica_ciclos += diff_counter_safe(metrica_ciclos, st.last_metrica_ciclos, st.rc_metrica_ciclos, ctx.with("metrica_ciclos"));
 
-                    st.acc_metrica_tiempo += diff_counter_safe(metrica_tiempo, st.last_metrica_tiempo, st.rc_metrica_tiempo, ctx.with("metrica_tiempo"));
+                    st.acc_metrica_tiempo += diff_counter_safe(metrica_tiempo, st.last_metrica_tiempo, st.rc_metrica_tiempo, ctx.with_acc("metrica_tiempo", st.acc_metrica_tiempo));
 
                     st.acc_bancalinos_q301 += diff_counter_safe(bancalinos_q301, st.last_bancalinos_q301, st.rc_bancalinos_q301, ctx.with("bancalinos_q301"));
 
@@ -3476,7 +3652,7 @@ public:
 
                     st.acc_barreira1_cantidad += diff_counter_safe(barreira1_cantidad, st.last_barreira1_cantidad, st.rc_barreira1_cantidad, ctx.with("barreira1_cantidad"));
 
-                    st.acc_barreira1_tiempo += diff_counter_safe(barreira1_tiempo, st.last_barreira1_tiempo, st.rc_barreira1_tiempo, ctx.with("barreira1_tiempo"));
+                    st.acc_barreira1_tiempo += diff_counter_safe(barreira1_tiempo, st.last_barreira1_tiempo, st.rc_barreira1_tiempo, ctx.with_acc("barreira1_tiempo", st.acc_barreira1_tiempo));
                 }
             }
 

@@ -107,14 +107,13 @@ TEST_CASE("un hueco legítimo no dispara el camino de los 3 rechazos") {
     const json prod = json::parse(pubs[1].payload);
     CHECK(prod["ingreso_elevador_turno"] == 6000);   // recuperado, no perdido
 
-    // Los acumuladores de tiempo en decisegundos SÍ se descartan aquí, y es
-    // correcto: a 10 ticks/s el contador de 16 bits da la vuelta en 1,8 h, así
-    // que tras 5 h su delta es ambiguo por construcción. No hay configuración
-    // que lo arregle; es el módulo del contador contra la velocidad del tick.
-    CHECK(count_lines(log, {"[STATE] delta_rejected", "family=tiempo_ds",
-                            "reason=ambiguous_module"}) == 3);
-    // Los de segundos, en cambio, sí se recuperan: 1 tick/s no agota el módulo
-    // hasta las ~12 h.
+    // Los acumuladores latcheados también se recuperan: su cota no es la tasa
+    // ni el módulo, es el reloj del turno, y 5 h de paro caben de sobra. Antes
+    // de PR 3 estos tres se descartaban por ambiguous_module.
+    CHECK(count_lines(log, {"[STATE] delta_rejected", "family=tiempo_latcheado"}) == 0);
+    // Y el salto queda registrado como lo que es, un paro con su duración.
+    CHECK(count_lines(log, {"[STATE] paro_latched", "proc=entrada_secador"}) == 3);
+    // Los de segundos también: 1 tick/s no agota el módulo hasta las ~12 h.
     CHECK(count_lines(log, {"[STATE] delta_rejected", "family=tiempo_s"}) == 0);
 }
 
@@ -249,11 +248,14 @@ TEST_CASE("familias de contador: la tabla clasifica lo que debe") {
     // Segundos: 1 tick/s.
     CHECK(counter_family_for("entrada_secador", "timer1Hz") == F::TimeSeconds);
     CHECK(counter_family_for("entrada_horno", "falha_forno_tiempo") == F::TimeSeconds);
-    // Decisegundos: 10 ticks/s. En las prensas el nombre no lo delata (se
-    // acumula con ×0,1), y es justo el caso que un clasificador por sufijo
-    // habría fallado.
-    CHECK(counter_family_for("prensa_hidraulica1", "metrica_tiempo") == F::TimeDeciseconds);
-    CHECK(counter_family_for("entrada_secador", "bancalino_l1_tiempo") == F::TimeDeciseconds);
+    // Decisegundos puro: hoy solo queda sentido_escolha_tiempo, que NO migró a
+    // LatchedTime por no tener firma (100% de deltas en cero durante 24 h).
+    CHECK(counter_family_for("salida_horno", "sentido_escolha_tiempo") == F::TimeDeciseconds);
+    // Latcheados: avanzan a saltos que valen el paro anterior. En las prensas el
+    // nombre no lo delata (se acumula con ×0,1), y es justo el caso que un
+    // clasificador por sufijo habría fallado.
+    CHECK(counter_family_for("prensa_hidraulica1", "metrica_tiempo") == F::LatchedTime);
+    CHECK(counter_family_for("entrada_secador", "bancalino_l1_tiempo") == F::LatchedTime);
     // Lo desconocido cae en Event, que es el lado conservador.
     CHECK(counter_family_for("entrada_secador", "campo_que_no_existe") == F::Event);
     CHECK(counter_family_for("procesador_nuevo", "timer1Hz") == F::Event);
@@ -279,9 +281,11 @@ TEST_CASE("ningún contador de tiempo se queda sin clasificar") {
             proc = line.substr(a, line.find('"', a) - a);
             continue;
         }
+        for (const char* forma : {"ctx.with(\"", "ctx.with_acc(\""}) {
+        const size_t largo = std::string(forma).size();
         size_t w = 0;
-        while ((w = line.find("ctx.with(\"", w)) != std::string::npos) {
-            const auto a = w + 10;
+        while ((w = line.find(forma, w)) != std::string::npos) {
+            const auto a = w + largo;
             const std::string field = line.substr(a, line.find('"', a) - a);
             w = a;
             ++sites;
@@ -294,6 +298,7 @@ TEST_CASE("ningún contador de tiempo se queda sin clasificar") {
                 ++unclassified;
                 missing += " " + proc + "/" + field;
             }
+        }
         }
     }
     // Si el patrón de llamada cambia, este test no debe pasar en vacío.
@@ -309,12 +314,12 @@ TEST_CASE("P1: un hueco corto ya recupera los acumuladores de tiempo") {
     const uint16_t delta_real = 18000;             // 10 ticks/s * 1800 s
 
     CounterCtx as_event = ctx_for(gap, 450.0);     // tasa de producción
-    as_event.proc = "entrada_secador";
-    as_event.field = "ingreso_elevador_cantidad";  // familia Event
+    as_event.proc = "salida_horno";
+    as_event.field = "bancalinos_total";           // familia Event
     CHECK_FALSE(diff_counter_scaled(1000 + delta_real, 1000, as_event).plausible);
 
     CounterCtx as_ds = as_event;
-    as_ds.field = "ingreso_elevador_tiempo";       // familia tiempo_ds
+    as_ds.field = "sentido_escolha_tiempo";        // familia tiempo_ds
     const auto r = diff_counter_scaled(1000 + delta_real, 1000, as_ds);
     CHECK(r.plausible);                            // ahora sí se recupera
     CHECK(r.max_plausible == doctest::Approx(10.0 * gap * 1.5));
@@ -440,4 +445,238 @@ TEST_CASE("Level: un salto imposible se rechaza y re-ancla como los demás") {
     CHECK(count_lines(log, {"delta_rejected", "field=numero_grades",
                             "family=nivel", "reason=level_jump"}) == 3);
     CHECK(count_lines(log, {"reanchor", "field=numero_grades"}) == 1);
+}
+
+// ---------------------------------------------------------------------------
+// Familia LatchedTime (defecto D6): el ladder le suma un contador libre y lo
+// reinicia en cada evento, así que se congela mientras la máquina está parada y
+// suelta el paro entero de golpe. Su incremento vale el paro ANTERIOR, no el
+// intervalo entre tramas: ninguna cota por tasa aplica.
+
+static CounterCtx ctx_latched(double shift_elapsed_s, uint32_t acc_current,
+                              double elapsed_s = 187.0)
+{
+    CounterCtx c = ctx_for(elapsed_s, 900.0);
+    c.proc = "entrada_secador";
+    c.field = "bancalino_l1_tiempo";
+    c.shift_elapsed_s = shift_elapsed_s;
+    c.acc_current = acc_current;
+    return c;
+}
+
+TEST_CASE("LatchedTime: la cota es el reloj del turno más un módulo de arrastre") {
+    REQUIRE(counter_family_for("entrada_secador", "bancalino_l1_tiempo")
+            == CounterFamily::LatchedTime);
+
+    SUBCASE("operación normal") {
+        const auto r = diff_counter_scaled(1870, 0, ctx_latched(4000, 39000));
+        CHECK(r.plausible);
+        CHECK(r.max_plausible == doctest::Approx(10.0 * 4000 * 1.05 + 65536.0));
+    }
+    SUBCASE("salto de paro") {
+        // El caso que hoy se rechaza y que es el corazón del PR: 37 min de paro
+        // soltados de golpe en el primer evento tras el arranque.
+        const auto r = diff_counter_scaled(22400, 0, ctx_latched(4000, 39000));
+        CHECK(r.value == 22400);
+        CHECK(r.plausible);
+    }
+    SUBCASE("arrastre de turno") {
+        // El caso que rompió la primera versión de esta cota. Turno recién
+        // empezado y un paro de 40 min que arrancó ANTES de la frontera: el
+        // contador libre del PLC no sabe de turnos y lo suelta entero aquí.
+        // Sin el término de arrastre esto se rechazaba: 10 x 1200 x 1,05 =
+        // 12.600 < 24.000.
+        const auto r = diff_counter_scaled(24000, 0, ctx_latched(1200, 0));
+        CHECK(r.plausible);
+    }
+    SUBCASE("por encima de todo lo posible") {
+        // Ni con el arrastre cabe: el acumulado se habría desbocado.
+        const auto r = diff_counter_scaled(60000, 0, ctx_latched(40000, 450000));
+        CHECK_FALSE(r.plausible);
+        CHECK(std::string(r.reason) == "over_shift_clock");
+    }
+    SUBCASE("sin turno no hay cota") {
+        const auto r = diff_counter_scaled(1870, 0, ctx_latched(0, 39000));
+        CHECK_FALSE(r.plausible);
+        CHECK(std::string(r.reason) == "no_shift_elapsed");
+    }
+    SUBCASE("el intervalo entre tramas es irrelevante") {
+        // Si el resultado dependiera de elapsed_s, la familia estaría mal
+        // implementada: el incremento no guarda relación con el intervalo.
+        const auto corto = diff_counter_scaled(22400, 0, ctx_latched(4000, 39000, 127.0));
+        const auto largo = diff_counter_scaled(22400, 0, ctx_latched(4000, 39000, 4000.0));
+        CHECK(corto.plausible == largo.plausible);
+        CHECK(corto.max_plausible == doctest::Approx(largo.max_plausible));
+        CHECK(corto.value == largo.value);
+    }
+    SUBCASE("la tasa configurada es irrelevante") {
+        CounterCtx sin_tasa = ctx_latched(4000, 39000);
+        sin_tasa.rate_max_per_s = 0.0;
+        const auto r = diff_counter_scaled(1870, 0, sin_tasa);
+        CHECK(r.plausible);
+        CHECK(std::string(r.reason) != "no_rate");
+    }
+}
+
+TEST_CASE("LatchedTime: el caso L2 completo, sin un solo rechazo") {
+    // Reproduce lo medido en planta: doce tramas con el campo congelado —la
+    // línea parada— y luego el paro entero de golpe. Antes de PR 3 ese salto se
+    // rechazaba, y como el re-anclaje fija prev_ref al valor posterior, el paro
+    // no se recuperaba nunca: L2 arrastraba un déficit fijo de ~23.600 ticks.
+    testsup::pin_local_hour(10);
+    reset_all_processor_states();
+    testsup::rates_for_tests();
+    celima::set_state_store(nullptr);
+
+    auto secador = createProcessor(DeviceType::Entrada_secador);
+    const int kParo = 22400;                       // 37 min 20 s
+
+    json m0 = testsup::make_frame(3, 1, 0);
+    m0["bancalino_l1_tiempo_ds"] = 1000;
+    secador->process(m0, kPfx, 3);
+
+    std::vector<Publication> pubs;
+    const std::string log = capture_streams([&] {
+        for (int tick = 1; tick <= 12; ++tick) {   // congelado: la línea no produce
+            json m = testsup::make_frame(3, 1, tick);
+            m["bancalino_l1_tiempo_ds"] = 1000;
+            pubs = secador->process(m, kPfx, 3);
+        }
+        json m = testsup::make_frame(3, 1, 13);    // primer evento tras el arranque
+        m["bancalino_l1_tiempo_ds"] = 1000 + kParo;
+        pubs = secador->process(m, kPfx, 3);
+    });
+
+    CHECK(count_lines(log, {"delta_rejected", "field=bancalino_l1_tiempo"}) == 0);
+    CHECK(count_lines(log, {"[STATE] paro_latched", "field=bancalino_l1_tiempo",
+                            "duracion_s=2240"}) == 1);
+    REQUIRE(pubs.size() == 2);
+    const json prod = json::parse(pubs[1].payload);
+    CHECK(prod["bancalino_l1_tiempo_turno_ds"] == kParo);
+
+    // Sin regresión en los campos de familia tiempo_s del mismo procesador: la
+    // secuencia no los toca y siguen acumulando su propio ritmo.
+    CHECK(count_lines(log, {"delta_rejected", "family=tiempo_s"}) == 0);
+    CHECK(prod["paradas_tiempo_turno_s"] == 12 * 64 + 64);
+}
+
+TEST_CASE("LatchedTime: el guardarraíl salta con el acumulado desbocado") {
+    // La cota NO decide sobre un delta suelto —al principio del turno el
+    // arrastre admite casi cualquiera, y así está documentado en el diseño—,
+    // pero sí impide que el acumulado se desboque. Se comprueba la propiedad,
+    // no el instante exacto: cuántos saltos caben depende de en qué punto del
+    // turno esté el reloj, y eso no es lo que se quiere fijar.
+    testsup::pin_local_hour(6);                    // turno recién empezado
+    reset_all_processor_states();
+    testsup::rates_for_tests();
+    celima::set_state_store(nullptr);
+
+    auto secador = createProcessor(DeviceType::Entrada_secador);
+    json m0 = testsup::make_frame(3, 2, 0);
+    m0["bancalino_l1_tiempo_ds"] = 0;
+    secador->process(m0, kPfx, 3);
+
+    // Saltos de 16.000 ticks (26 min de "paro") cada 3 minutos de reloj: un
+    // acumulado imposible, que la cota tiene que acabar frenando.
+    int primer_rechazo = -1;
+    for (int k = 1; k <= 12 && primer_rechazo < 0; ++k) {
+        json m = testsup::make_frame(3, 2, k);
+        m["bancalino_l1_tiempo_ds"] = static_cast<uint16_t>(16000 * k);
+        const std::string log = capture_streams([&] { secador->process(m, kPfx, 3); });
+        if (count_lines(log, {"delta_rejected", "field=bancalino_l1_tiempo",
+                              "family=tiempo_latcheado", "reason=over_shift_clock"}) > 0)
+            primer_rechazo = k;
+    }
+    CHECK_MESSAGE(primer_rechazo > 0,
+                  "el acumulado creció sin freno: la cota no está haciendo de guardarraíl");
+}
+
+TEST_CASE("LatchedTime: un paro a caballo de la frontera de turno se acepta") {
+    // ES LA PRUEBA DE REGRESIÓN del fallo de diseño que destapó el replay del
+    // log de planta. El contador libre del PLC no sabe nada de turnos: sigue
+    // corriendo a través de las 06:00, así que un paro que empieza a las 05:40
+    // se suelta ENTERO en el turno nuevo, cuyo reloj lleva minutos. Sin el
+    // término de arrastre, ese salto se rechazaba y el paro se perdía — que es
+    // exactamente el déficit fijo que se midió en L2.
+    testsup::pin_local_hour(6);                    // turno recién empezado
+    reset_all_processor_states();
+    testsup::rates_for_tests();
+    celima::set_state_store(nullptr);
+
+    auto secador = createProcessor(DeviceType::Entrada_secador);
+    json m0 = testsup::make_frame(3, 9, 0);
+    m0["bancalino_l1_tiempo_ds"] = 5000;
+    secador->process(m0, kPfx, 3);
+
+    // Primer evento tras el arranque: suelta 40 min de paro, la mayoría de
+    // antes de las 06:00. El reloj del turno lleva 180 s.
+    json m1 = testsup::make_frame(3, 9, 1);
+    m1["bancalino_l1_tiempo_ds"] = 5000 + 24000;
+    std::vector<Publication> pubs;
+    const std::string log = capture_streams([&] { pubs = secador->process(m1, kPfx, 3); });
+
+    CHECK(count_lines(log, {"delta_rejected", "field=bancalino_l1_tiempo"}) == 0);
+    CHECK(count_lines(log, {"[STATE] paro_latched", "field=bancalino_l1_tiempo",
+                            "duracion_s=2400"}) == 1);
+    REQUIRE(pubs.size() == 2);
+    CHECK(json::parse(pubs[1].payload)["bancalino_l1_tiempo_turno_ds"] == 24000);
+
+    // Y el resto del turno sigue acumulando a su ritmo, sin rechazos: el
+    // arrastre se absorbe según crece el reloj del turno.
+    const std::string log2 = capture_streams([&] {
+        for (int k = 2; k <= 20; ++k) {
+            json m = testsup::make_frame(3, 9, k);
+            m["bancalino_l1_tiempo_ds"] = static_cast<uint16_t>(5000 + 24000 + 1870 * (k - 1));
+            pubs = secador->process(m, kPfx, 3);
+        }
+    });
+    CHECK(count_lines(log2, {"delta_rejected"}) == 0);
+    CHECK(json::parse(pubs[1].payload)["bancalino_l1_tiempo_turno_ds"] == 24000 + 1870 * 19);
+
+    // Sin regresión en los campos de familia tiempo_s del mismo procesador.
+    CHECK(count_lines(log2, {"family=tiempo_s"}) == 0);
+}
+
+TEST_CASE("LatchedTime: el reloj del turno sale de la trama, no del host") {
+    // ESTE TEST EXISTE POR UN BUG CONCRETO. Al implementar PR 3 se calculó
+    // shift_elapsed_s con std::time(nullptr) en lugar de con dev_epoch. En una
+    // suite que corre en segundos las dos versiones dan lo mismo, así que no
+    // falló nada; solo se vio reproduciendo 24 h de tráfico real, donde el
+    // acumulado de N horas se comparaba contra un turno de M y se rechazaba
+    // todo.
+    //
+    // Aquí se separan los dos relojes a propósito: el host va por la mitad del
+    // turno y las tramas llegan del principio. Si la cota usara el reloj del
+    // host, el techo sería 25x mayor y no habría rechazo.
+    testsup::pin_local_hour(13);                   // host: 7 h de turno S1 (06–14)
+    reset_all_processor_states();
+    testsup::rates_for_tests();
+    celima::set_state_store(nullptr);
+
+    auto secador = createProcessor(DeviceType::Entrada_secador);
+    const int64_t manana = testsup::base_epoch() - 7 * 3600;   // 06:00 local
+
+    auto trama = [&](int k, int nivel) {
+        json m = testsup::make_frame(3, 40, k);
+        m["gatewayTime"] = testsup::iso_utc(manana + k * 180);
+        m["bancalino_l1_tiempo_ds"] = static_cast<uint16_t>(nivel);
+        return m;
+    };
+
+    secador->process(trama(0, 0), kPfx, 3);        // siembra a las 06:00
+    // Dos saltos que caben bajo el techo de la trama (06:03 y 06:06):
+    // 10 x ~360 s x 1,05 + 65.536 ≈ 69.300.
+    secador->process(trama(1, 34000), kPfx, 3);
+    secador->process(trama(2, 34000 + 34000 - 65536), kPfx, 3);
+
+    // El tercero ya no cabe con el reloj de la trama (~68.000 + 5.000), pero
+    // sobraría con el del host (techo ≈ 330.000).
+    const std::string log = capture_streams([&] {
+        secador->process(trama(3, 34000 + 34000 + 5000 - 65536), kPfx, 3);
+    });
+    CHECK_MESSAGE(count_lines(log, {"delta_rejected", "field=bancalino_l1_tiempo",
+                                    "reason=over_shift_clock"}) == 1,
+                  "la cota está usando el reloj del host y no el de la trama");
+    // Y la traza tiene que reportar el turno de la TRAMA, no el del host.
+    CHECK(count_lines(log, {"turno_s=540"}) == 1);
 }

@@ -108,18 +108,37 @@ enum class CounterFamily { Event, TimeSeconds, TimeDeciseconds, Level, LatchedTi
 tiempo transcurrido desde el evento anterior. **No tiene tasa.** Ninguna cota
 basada en el intervalo entre tramas es aplicable.
 
-### 3.2 La única invariante real
+### 3.2 La invariante, con el arrastre de turno incluido
 
-El campo es un reloj, así que su acumulado de turno no puede superar el tiempo
-transcurrido del turno:
+El campo es un reloj, así que su acumulado tiende al tiempo transcurrido del
+turno. Pero **el contador libre del PLC no sabe nada de turnos**: sigue corriendo
+a través de las 06:00 y las 18:00. Un paro que empieza a las 17:40 y termina a
+las 18:20 se suelta **entero dentro del turno 2**, cuyo reloj lleva 1.200 s.
+El acumulado va legítimamente por delante del reloj al principio de cada turno.
+
+Medido: sobre el turno **completo** L2 y L3 dan 10,00 exacto —los arrastres se
+compensan, cada turno regala su cola y hereda la del anterior— pero **dentro** del
+turno, y sobre todo al principio, `acc > 10 × elapsed`.
+
+El exceso tiene un techo físico: el arrastre es un solo salto de un registro de
+16 bits, así que **no puede pasar de un módulo**. Por encima de 65.536 ticks
+(6.553,6 s = 1,82 h) el contador libre ha dado la vuelta y el valor ya es
+ambiguo por construcción. De ahí la cota:
 
 ```
-acc + delta  ≤  10 ticks/s × segundos_transcurridos_del_turno × (1 + TOL)
+acc + delta  ≤  10 ticks/s × segundos_transcurridos_del_turno × (1 + TOL)  +  65536
 ```
 
-`TOL = 0,05` cubre la deriva entre el reloj del PLC y el del host. La cota es
-one-sided a propósito: el acumulado **puede** ir por debajo (arranca en el primer
-evento tras el reseed) pero nunca por encima.
+`TOL = 0,05` cubre la deriva entre el reloj del PLC y el del host. El sumando de
+65.536 es el arrastre máximo posible, no un margen a ojo.
+
+**Honestidad sobre lo que esta cota vale.** Al principio del turno el término del
+arrastre domina y la cota admite casi cualquier delta; al final domina el reloj.
+Es decir: **para un `LatchedTime` la plausibilidad de un delta concreto no es
+decidible desde esta aplicación** — el salto vale el paro anterior, y la app no
+sabe cuándo ocurrió el evento previo. Esto es un guardarraíl contra un acumulado
+desbocado, no un filtro fino. Y está bien que lo sea: el Arduino ya descarta las
+tramas que no valida contra W1, así que aquí no llega basura que filtrar.
 
 Esto exige dos datos nuevos en `CounterCtx`:
 
@@ -150,7 +169,10 @@ if (family == CounterFamily::LatchedTime) {
         r.reason = "no_shift_elapsed";   // sin turno no hay cota: se descarta
         return r;
     }
-    const double techo = 10.0 * ctx.shift_elapsed_s * 1.05;
+    // El +65536 es el arrastre: un paro que cruza la frontera de turno se
+    // suelta entero en el turno nuevo y su tiempo es de antes. Como es un
+    // solo salto de un registro de 16 bits, no puede pasar de un módulo.
+    const double techo = 10.0 * ctx.shift_elapsed_s * 1.05 + 65536.0;
     r.max_plausible = techo;
     r.plausible = (static_cast<double>(ctx.acc_current) + r.value <= techo);
     if (!r.plausible) r.reason = "over_shift_clock";
@@ -242,30 +264,40 @@ En `tests/test_scaled_bound.cpp`:
    `acc_current = 39000`, delta 1.870 → plausible (39.000+1.870 ≤ 42.000).
 2. **Salto de paro.** Mismo contexto, delta **22.400** → plausible. Este es el
    caso que hoy se rechaza y es el corazón del PR.
-3. **Por encima del reloj del turno.** `shift_elapsed_s = 4000`,
-   `acc_current = 41000`, delta 5.000 → `plausible == false`,
+3. **Arrastre de turno — el caso que rompió la primera versión de esta spec.**
+   Recién empezado el turno: `shift_elapsed_s = 1200`, `acc_current = 0`,
+   delta **24.000** (un paro de 40 min que empezó a las 17:40 y terminó a las
+   18:20) → **plausible**. Con la cota sin el término de arrastre esto se
+   rechazaba: 10 × 1200 × 1,05 = 12.600 < 24.000.
+4. **Por encima de todo lo posible.** `shift_elapsed_s = 40000`,
+   `acc_current = 450000`, delta 60.000 → `plausible == false`,
    `reason == "over_shift_clock"`.
-4. **Sin turno.** `shift_elapsed_s = 0` → `reason == "no_shift_elapsed"`, no
+5. **Sin turno.** `shift_elapsed_s = 0` → `reason == "no_shift_elapsed"`, no
    plausible. Nunca debe colarse un delta sin poder acotarlo.
-5. **`elapsed_s` es irrelevante.** Con `elapsed_s = 127` y con `elapsed_s = 4000`,
+6. **`elapsed_s` es irrelevante.** Con `elapsed_s = 127` y con `elapsed_s = 4000`,
    el mismo delta da el mismo resultado. La familia no depende del intervalo
    entre tramas: si depende, está mal implementada.
-6. **La tasa configurada es irrelevante.** Con `rate_max_per_s = 0` no debe
+7. **La tasa configurada es irrelevante.** Con `rate_max_per_s = 0` no debe
    devolver `no_rate`.
 
 En `tests/test_replay.cpp`:
 
-7. **Reproducción del caso L2.** Secuencia con ~12 tramas de delta 0 y luego un
+8. **Reproducción del caso L2.** Secuencia con ~12 tramas de delta 0 y luego un
    delta de ~22.400. Comprobar que el acumulado final es ≈ 10 × el reloj del
    turno, y que **no** se emite ningún `delta_rejected`.
-8. **Sin regresión en kS.** La misma secuencia no debe alterar
-   `falha_forno_tiempo_turno_s` ni `paradas_tiempo_turno_s`.
+9. **Turno completo con paro a caballo de la frontera.** Reproducir el final de
+   un turno y el principio del siguiente con un paro que cruza las 18:00.
+   Comprobar que el salto se acepta en el turno nuevo y que la ratio del turno
+   completo converge a 10,00. **Es la prueba de regresión de este fallo de
+   diseño**; sin ella se vuelve a colar.
+10. **Sin regresión en kS.** La misma secuencia no debe alterar
+    `falha_forno_tiempo_turno_s` ni `paradas_tiempo_turno_s`.
 
 En `tests/test_persistence.cpp`:
 
-9. `shift_elapsed_s` y `acc_current` se calculan bien en la primera trama tras
-   una restauración dentro del mismo turno (el acumulado viene de la base, el
-   reloj del turno del `dev_epoch`).
+11. `shift_elapsed_s` y `acc_current` se calculan bien en la primera trama tras
+    una restauración dentro del mismo turno (el acumulado viene de la base, el
+    reloj del turno del `dev_epoch`).
 
 ---
 
@@ -322,6 +354,28 @@ journalctl -u iot-celima-mqtt.service --no-pager --since '-24 hours' \
   sin rellenar cae en `no_shift_elapsed` y deja de acumular. Revisar uno por uno.
 - **Los paros de más de 1,82 h se siguen midiendo mal.** No es corregible aquí.
   Queda marcado con `AVISO=posible_wrap` y va como pregunta a automatización.
+- **La cota es un guardarraíl, no un filtro.** Ver §3.2: al principio del turno el
+  término de arrastre la vuelve casi inoperante. Quien la lea esperando que
+  detecte deltas anómalos se va a llevar una sorpresa; lo único que detecta es un
+  acumulado desbocado.
+
+## 6 bis. Un defecto que este PR NO arregla, y que hay que anotar antes de PR 5
+
+**La atribución a turno de estos campos es incorrecta por construcción.** El
+contador libre del PLC no se entera del cambio de turno, así que un paro que
+cruza las 06:00 o las 18:00 se atribuye **entero al turno siguiente**, aunque la
+mayor parte del tiempo pertenezca al anterior. La aplicación no puede repartirlo:
+el PLC entrega el bulto sin dividir y no dice cuándo empezó.
+
+Para los `*_tiempo_ds` da igual: son réplicas del reloj y nadie los consume. Pero
+**si PR 5 llega a publicar `paro_latched` como métrica de paro de línea, esa
+métrica va a colocar en el turno equivocado justamente los paros más largos**,
+que son los que más probabilidad tienen de cruzar una frontera. Para un dato que
+se usa en control de planta eso no es aceptable sin, como mínimo, marcar el
+evento como "a caballo" y publicar el instante del evento además de la duración.
+
+Es el mismo patrón que D4: un total de turno que no sabe a qué instancia de turno
+pertenece su contenido. Anotarlo en `claude/cota-plausibilidad-y-tasas.md`.
 
 ## 7. Lo que NO hay que hacer
 
@@ -335,3 +389,4 @@ journalctl -u iot-celima-mqtt.service --no-pager --since '-24 hours' \
   crudo. La cota contra el reloj es una validación, no una fuente.
 - **No publicar todavía el paro como campo.** Primero hay que decidir qué se hace
   con el techo de 1,82 h.
+  
