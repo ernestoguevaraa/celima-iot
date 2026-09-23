@@ -132,9 +132,11 @@ inline int count_lines(const std::string& text, const std::vector<std::string>& 
 // ---------------------------------------------------------------------------
 // Constructor de tramas para los 8 deviceType.
 //
-// Todos los contadores avanzan `step` por tick (timer1Hz avanza 180, un tick =
-// un intervalo de 180 s) y gatewayTime avanza con el tick, así que el hueco
-// entre tramas es explícito: pasa un `tick` salteado para simular un hueco.
+// Un tick es un intervalo de publicación de su clase: 120 s en entrada_horno,
+// 180 s en el resto. Los contadores avanzan `step` por tick y timer1Hz avanza
+// los segundos transcurridos, porque es un reloj libre de 1 Hz y no puede hacer
+// otra cosa. gatewayTime avanza con el tick, así que el hueco entre tramas es
+// explícito: pasa un `tick` salteado para simular un hueco.
 inline std::string iso_utc(int64_t epoch_s)
 {
     std::time_t t = static_cast<std::time_t>(epoch_s);

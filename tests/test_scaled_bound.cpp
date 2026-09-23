@@ -1,7 +1,10 @@
-// Cota de plausibilidad escalada por tiempo (D2) y configuración de tasas.
+// La cota de plausibilidad, familia por familia, y la configuración de tasas.
 //
-// El caso que justifica el PR es el hueco de 4–6 h: hoy el techo fijo de 5000
-// lo descarta; con la cota escalada debe recuperarse.
+//   - Event        cota escalada por tiempo (D2): el caso que la justifica es el
+//                  hueco de 4–6 h, que el techo fijo de 5000 descartaba.
+//   - tiempo_s/ds  máximo analítico, 1 y 10 ticks/s (D6 parcial, defecto P1).
+//   - Level        cambio con signo, sin tasa ni hueco (D5).
+//   - LatchedTime  cota contra el reloj del turno más un módulo de arrastre (D6).
 #include "doctest.h"
 #include "support.hpp"
 

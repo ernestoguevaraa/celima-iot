@@ -1,5 +1,9 @@
-// Eventos [STATE] — criterios de aceptación 4 (re-siembras visibles) y
-// 5 (re-anclajes visibles), más el shift_change_global de la tabla del PR 1.
+// Eventos [STATE] y lo que el servicio NO debe publicar.
+//
+// Nació con los criterios 4 y 5 de PR 1 —re-siembras y re-anclajes visibles— y
+// ha ido recogiendo las invariantes de salida: que una retransmisión no sume
+// dos veces, que el camino caliente no loguee, que las tramas del decoder no
+// publiquen nada y que checksum no se reemita.
 //
 // Los tests fijan la hora local en lugar de esperar al reloj: pin_local_hour()
 // clava TZ a un offset calculado, así que el turno es el mismo se ejecute la

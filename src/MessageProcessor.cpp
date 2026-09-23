@@ -99,26 +99,31 @@ bool detect_global_shift_change(int currentShift)
 // uint16_t — no masking, rollover at 65536.
 // Example: prev=65530, curr=12 → delta=(uint16_t)(12-65530)=18  ✓
 //
+// De ahí que NINGÚN sitio de este archivo corrija alineamiento ni multiplique
+// por dos: el firmware ya entrega el valor alineado. Hasta 2026-09-23 eso iba
+// repetido como etiqueta en 26 líneas de publicación, lo que sugería que allí
+// pasaba algo. No pasa nada: se publica el acumulado tal cual.
+//
 // El antiguo diff_counter(curr, prev, max_valid) desapareció: su techo fijo es
 // justo el defecto D2. Toda la aritmética pasa ahora por diff_counter_scaled().
 
 // FIX: Safe wrapper that only updates 'last' when delta is valid.
 // When LoRa devices intermittently send data from alternate PLC register banks,
-// the raw value jumps to a completely different range. diff_counter correctly
-// rejects these (delta > max_valid), but if we unconditionally update 'last'
-// to the anomalous value, the NEXT valid reading also produces a huge delta
-// and gets rejected too -- losing two intervals of real counts per anomaly.
+// the raw value jumps to a completely different range. The bound rejects those
+// correctly, but if we unconditionally update 'last' to the anomalous value,
+// the NEXT valid reading also produces a huge delta and gets rejected too --
+// losing two intervals of real counts per anomaly.
 //
 // FIX v2: Added stale recovery. If max_rejects consecutive messages produce
-// rejected deltas (delta > max_valid), force-reset prev_ref to curr.
+// rejected deltas, force-reset prev_ref to curr.
 // This prevents permanent lockout where a single corrupted reading poisons
 // prev_ref into a range that makes ALL subsequent valid readings appear as
 // huge deltas (via 16-bit wraparound), freezing the accumulator forever.
 // ---------------------------------------------------------------------------
-// Clasificación de contadores por familia (pendiente P1).
+// Clasificación de contadores por familia (corrige el defecto P1).
 //
-// Se listan los contadores de tiempo y los de nivel; todo lo demás es Event por
-// defecto. La
+// Se listan los de tiempo (tiempo_s, tiempo_ds), los latcheados y los de
+// nivel; todo lo demás es Event por defecto. La
 // clasificación no se deduce del sufijo del nombre porque los nombres se
 // contradicen entre procesadores: en las prensas `metrica_tiempo` son
 // decisegundos (se multiplica por 0,1 al acumular), mientras que en salida
@@ -1099,7 +1104,7 @@ class PrensaHidraulica1Processor : public IMessageProcessor
         // Semántica y unidad distintas a last_accepted_time (dedup): no reutilizar.
         int64_t last_accepted_epoch_s = 0;
 
-        // Counters are 16-bit with bit-15 validation
+        // Contadores de 16 bits completos: sin máscara, rollover en 65536.
         uint16_t last_pisadas = 0;        // D29005 - PISADAS (press strokes)
         uint8_t  rc_pisadas = 0;
         uint32_t acc_pisadas = 0;
@@ -1307,13 +1312,13 @@ public:
                 st.last_accepted_time     = now;
                 if (dev_epoch) st.last_accepted_epoch_s = *dev_epoch;
 
-                // Accumulate deltas using PLC-compatible validation
+                // Acumulación de deltas
 
-                // D29005 - PISADAS counter (use diff_counter with bit-15 validation)
+                // D29005 - PISADAS (pisadas de prensa)
                 uint16_t delta_pisadas = diff_counter_safe(pisadas, st.last_pisadas, st.rc_pisadas, ctx.with("pisadas"));
                 st.acc_pisadas += delta_pisadas;
 
-                // D29006 - Metric time (deciseconds, bit-15 masked)
+                // D29006 - Tiempo métrico, en decisegundos
                 uint16_t delta_tiempo = diff_counter_safe(metrica_tiempo, st.last_metrica_tiempo, st.rc_metrica_tiempo,
                     // acc_metrica_tiempo_s está en SEGUNDOS y el campo en decisegundos.
                     ctx.with_acc("metrica_tiempo", static_cast<uint32_t>(st.acc_metrica_tiempo_s * 10.0)));
@@ -1325,7 +1330,7 @@ public:
 
                 // D29004 - Stop time counter (seconds)
                 uint16_t delta_tiempo_paradas = diff_counter_safe(paradas_tiempo, st.last_paradas_tiempo, st.rc_paradas_tiempo, ctx.with("paradas_tiempo"));
-                st.acc_paradas_tiempo_s += delta_tiempo_paradas;  // firmware Arduino ya corrige alineamiento de bit
+                st.acc_paradas_tiempo_s += delta_tiempo_paradas;
             }
 
             // Copy out accumulated values
@@ -1626,7 +1631,7 @@ public:
                 st.acc_paradas_count += delta_paradas;
 
                 uint16_t delta_tiempo_paradas = diff_counter_safe(paradas_tiempo, st.last_paradas_tiempo, st.rc_paradas_tiempo, ctx.with("paradas_tiempo"));
-                st.acc_paradas_tiempo_s += delta_tiempo_paradas;  // firmware Arduino ya corrige alineamiento de bit
+                st.acc_paradas_tiempo_s += delta_tiempo_paradas;
             }
 
             acc_pisadas_out = st.acc_pisadas;
@@ -1700,7 +1705,7 @@ std::unordered_map<int, PrensaHidraulica2Processor::PH2State>
  * 
  * Changes from original:
  * 1. Reads NEW semantic field names from LoRaWAN decoder v2
- * 2. ALL registers use bit-15 flag — diff_counter for everything
+ * 2. ALL registers are full uint16_t — the counter family decides the bound
  * 3. Tracks ALL fields from PLC (not just 2)
  * 4. Output JSON uses correct semantic names
  * 
@@ -1990,7 +1995,7 @@ public:
                 st.last_accepted_timer1Hz = timer1Hz;
                 if (dev_epoch) st.last_accepted_epoch_s = *dev_epoch;
 
-                // Accumulate deltas — ALL PLC registers have bit-15 flag, use diff_counter for everything
+                // Acumulación de deltas: uint16 completo, y la familia del contador decide la cota
                 st.acc_timer1Hz += diff_counter_safe(timer1Hz, st.last_timer1Hz, st.rc_timer1Hz, ctx.with("timer1Hz"));
 
                 st.acc_paradas_cantidad += diff_counter_safe(paradas_cantidad, st.last_paradas_cantidad, st.rc_paradas_cantidad, ctx.with("paradas_cantidad"));
@@ -2043,13 +2048,13 @@ public:
 
         // Timer/validation
         prod["timer1Hz_instantaneo"] = timer1Hz;
-        prod["timer1Hz_turno"] = acc_timer1Hz_out;  // firmware Arduino ya corrige alineamiento de bit
+        prod["timer1Hz_turno"] = acc_timer1Hz_out;
 
         // Paradas (stops) - D29003, D29004
         prod["paradas_instantaneo"] = paradas_cantidad;
         prod["paradas_turno"] = acc_paradas_cantidad_out;
         prod["paradas_tiempo_instantaneo_s"] = paradas_tempo;
-        prod["paradas_tiempo_turno_s"] = acc_paradas_tempo_s_out;  // firmware Arduino ya corrige alineamiento de bit
+        prod["paradas_tiempo_turno_s"] = acc_paradas_tempo_s_out;
 
         // Ingreso Elevador - D29005, D29006
         prod["ingreso_elevador_instantaneo"] = ingreso_elevador_cantidad;
@@ -2059,13 +2064,13 @@ public:
 
         // Bancalino Linea 1 - D29007, D29008
         prod["bancalino_l1_instantaneo"] = bancalino_l1_cantidad;
-        prod["bancalino_l1_turno"] = acc_bancalino_l1_cantidad_out;  // firmware Arduino ya corrige alineamiento de bit
+        prod["bancalino_l1_turno"] = acc_bancalino_l1_cantidad_out;
         prod["bancalino_l1_tiempo_instantaneo_ds"] = bancalino_l1_tiempo;
         prod["bancalino_l1_tiempo_turno_ds"] = acc_bancalino_l1_tiempo_ds_out;  // CF100: 1 tick = 0.1s = 1ds (validated, no ×2)
 
         // Bancalino Linea 2 - D29009, D29010
         prod["bancalino_l2_instantaneo"] = bancalino_l2_cantidad;
-        prod["bancalino_l2_turno"] = acc_bancalino_l2_cantidad_out;  // firmware Arduino ya corrige alineamiento de bit
+        prod["bancalino_l2_turno"] = acc_bancalino_l2_cantidad_out;
         prod["bancalino_l2_tiempo_instantaneo_ds"] = bancalino_l2_tiempo;
         prod["bancalino_l2_tiempo_turno_ds"] = acc_bancalino_l2_tiempo_ds_out;  // CF100: 1 tick = 0.1s = 1ds (validated, no ×2)
 
@@ -2094,8 +2099,8 @@ std::unordered_map<int, EntradaSecadorProcessor::State> EntradaSecadorProcessor:
  * 
  * Changes from original:
  * 1. Reads NEW semantic field names from LoRaWAN decoder v2
- * 2. ALL registers use bit-15 flag — diff_counter for everything
- * 3. Uses diff_counter() for ALL fields (bit-15 mask + 15-bit rollover)
+ * 2. ALL registers are full uint16_t — the counter family decides the bound
+ * 3. Tracks ALL fields from PLC (not just 2)
  * 4. Output JSON uses correct semantic names
  * 
  * Input fields (from decoder v2):
@@ -2319,7 +2324,7 @@ public:
                 st.last_accepted_timer1Hz = timer1Hz;
                 if (dev_epoch) st.last_accepted_epoch_s = *dev_epoch;
 
-                // Accumulate deltas — ALL PLC registers have bit-15 flag, use diff_counter for everything
+                // Acumulación de deltas: uint16 completo, y la familia del contador decide la cota
                 st.acc_timer1Hz += diff_counter_safe(timer1Hz, st.last_timer1Hz, st.rc_timer1Hz, ctx.with("timer1Hz"));
 
                 st.acc_parada_mds_cantidad += diff_counter_safe(parada_mds_cantidad, st.last_parada_mds_cantidad, st.rc_parada_mds_cantidad, ctx.with("parada_mds_cantidad"));
@@ -2354,18 +2359,18 @@ public:
 
         // Timer/validation
         prod["timer1Hz_instantaneo"] = timer1Hz;
-        prod["timer1Hz_turno"] = acc_timer1Hz_out;  // firmware Arduino ya corrige alineamiento de bit
+        prod["timer1Hz_turno"] = acc_timer1Hz_out;
 
         // Parada MDS (stops) - D29003, D29004
         prod["parada_mds_instantaneo"] = parada_mds_cantidad;
         prod["parada_mds_turno"] = acc_parada_mds_cantidad_out;
         prod["parada_mds_tiempo_instantaneo_s"] = parada_mds_tiempo;
-        prod["parada_mds_tiempo_turno_s"] = acc_parada_mds_tiempo_s_out;  // firmware Arduino ya corrige alineamiento de bit
+        prod["parada_mds_tiempo_turno_s"] = acc_parada_mds_tiempo_s_out;
 
         // Métrica MDS (cycles) - D29005, D29006
         // NOTE: These are MDS machine CYCLES, NOT product count!
         prod["metrica_mds_instantaneo"] = metrica_mds_cantidad;
-        prod["metrica_mds_turno"] = acc_metrica_mds_cantidad_out;  // firmware Arduino ya corrige alineamiento de bit
+        prod["metrica_mds_turno"] = acc_metrica_mds_cantidad_out;
         prod["metrica_mds_tiempo_instantaneo_ds"] = metrica_mds_tiempo;
         prod["metrica_mds_tiempo_turno_ds"] = acc_metrica_mds_tiempo_ds_out;  // CF100: 1 tick = 0.1s = 1ds (validated, no ×2)
         
@@ -2396,8 +2401,8 @@ std::unordered_map<int, SalidaSecadorProcessor::State> SalidaSecadorProcessor::s
  * 
  * Changes from original:
  * 1. Reads NEW semantic field names from LoRaWAN decoder v2
- * 2. ALL registers use bit-15 flag — diff_counter for everything
- * 3. Uses diff_counter() for ALL fields (bit-15 mask + 15-bit rollover)
+ * 2. ALL registers are full uint16_t — the counter family decides the bound
+ * 3. Tracks ALL fields from PLC (not just 2)
  * 4. Output JSON uses correct semantic names
  * 
  * Input fields (from decoder v2):
@@ -2621,7 +2626,7 @@ public:
                 st.last_accepted_timer1Hz = timer1Hz;
                 if (dev_epoch) st.last_accepted_epoch_s = *dev_epoch;
 
-                // Accumulate deltas — ALL PLC registers have bit-15 flag, use diff_counter for everything
+                // Acumulación de deltas: uint16 completo, y la familia del contador decide la cota
                 st.acc_timer1Hz += diff_counter_safe(timer1Hz, st.last_timer1Hz, st.rc_timer1Hz, ctx.with("timer1Hz"));
 
                 st.acc_parada_esm_cantidad += diff_counter_safe(parada_esm_cantidad, st.last_parada_esm_cantidad, st.rc_parada_esm_cantidad, ctx.with("parada_esm_cantidad"));
@@ -2656,18 +2661,18 @@ public:
 
         // Timer/validation (D29001)
         prod["timer1Hz_instantaneo"] = timer1Hz;
-        prod["timer1Hz_turno"] = acc_timer1Hz_out;  // firmware Arduino ya corrige alineamiento de bit
+        prod["timer1Hz_turno"] = acc_timer1Hz_out;
 
         // Parada ESM (stops) - D29003, D29004
         prod["parada_esm_instantaneo"] = parada_esm_cantidad;
         prod["parada_esm_turno"] = acc_parada_esm_cantidad_out;
         prod["parada_esm_tiempo_instantaneo_s"] = parada_esm_tiempo;
-        prod["parada_esm_tiempo_turno_s"] = acc_parada_esm_tiempo_s_out;  // firmware Arduino ya corrige alineamiento de bit
+        prod["parada_esm_tiempo_turno_s"] = acc_parada_esm_tiempo_s_out;
 
         // Métrica ESM (cycles) - D29005, D29006
         // NOTE: These are ESM machine CYCLES, NOT product count!
         prod["metrica_esm_instantaneo"] = metrica_esm_cantidad;
-        prod["metrica_esm_turno"] = acc_metrica_esm_cantidad_out;  // firmware Arduino ya corrige alineamiento de bit
+        prod["metrica_esm_turno"] = acc_metrica_esm_cantidad_out;
         prod["metrica_esm_tiempo_instantaneo_ds"] = metrica_esm_tiempo;
         prod["metrica_esm_tiempo_turno_ds"] = acc_metrica_esm_tiempo_ds_out;  // CF100: 1 tick = 0.1s = 1ds (validated, no ×2)
 
@@ -3043,7 +3048,7 @@ public:
                 st.last_accepted_timer1Hz = timer1Hz;
                 if (dev_epoch) st.last_accepted_epoch_s = *dev_epoch;
 
-                // Accumulate deltas — ALL PLC registers have bit-15 flag, use diff_counter for everything
+                // Acumulación de deltas: uint16 completo, y la familia del contador decide la cota
                 uint32_t delta_timer = diff_counter_safe(timer1Hz, st.last_timer1Hz, st.rc_timer1Hz, ctx.with("timer1Hz"));
                 st.acc_timer1Hz += delta_timer;
 
@@ -3077,7 +3082,7 @@ public:
                 // Void detection: if no units entered this interval, count elapsed time as void
                 // delta_mcf == 0 means sensor saw zero new pieces since last message
                 if (delta_mcf == 0 && delta_timer > 0) {
-                    st.acc_sin_entrada_s += delta_timer;  // firmware Arduino ya corrige alineamiento de bit
+                    st.acc_sin_entrada_s += delta_timer;
                 }
 
                 // Tiempo con el buffer vacío. APROXIMACIÓN POR MUESTREO: cuenta
@@ -3120,7 +3125,7 @@ public:
 
         // Timer/validation
         prod["timer1Hz_instantaneo"] = timer1Hz;
-        prod["timer1Hz_turno"] = acc_timer1Hz_out;  // firmware Arduino ya corrige alineamiento de bit
+        prod["timer1Hz_turno"] = acc_timer1Hz_out;
 
         // PRODUCTION COUNT - numero_grades (D29007)
         prod["numero_grades_instantaneo"] = numero_grades;   // crudo del PLC, sin tocar
@@ -3134,18 +3139,18 @@ public:
         prod["parada_mcf_instantaneo"] = parada_mcf_cantidad;
         prod["parada_mcf_turno"] = acc_parada_mcf_cantidad_out;
         prod["parada_mcf_tiempo_instantaneo_s"] = parada_mcf_tiempo;
-        prod["parada_mcf_tiempo_turno_s"] = acc_parada_mcf_tiempo_s_out;  // firmware Arduino ya corrige alineamiento de bit
+        prod["parada_mcf_tiempo_turno_s"] = acc_parada_mcf_tiempo_s_out;
 
         // Métrica MCF - D29005, D29006
         prod["metrica_mcf_instantaneo"] = metrica_mcf_cantidad;
-        prod["metrica_mcf_turno"] = acc_metrica_mcf_cantidad_out;  // firmware Arduino ya corrige alineamiento de bit
+        prod["metrica_mcf_turno"] = acc_metrica_mcf_cantidad_out;
         prod["metrica_mcf_tiempo_instantaneo_ds"] = metrica_mcf_tiempo;
         prod["metrica_mcf_tiempo_turno_ds"] = acc_metrica_mcf_tiempo_ds_out;  // CF100: 1 tick = 0.1s = 1ds (validated, no ×2)
         prod["metrica_mcf_tiempo_turno_s"] = static_cast<double>(acc_metrica_mcf_tiempo_ds_out) * 0.1;  // CF100: each tick = 0.1s (validated)
 
         // Métrica Formador - D29008, D29009
         prod["metrica_formador_instantaneo"] = metrica_formador_cantidad;
-        prod["metrica_formador_turno"] = acc_metrica_formador_cantidad_out;  // firmware Arduino ya corrige alineamiento de bit
+        prod["metrica_formador_turno"] = acc_metrica_formador_cantidad_out;
         prod["metrica_formador_tiempo_instantaneo_ds"] = metrica_formador_tiempo;
         prod["metrica_formador_tiempo_turno_ds"] = acc_metrica_formador_tiempo_ds_out;  // CF100: 1 tick = 0.1s = 1ds (validated, no ×2)
         prod["metrica_formador_tiempo_turno_s"] = static_cast<double>(acc_metrica_formador_tiempo_ds_out) * 0.1;  // CF100: each tick = 0.1s (validated)
@@ -3154,7 +3159,7 @@ public:
         prod["falha_forno_instantaneo"] = falha_forno_cantidad;
         prod["falha_forno_turno"] = acc_falha_forno_cantidad_out;
         prod["falha_forno_tiempo_instantaneo_s"] = falha_forno_tiempo;
-        prod["falha_forno_tiempo_turno_s"] = acc_falha_forno_tiempo_s_out;  // firmware Arduino ya corrige alineamiento de bit
+        prod["falha_forno_tiempo_turno_s"] = acc_falha_forno_tiempo_s_out;
 
         // Void time: accumulated seconds where metrica_mcf_cantidad delta was 0
         // (no new units detected entering the furnace during that message interval)
@@ -3185,7 +3190,7 @@ std::unordered_map<int, EntradaHornoProcessor::State> EntradaHornoProcessor::sta
  * 
  * Changes from original:
  * 1. Reads NEW semantic field names from LoRaWAN decoder
- * 2. ALL registers use bit-15 flag — diff_counter for everything
+ * 2. ALL registers are full uint16_t — the counter family decides the bound
  * 3. Outputs OLD field names in JSON for backward compatibility
  * 
  * Input fields (from decoder v3):
@@ -3610,7 +3615,7 @@ public:
                     spike_ema_update(st.ema_metrica_ciclos,     rd_mc);
                     spike_ema_update(st.ema_barreira1_cantidad, rd_b1c);
 
-                    // Accumulate deltas — ALL PLC registers have bit-15 flag, use diff_counter for everything
+                    // Acumulación de deltas: uint16 completo, y la familia del contador decide la cota
                     uint16_t delta_timer = diff_counter_safe(timer1Hz, st.last_timer1Hz, st.rc_timer1Hz, ctx.with("timer1Hz"));
                     st.acc_timer1Hz += delta_timer;
                     st.acc_tiempo_operacion_s += delta_timer;
@@ -3682,12 +3687,12 @@ public:
 
         // Timer/operation time
         prod["timer1Hz_instantaneo"] = timer1Hz;
-        prod["tiempo_operacion_turno_s"] = acc_tiempo_operacion_s_out;  // firmware Arduino ya corrige alineamiento de bit
+        prod["tiempo_operacion_turno_s"] = acc_tiempo_operacion_s_out;
 
         // Main production counter (D25005 - metrica MDF ciclos)
         // OLD: cantidad → NEW: metrica_mdf_ciclos
         prod["cantidad_instantanea"] = metrica_ciclos;
-        prod["cantidad_produccion_turno"] = acc_metrica_ciclos_out;  // firmware Arduino ya corrige alineamiento de bit
+        prod["cantidad_produccion_turno"] = acc_metrica_ciclos_out;
 
         // Cycle time accumulator (D25006 - metrica MDF tiempo)
         // OLD: cantidad_total → NEW: metrica_mdf_tiempo
@@ -3702,7 +3707,7 @@ public:
         // Paradas tempo (D25004)
         // OLD: paradas_2 → NEW: paradas_tempo
         prod["paradas_2_instantaneo"] = paradas_tempo;
-        prod["paradas_2_turno"] = acc_paradas_tempo_out;  // firmware Arduino ya corrige alineamiento de bit
+        prod["paradas_2_turno"] = acc_paradas_tempo_out;
 
         // Bancalinos Q:3.01 sin sensor (D25007) — activaciones Q:3.01 sin confirmar presencia de lozeta
         prod["bancalinos0_nosensor_instantaneo"] = bancalinos_q301;
@@ -3711,7 +3716,7 @@ public:
         // Bancalinos Q:3.00 (D25008)
         // OLD: bancalinos1 → NEW: bancalinos_q300
         prod["bancalinos1_instantaneo"] = bancalinos_q300;
-        prod["bancalinos1_turno"] = acc_bancalinos_q300_out;  // firmware Arduino ya corrige alineamiento de bit
+        prod["bancalinos1_turno"] = acc_bancalinos_q300_out;
 
         // Bancalinos Comb1: Q:3.01 AND I:1.09 (D25009) — activaciones con lozeta presente (sustituye bancalinos0)
         prod["bancalinos0_instantaneo"] = bancalinos_comb1;
@@ -3719,11 +3724,11 @@ public:
 
         // Bancalinos Comb2: Q:3.01 AND Q:2.10 (D25016) - NOW INCLUDED!
         prod["bancalinosComb2_instantaneo"] = bancalinos_comb2;
-        prod["bancalinosComb2_turno"] = acc_bancalinos_comb2_out;  // firmware Arduino ya corrige alineamiento de bit
+        prod["bancalinosComb2_turno"] = acc_bancalinos_comb2_out;
 
         // Bancalinos Total: Q:3.00 AND Q:2.10 (D25017) - NOW INCLUDED!
         prod["bancalinosTotal_instantaneo"] = bancalinos_total;
-        prod["bancalinosTotal_turno"] = acc_bancalinos_total_out;  // firmware Arduino ya corrige alineamiento de bit
+        prod["bancalinosTotal_turno"] = acc_bancalinos_total_out;
 
         // Sentido Escolha (D25012, D25013)
         // OLD: cambioSentido → NEW: sentido_escolha
@@ -3735,7 +3740,7 @@ public:
         // Barreira 1 (D25014, D25015)
         // OLD: cambioBarrera → NEW: barreira1
         prod["cambioBarrera_instantaneo"] = barreira1_cantidad;
-        prod["cambioBarrera_turno"] = acc_barreira1_cantidad_out;  // firmware Arduino ya corrige alineamiento de bit
+        prod["cambioBarrera_turno"] = acc_barreira1_cantidad_out;
         prod["cambioBarreraTotal_instantaneo"] = barreira1_tiempo;
         prod["cambioBarreraTotal_turno"] = acc_barreira1_tiempo_out;  // CF100: 1 tick = 0.1s = 1ds (validated, no ×2)
 
@@ -3743,7 +3748,7 @@ public:
         prod["paradaEscolha_instantaneo"] = parada_escolha_cantidad;
         prod["paradaEscolha_turno"] = acc_parada_escolha_cantidad_out;
         prod["paradaEscolhaTempo_instantaneo"] = parada_escolha_tempo;
-        prod["paradaEscolhaTempo_turno"] = acc_parada_escolha_tempo_out;  // firmware Arduino ya corrige alineamiento de bit
+        prod["paradaEscolhaTempo_turno"] = acc_parada_escolha_tempo_out;
 
         prod["timestamp_device"] = device_timestamp(msg);
         add_unobserved_marker(prod, unobserved_s);

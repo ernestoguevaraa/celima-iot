@@ -187,8 +187,9 @@ Every processor is structurally the same; deviations are almost always deliberat
   process-scoped static, not a state field, because `reset_all_processor_states()` wipes state on
   every shift change and would otherwise re-read the DB and mislabel it as an across-restart change.
 - **Publish interval, measured over 24 h of plant traffic: 187 s for most classes, 127 s for
-  `entrada_horno`, 180 s for `calidad`.** The Arduino clock runs slightly long, hence 187 and not 180.
-  Nothing in the code hardcodes it — the bound derives the gap from `gatewayTime` — but it is the
+  `entrada_horno`, 180 s for `calidad`.** That is the Arduino's `MIN_TX_INTERVAL_MS` (180.000 and
+  120.000) plus ~7 s of quantization from the decoding cycle, which runs every ~5 s — **not** clock
+  drift, as was assumed before reading the firmware. Nothing in the code hardcodes it — the bound derives the gap from `gatewayTime` — but it is the
   number behind `CELIMA_GAP_SHORT_S`, the dedup window and the cost of a rejection.
 - Duplicate-frame rejection. Duplicates are routine, not exceptional: the Arduino retries a frame up
   to 3 times (~30 s apart) until the LoRaWAN gateway ACKs it, and **those ACKs get lost on the way

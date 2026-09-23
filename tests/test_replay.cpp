@@ -8,9 +8,12 @@
 //
 //     make test GOLDEN_OUT=tests/data/celima_data_replay.golden
 //
-// El golden que está en el repo se generó con el código de main@0ac7a9c, es
-// decir ANTES de este PR: es lo que demuestra que la instrumentación no cambió
-// ningún valor publicado.
+// El golden nació generado con el código de main@0ac7a9c, anterior a toda la
+// serie de PRs, y durante PR 1 y PR 2 se mantuvo byte a byte idéntico. Ya no lo
+// es: PR 4 le añadió dos campos y la retirada de checksum le quitó uno. Lo que
+// sigue garantizando —y lo que hay que comprobar campo a campo al regenerarlo—
+// es que ningún campo EXISTENTE cambia de valor. La historia completa está en
+// tests/data/README.md.
 #include "doctest.h"
 #include "support.hpp"
 
@@ -103,8 +106,10 @@ TEST_CASE("el fixture es físicamente coherente") {
 
             CAPTURE(dt); CAPTURE(lid); CAPTURE(d_epoch);
             // Intervalo nominal de su clase. En planta el real es 187 s (127 en
-            // entrada_horno, 180 en calidad): el reloj del Arduino corre algo
-            // largo. La tolerancia cubre eso sin dejar pasar un hueco.
+            // entrada_horno, 180 en calidad): es el MIN_TX_INTERVAL_MS del
+            // Arduino —180.000 y 120.000— más ~7 s de cuantización del ciclo de
+            // decodificación, que corre cada ~5 s. No es deriva del reloj.
+            // La tolerancia cubre eso sin dejar pasar un hueco.
             CHECK(std::abs(d_epoch - testsup::frame_interval(dt)) <= 15);
 
             if (has_timer && it->second.has_timer) {

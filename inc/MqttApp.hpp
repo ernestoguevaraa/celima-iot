@@ -8,10 +8,16 @@
 /**
  * MqttApp: wraps Paho C++ async_client and routes messages.
  *
- * Env/config (or argv) you can pass to main():
- *  - MQTT_BROKER (e.g. tcp://localhost:1883)
- *  - MQTT_CLIENT_ID (default: celima-integration-<pid>)
- *  - ISA95_PREFIX (default: enterprise/site/area/line1)
+ * Los tres primeros argumentos salen de env o argv en main():
+ *  - MQTT_BROKER     (por defecto tcp://localhost:1883)
+ *  - MQTT_CLIENT_ID  (por defecto celima-integration)
+ *  - ISA95_PREFIX    (por defecto celima/punta_hermosa/planta/linea/ — la barra
+ *                     final importa: los tópicos se forman concatenando lineID)
+ *
+ * El resto de la configuración del servicio (SHIFT_MODE, CELIMA_*) se lee en
+ * main.cpp y está documentada en packaging/defaults.env, que es lo que se
+ * instala en planta. No la dupliques aquí: es lo que dejó estos valores por
+ * defecto desfasados durante meses.
  */
 class MqttApp : public virtual mqtt::callback, public virtual mqtt::iaction_listener {
 public:

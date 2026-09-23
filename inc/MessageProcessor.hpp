@@ -30,12 +30,14 @@ public:
 
 /**
  * Factory to get a processor for a given DeviceType.
- * Unknown types fallback to DefaultProcessor (pass-through summarized).
+ * Unknown types fall back to DefaultProcessor, which publishes two placeholder
+ * messages (quantity 0, alarms 0) and does NOT forward the frame's contents.
  */
 std::unique_ptr<IMessageProcessor> createProcessor(DeviceType dt);
 
 /**
- * Default processor for unknown/unspecified device types.
+ * Default processor for unknown/unspecified device types. Las tramas que el
+ * decoder no pudo interpretar ya no llegan aquí: las corta el enrutado.
  */
 std::unique_ptr<IMessageProcessor> createDefaultProcessor();
 
@@ -67,8 +69,8 @@ void clear_incomplete_shift_marker_override();
 
 /**
  * Familia de un contador. Conviven dos con ~50x de diferencia de velocidad, y
- * una sola tasa por máquina no puede cubrir ambas (pendiente P1 de
- * docs/design/cota-plausibilidad-y-tasas.md):
+ * una sola tasa por máquina no puede cubrir ambas — era el defecto P1 de
+ * docs/design/cota-plausibilidad-y-tasas.md, corregido con esta clasificación:
  *
  *  - Event: contadores de evento (piezas, pisadas, paradas, bancalinos). Su
  *    tasa se mide y sale de rates.json.
@@ -105,8 +107,11 @@ CounterFamily counter_family_for(const char* proc, const char* field);
  * eventos [STATE]. Un argumento en lugar de siete: los procesadores lo
  * construyen una vez por mensaje y lo reutilizan con with(<campo>).
  *
- * line/proc/field solo etiquetan; elapsed_s y rate_max_per_s son los que
- * determinan la cota. Los valores por defecto conservan el fallback
+ * line/proc/field solo etiquetan. Qué campos deciden la cota depende de la
+ * FAMILIA del contador: elapsed_s, rate_max_per_s y margin en los de evento y
+ * tiempo; shift_elapsed_s y acc_current en los latcheados; solo max_valid en
+ * los de nivel. Rellenar los que no aplican es inocuo, no rellenar los que sí
+ * hace que el delta se descarte. Los valores por defecto conservan el fallback
  * "line=-1 proc=? field=?" que delata una llamada sin contexto.
  */
 struct CounterCtx {
