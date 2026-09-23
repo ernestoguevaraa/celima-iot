@@ -70,13 +70,22 @@ Desde PR 4 ya no es byte a byte ese golden: es ese mismo **más dos campos**
 campo al regenerarlo, es más preciso que "no cambia nada":
 
 - mismo número de publicaciones y mismos tópicos;
-- ningún campo desaparecido;
 - **cero campos existentes con un valor distinto**.
 
-Esa es la propiedad que hay que preservar. Un PR puede añadir campos —el
-invariante del repo es añadir, nunca reinterpretar—, pero si al regenerar
-aparece un campo existente con otro valor, el PR está mal y hay que investigar
-antes de aceptar el golden nuevo.
+Esa es la propiedad que hay que preservar, y es la que hay que comprobar campo a
+campo al regenerar: si aparece un campo existente con otro valor, el PR está mal
+y hay que investigarlo antes de aceptar el golden nuevo.
+
+El conjunto de campos sí ha cambiado dos veces, las dos a conciencia:
+
+| cambio | qué pasó |
+|---|---|
+| PR 4 | **añadió** `numero_grades_bajadas_turno` y `buffer_vacio_turno_s` en `entrada_horno/production` |
+| checksum | **quitó** `checksum` de los cinco `production` que lo reemitían |
+
+Añadir es la vía normal. **Quitar es la excepción** y necesita saber que nadie
+aguas abajo lo lee: `checksum` valida la trama dentro del Arduino y aquí no
+verifica nada, así que reemitirlo sugería una garantía inexistente.
 
 Regenerar:
 

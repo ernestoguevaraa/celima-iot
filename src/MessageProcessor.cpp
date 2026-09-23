@@ -1874,7 +1874,6 @@ public:
         const auto dev_epoch = device_epoch_s(msg);
         int64_t unobserved_s = 0;   // segundos del turno sin observar
         int alarms = jsonu::get_opt<int>(msg, "alarms").value_or(0);
-        int checksum = jsonu::get_opt<int>(msg, "checksum").value_or(0);
         int deviceType = jsonu::get_opt<int>(msg, "deviceType").value_or(0);
 
         // === Read all 16-bit counters (new semantic names from decoder v2) ===
@@ -2041,7 +2040,6 @@ public:
         prod["turno"] = shiftNum;
         prod["deviceType"] = deviceType;
         prod["lineID"] = line;
-        prod["checksum"] = checksum;
 
         // Timer/validation
         prod["timer1Hz_instantaneo"] = timer1Hz;
@@ -2226,7 +2224,6 @@ public:
         const auto dev_epoch = device_epoch_s(msg);
         int64_t unobserved_s = 0;   // segundos del turno sin observar
         int alarms = jsonu::get_opt<int>(msg, "alarms").value_or(0);
-        int checksum = jsonu::get_opt<int>(msg, "checksum").value_or(0);
         int deviceType = jsonu::get_opt<int>(msg, "deviceType").value_or(0);
 
         // === Read all 16-bit counters (new semantic names from decoder v2) ===
@@ -2354,7 +2351,6 @@ public:
         prod["turno"] = shiftNum;
         prod["deviceType"] = deviceType;
         prod["lineID"] = line;
-        prod["checksum"] = checksum;
 
         // Timer/validation
         prod["timer1Hz_instantaneo"] = timer1Hz;
@@ -2530,7 +2526,6 @@ public:
         const auto dev_epoch = device_epoch_s(msg);
         int64_t unobserved_s = 0;   // segundos del turno sin observar
         int alarms = jsonu::get_opt<int>(msg, "alarms").value_or(0);
-        int checksum = jsonu::get_opt<int>(msg, "checksum").value_or(0);
         int deviceType = jsonu::get_opt<int>(msg, "deviceType").value_or(0);
 
         // === Read all 16-bit counters (new semantic names from decoder v2) ===
@@ -2658,7 +2653,6 @@ public:
         prod["turno"] = shiftNum;
         prod["deviceType"] = deviceType;
         prod["lineID"] = line;
-        prod["checksum"] = checksum;
 
         // Timer/validation (D29001)
         prod["timer1Hz_instantaneo"] = timer1Hz;
@@ -2924,7 +2918,6 @@ public:
         const auto dev_epoch = device_epoch_s(msg);
         int64_t unobserved_s = 0;   // segundos del turno sin observar
         int alarms = jsonu::get_opt<int>(msg, "alarms").value_or(0);
-        int checksum = jsonu::get_opt<int>(msg, "checksum").value_or(0);
         int deviceType = jsonu::get_opt<int>(msg, "deviceType").value_or(0);
 
         // === Read all 16-bit counters (CORRECTED field names from decoder v2) ===
@@ -3124,7 +3117,6 @@ public:
         prod["turno"] = shiftNum;
         prod["deviceType"] = deviceType;
         prod["lineID"] = line;
-        prod["checksum"] = checksum;
 
         // Timer/validation
         prod["timer1Hz_instantaneo"] = timer1Hz;
@@ -3445,7 +3437,6 @@ public:
         const auto dev_epoch = device_epoch_s(msg);
         int64_t unobserved_s = 0;   // segundos del turno sin observar
         int alarms = jsonu::get_opt<int>(msg, "alarms").value_or(0);
-        int checksum = jsonu::get_opt<int>(msg, "checksum").value_or(0);
         int deviceType = jsonu::get_opt<int>(msg, "deviceType").value_or(0);
 
         // === Read all 16-bit counters (new semantic names from decoder v3) ===
@@ -3688,7 +3679,6 @@ public:
         prod["turno"] = shiftNum;
         prod["deviceType"] = deviceType;
         prod["lineID"] = line;
-        prod["checksum"] = checksum;
 
         // Timer/operation time
         prod["timer1Hz_instantaneo"] = timer1Hz;

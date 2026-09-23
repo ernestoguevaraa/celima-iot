@@ -232,3 +232,32 @@ TEST_CASE("las tramas que el decoder no pudo interpretar se descartan en el enru
     CHECK_FALSE(is_decoder_error(desconocido));
     CHECK(createDefaultProcessor()->process(desconocido, kPfx, 3).size() == 2);
 }
+
+TEST_CASE("checksum no se reemite: es del Arduino, no del pipeline") {
+    // El checksum valida la trama DENTRO del Arduino, contra las words crudas
+    // del PLC. Para cuando llega aquí ya cumplió su función y no hay nada que
+    // pueda verificar: reemitirlo solo sugería una garantía que este servicio
+    // no da. Cinco procesadores lo echaban al payload de production.
+    //
+    // Sigue llegando en la trama de entrada —y el fixture lo lleva, porque los
+    // dispositivos lo mandan—, simplemente se ignora.
+    testsup::pin_local_hour(10);
+    testsup::rates_for_tests();
+    celima::set_state_store(nullptr);
+
+    for (int dt = 1; dt <= 8; ++dt) {
+        CAPTURE(dt);
+        reset_all_processor_states();
+        auto proc = createProcessor(*deviceTypeFromInt(dt));
+
+        json semilla = testsup::make_frame(dt, 1, 0);
+        REQUIRE(semilla.contains("checksum"));       // entra, como en planta
+        proc->process(semilla, kPfx, 3);
+
+        for (const auto& p : proc->process(testsup::make_frame(dt, 1, 1), kPfx, 3)) {
+            const json payload = json::parse(p.payload);
+            CHECK_MESSAGE(!payload.contains("checksum"),
+                          "deviceType " << dt << " reemite checksum en " << p.topic);
+        }
+    }
+}

@@ -42,7 +42,7 @@ make test GOLDEN_OUT=tests/data/celima_data_replay.golden   # regenerar el golde
 ```
 
 The suite is doctest (vendored at [tests/doctest.h](tests/doctest.h), MIT, header-only — no runtime
-dependency, not linked into the release binary): 48 cases across
+dependency, not linked into the release binary): 55 cases across
 [test_replay.cpp](tests/test_replay.cpp) (golden), [test_state_events.cpp](tests/test_state_events.cpp),
 [test_scaled_bound.cpp](tests/test_scaled_bound.cpp), [test_persistence.cpp](tests/test_persistence.cpp)
 and [test_shifts.cpp](tests/test_shifts.cpp). Its core is a deterministic replay:
@@ -311,6 +311,12 @@ No los cambies sin entender la consecuencia aguas abajo — el edge processor y 
 - `*_instantaneo` y `*_raw` son el contador crudo del PLC tal como llegó. No se derivan, no se
   corrigen, no se normalizan. Son la única fuente de verdad recuperable y la base de cualquier
   reconstrucción posterior.
+- **`checksum` se ignora.** Llega en la trama de entrada de cinco clases de dispositivo y hasta
+  2026-09-23 se reemitía tal cual en su `production`. Valida la trama **dentro del Arduino**, contra
+  las words crudas del PLC; para cuando llega aquí ya cumplió su función y no hay nada que pueda
+  verificar, así que reemitirlo sugería una garantía que este servicio no da. Un test recorre los
+  ocho procesadores y falla si alguien lo vuelve a publicar. Sigue llegando en la entrada —y el
+  fixture lo lleva, porque los dispositivos lo mandan—, simplemente no se propaga.
 - Calidad acumula en la aplicación, no en el dispositivo. `CalidadProcessor` v4 recibe contadores
   monotónicos (`boxesQ1/Q2/Q6`, `totalBroken`), calcula el delta con `safe_delta_u16` y publica sus
   propias sumas de turno en `extra_c1`/`extra_c2`/`comercial`/`quebrados`
@@ -429,6 +435,10 @@ Léelas antes de tocar [src/MessageProcessor.cpp](src/MessageProcessor.cpp).
 - Cualquier cambio que altere los valores publicados afecta datos de producción que se usan para
   control de planta y que no se pueden reexpresar una vez enviados a AWS. Ante la duda, prefiere
   añadir un campo nuevo a cambiar la semántica de uno existente.
+- **Quitar un campo publicado es la excepción, no la regla**, y exige saber que nadie aguas abajo lo
+  lee. Se ha hecho una sola vez, con `checksum`, porque no verificaba nada en este punto. Un campo
+  que se deja de publicar corta su serie en seco para cualquiera que la tuviera en un panel: no es
+  reversible para los datos ya no enviados, igual que no lo es publicar uno nuevo.
 - Para reconstruir un turno perdido, la única fuente es el journal (retención ~7 semanas, menos los
   4 KB que se pierden en cada parada dura): InfluxDB guarda solo un subconjunto de lo publicado, sin
   los contadores crudos. El procedimiento está en el documento de diseño.
