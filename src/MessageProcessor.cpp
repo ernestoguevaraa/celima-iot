@@ -706,6 +706,11 @@ static Publication make_pub(const std::string &topic, const json &j)
     return Publication{topic, j.dump()};
 }
 
+std::string isa95_topic(const std::string &isa95_prefix, int line, DeviceType dt, const char *leaf)
+{
+    return isa95_prefix + std::to_string(line) + "/" + stationSegment(dt) + "/" + leaf;
+}
+
 /** Default processor: lightly normalize and forward a summary. */
 class DefaultProcessor : public IMessageProcessor
 {
@@ -1057,7 +1062,7 @@ public:
         out["quebrados"]  = disc;
         add_unobserved_marker(out, unobserved_s);
 
-        const auto t1 = isa95_prefix + std::to_string(line_id) + "/calidad/production";
+        const auto t1 = isa95_topic(isa95_prefix, line_id, DeviceType::Calidad, "production");
         return { make_pub(t1, out) };
     }
 };
@@ -1395,8 +1400,8 @@ public:
         prod["timestamp_device"] = device_timestamp(msg);
         add_unobserved_marker(prod, unobserved_s);
 
-        auto t1 = isa95_prefix + std::to_string(line) + "/prensa_hidraulica1/alarms";
-        auto t2 = isa95_prefix + std::to_string(line) + "/prensa_hidraulica1/production";
+        auto t1 = isa95_topic(isa95_prefix, line, DeviceType::PH_1, "alarms");
+        auto t2 = isa95_topic(isa95_prefix, line, DeviceType::PH_1, "production");
 
         return {make_pub(t1, qual), make_pub(t2, prod)};
     }
@@ -1688,8 +1693,8 @@ public:
         prod["timestamp_device"] = device_timestamp(msg);
         add_unobserved_marker(prod, unobserved_s);
 
-        auto t1 = isa95_prefix + std::to_string(line) + "/prensa_hidraulica2/alarms";
-        auto t2 = isa95_prefix + std::to_string(line) + "/prensa_hidraulica2/production";
+        auto t1 = isa95_topic(isa95_prefix, line, DeviceType::PH_2, "alarms");
+        auto t2 = isa95_topic(isa95_prefix, line, DeviceType::PH_2, "production");
 
         return {make_pub(t1, qual), make_pub(t2, prod)};
     }
@@ -2082,8 +2087,8 @@ public:
         qual["alarms"] = alarms;
         qual["timestamp_device"] = device_timestamp(msg);
 
-        auto t1 = isa95_prefix + std::to_string(line) + "/entrada_secador/alarms";
-        auto t2 = isa95_prefix + std::to_string(line) + "/entrada_secador/production";
+        auto t1 = isa95_topic(isa95_prefix, line, DeviceType::Entrada_secador, "alarms");
+        auto t2 = isa95_topic(isa95_prefix, line, DeviceType::Entrada_secador, "production");
 
         return { make_pub(t1, qual), make_pub(t2, prod) };
     }
@@ -2385,8 +2390,8 @@ public:
         qual["alarms"] = alarms;
         qual["timestamp_device"] = device_timestamp(msg);
 
-        auto t1 = isa95_prefix + std::to_string(line) + "/salida_secador/alarms";
-        auto t2 = isa95_prefix + std::to_string(line) + "/salida_secador/production";
+        auto t1 = isa95_topic(isa95_prefix, line, DeviceType::Salida_secador, "alarms");
+        auto t2 = isa95_topic(isa95_prefix, line, DeviceType::Salida_secador, "production");
 
         return { make_pub(t1, qual), make_pub(t2, prod) };
     }
@@ -2706,8 +2711,8 @@ public:
         qual["alarms"] = alarms;
         qual["timestamp_device"] = device_timestamp(msg);
 
-        auto t1 = isa95_prefix + std::to_string(line) + "/esmalte/alarms";
-        auto t2 = isa95_prefix + std::to_string(line) + "/esmalte/production";
+        auto t1 = isa95_topic(isa95_prefix, line, DeviceType::Esmalte, "alarms");
+        auto t2 = isa95_topic(isa95_prefix, line, DeviceType::Esmalte, "production");
 
         return { make_pub(t1, qual), make_pub(t2, prod) };
     }
@@ -3174,8 +3179,8 @@ public:
         qual["alarms"] = alarms;
         qual["timestamp_device"] = device_timestamp(msg);
 
-        auto t1 = isa95_prefix + std::to_string(line) + "/entrada_horno/alarms";
-        auto t2 = isa95_prefix + std::to_string(line) + "/entrada_horno/production";
+        auto t1 = isa95_topic(isa95_prefix, line, DeviceType::Entrada_horno, "alarms");
+        auto t2 = isa95_topic(isa95_prefix, line, DeviceType::Entrada_horno, "production");
 
         return { make_pub(t1, qual), make_pub(t2, prod) };
     }
@@ -3758,8 +3763,8 @@ public:
         qual["alarms"] = alarms;
         qual["timestamp_device"] = device_timestamp(msg);
 
-        auto t1 = isa95_prefix + std::to_string(line) + "/salida_horno/alarms";
-        auto t2 = isa95_prefix + std::to_string(line) + "/salida_horno/production";
+        auto t1 = isa95_topic(isa95_prefix, line, DeviceType::Salida_horno, "alarms");
+        auto t2 = isa95_topic(isa95_prefix, line, DeviceType::Salida_horno, "production");
 
         return { make_pub(t1, qual), make_pub(t2, prod) };
     }

@@ -53,6 +53,33 @@ std::unique_ptr<IMessageProcessor> createDefaultProcessor();
  */
 bool is_decoder_error(const nlohmann::json& msg);
 
+/**
+ * Tópico ISA-95 de una estación: ${prefix}<line>/<stationSegment(dt)>/<leaf>.
+ * El prefijo ya trae la barra final.
+ */
+std::string isa95_topic(const std::string& isa95_prefix, int line, DeviceType dt,
+                        const char* leaf);
+
+/**
+ * Mensajes con msgType del firmware v6 (fPort 2 "arranque", fPort 3 "diag").
+ *
+ *  - Sin msgType → nullopt: es una trama de producción (fPort 1) y sigue el
+ *    camino de siempre, cambio de turno global incluido.
+ *  - "arranque" / "diag" → las publicaciones de DiagnosticoProcessor. Nunca
+ *    pasan por createProcessor() ni por detect_global_shift_change(): no tocan
+ *    el estado de ningún procesador de producción.
+ *  - Cualquier otro msgType → vector vacío y [STATE] frame_ignored
+ *    reason=msgType_desconocido, una vez por texto distinto.
+ *
+ * Definida en src/Diagnostico.cpp.
+ */
+std::optional<std::vector<Publication>> process_typed_message(const nlohmann::json& msg,
+                                                              const std::string& isa95_prefix);
+
+// Olvida las líneas base de diag. Solo para las pruebas: en producción la base
+// vive lo que vive el proceso, y un cambio de turno no la toca.
+void reset_diagnostico_state_for_tests();
+
 bool detect_global_shift_change(int currentShift);
 void reset_all_processor_states();
 

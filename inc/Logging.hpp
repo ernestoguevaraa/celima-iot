@@ -16,7 +16,10 @@ namespace celima::log {
 //   reanchor              re-ancla tras 3 rechazos seguidos del mismo campo
 //   restored / gap        estado recuperado del disco, según el tamaño del hueco
 //   paro_latched          un paro de línea con su duración, de la familia latcheada
-//   frame_ignored         trama que el decoder no pudo interpretar
+//   frame_ignored         trama que no se procesa: error del decoder, o un
+//                         mensaje v6 con msgType o deviceType desconocido
+//   arranque              reporte de arranque de un equipo (firmware v6)
+//   alarma_sin_datos_validos  diag "latido": el equipo late sin datos válidos
 //   shift_first_observed  primer turno visto tras arrancar (NO es un cambio)
 //   shift_change_global   cambio de turno de verdad
 // Y desde el store, que no pasa por aquí: stored_state_ignored y store_error.

@@ -140,6 +140,14 @@ void MqttApp::handle_celima_data(const std::string& payload) {
     if (is_decoder_error(j))
         return;
 
+    // Arranque y diagnóstico del firmware v6 (msgType): vía aparte, antes del
+    // cambio de turno global, para que no toquen el estado de producción.
+    if (auto typed = process_typed_message(j, isa95_prefix_)) {
+        for (auto& p : *typed)
+            publish_qos1(p.topic, p.payload);
+        return;
+    }
+
     int devTypeInt = j.value("deviceType", 0);
     auto dt = deviceTypeFromInt(devTypeInt);
     std::unique_ptr<IMessageProcessor> proc = dt ? createProcessor(*dt)

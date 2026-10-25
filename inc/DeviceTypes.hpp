@@ -41,3 +41,22 @@ inline const char* deviceTypeName(DeviceType dt) {
     }
     return "Unknown";
 }
+
+// Segmento de estación en los tópicos ISA-95:
+//   ${ISA95_PREFIX}<lineID>/<segmento>/{production,alarms,diagnostico}
+// Única fuente del nombre: lo usan los procesadores de producción y el de
+// diagnóstico, así que una estación no puede publicar con dos nombres.
+// Cambiar un valor corta la serie aguas abajo (edge processor y AWS).
+inline const char* stationSegment(DeviceType dt) {
+    switch (dt) {
+        case DeviceType::PH_1: return "prensa_hidraulica1";
+        case DeviceType::PH_2: return "prensa_hidraulica2";
+        case DeviceType::Entrada_secador: return "entrada_secador";
+        case DeviceType::Salida_secador: return "salida_secador";
+        case DeviceType::Esmalte: return "esmalte";
+        case DeviceType::Entrada_horno: return "entrada_horno";
+        case DeviceType::Salida_horno: return "salida_horno";
+        case DeviceType::Calidad: return "calidad";
+    }
+    return "desconocido";
+}

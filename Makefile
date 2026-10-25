@@ -70,7 +70,7 @@ build/Debug/%.o: src/%.cpp
 # runtime. doctest está vendorizado en tests/doctest.h (MIT, un header).
 # src/main.cpp queda fuera: tiene su propio main().
 TEST_SRC     := $(wildcard tests/*.cpp)
-TEST_APP_SRC := src/MessageProcessor.cpp src/JsonUtils.cpp src/DeviceTypes.cpp \
+TEST_APP_SRC := src/MessageProcessor.cpp src/Diagnostico.cpp src/JsonUtils.cpp src/DeviceTypes.cpp \
                 src/RateConfig.cpp src/StateStore.cpp src/SqliteStateStore.cpp
 TEST_BIN     := bin/tests
 
