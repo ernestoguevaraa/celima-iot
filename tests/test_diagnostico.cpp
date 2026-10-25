@@ -265,9 +265,17 @@ ReplayRun run_replay(const std::string& path)
         for (int line = 1; line <= 4; ++line) {
             celima::StoredState st;
             const std::string proc = stationSegment(*deviceTypeFromInt(dt));
-            if (store->load(proc, line, st))
-                r.rows[proc + "/" + std::to_string(line)] =
-                    json{{"shift", st.shift}, {"updated_at", st.updated_at}, {"state", st.state}};
+            if (!store->load(proc, line, st)) continue;
+            // Fuera de la comparación, la hora de pared del servidor: las prensas
+            // guardan last_accepted_time = std::time(nullptr) para su ventana de
+            // dedup, y dos corridas del replay pueden caer en segundos distintos
+            // (fallaba ~1 de cada 6). Es el único campo de estado que no sale de
+            // gatewayTime. updated_at también cae al reloj del servidor, pero
+            // solo sin gatewayTime, y todas las tramas del fixture lo llevan:
+            // aquí es determinista y se compara.
+            st.state.erase("last_accepted_time");
+            r.rows[proc + "/" + std::to_string(line)] =
+                json{{"shift", st.shift}, {"updated_at", st.updated_at}, {"state", st.state}};
         }
     celima::set_state_store(nullptr);
     return r;

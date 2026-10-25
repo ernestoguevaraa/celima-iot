@@ -319,6 +319,17 @@ What to know before touching it:
   bound handle the first delta, logging `restored` or `gap` depending on `CELIMA_GAP_SHORT_S`.
 - The store is never a new crash cause: unopenable DB, corrupt file, or a failing save all degrade to
   in-memory-only with one log line (repeats suppressed).
+- **PH1/PH2 persist one field on the server clock.** Their dedup window compares
+  `last_accepted_time`, set with `std::time(nullptr)` (it dates from cf156e4, before the code
+  read `gatewayTime` at all); every other processor dedups on `timer1Hz` or `gatewayTime`, and
+  the gap measurement everywhere — PH included — uses `last_accepted_epoch_s` from `gatewayTime`.
+  **Open question, not settled: whether the server clock is intentional there.** It works in
+  production because reception ≈ arrival, but it is reception time, not device time: a QoS 1
+  backlog delivered in one burst after downtime lands inside the 120 s window, so a stalled
+  press's legitimate identical frames would be dropped (delta 0, so no count is lost — only the
+  publication). It is also the only persisted state field that is not deterministic under replay,
+  which is why the interleaving test in [tests/test_diagnostico.cpp](tests/test_diagnostico.cpp)
+  excludes it. Do not change it without deciding that question first.
 - `to_json`/`from_json` in each state struct are **generated** from the member list. If you add a
   field to a state struct, add it to both — a field missing from `to_json` silently resets on every
   restart, which is the exact bug this section exists to prevent.
