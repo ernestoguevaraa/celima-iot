@@ -29,7 +29,7 @@ make run-release          # runs against tcp://localhost:1883
 make format               # clang-format -i inc/*.hpp src/*.cpp
 make clean
 
-./scripts/build_deb.sh 1.06.0   # .deb into ./_pkg (needs bin/Release built first)
+./scripts/build_deb.sh 1.09.0   # .deb into ./_pkg (needs bin/Release built first)
 ```
 
 ```bash
@@ -42,10 +42,10 @@ make test GOLDEN_OUT=tests/data/celima_data_replay.golden   # regenerar el golde
 ```
 
 The suite is doctest (vendored at [tests/doctest.h](tests/doctest.h), MIT, header-only — no runtime
-dependency, not linked into the release binary): 55 cases across
+dependency, not linked into the release binary): 66 cases across
 [test_replay.cpp](tests/test_replay.cpp) (golden), [test_state_events.cpp](tests/test_state_events.cpp),
-[test_scaled_bound.cpp](tests/test_scaled_bound.cpp), [test_persistence.cpp](tests/test_persistence.cpp)
-and [test_shifts.cpp](tests/test_shifts.cpp). Its core is a deterministic replay:
+[test_scaled_bound.cpp](tests/test_scaled_bound.cpp), [test_persistence.cpp](tests/test_persistence.cpp),
+[test_shifts.cpp](tests/test_shifts.cpp) and [test_diagnostico.cpp](tests/test_diagnostico.cpp). Its core is a deterministic replay:
 [tests/data/celima_data_replay.jsonl](tests/data/celima_data_replay.jsonl) is fed through the
 processors and every publication is compared byte-for-byte against a golden file. See
 [tests/data/README.md](tests/data/README.md) — the fixture is synthetic, and the golden was generated
@@ -139,6 +139,8 @@ Flow, all inside one process:
    each distinct `_error` string logs `[STATE] frame_ignored`; repeats are silent, so a *new* decoder
    error is still visible. The raw `[celima/data]` ingest line is unaffected — the pings still show
    up there, which is where you want them for forensics.
+   Next, a frame carrying `msgType` (firmware v6, see *Arranque y diagnóstico* below) leaves the
+   production path entirely via `process_typed_message()`; one without it continues unchanged.
 4. Before dispatch, `detect_global_shift_change()` compares the current shift against a global atomic;
    on change it calls `reset_all_processor_states()`, zeroing every processor's static state. The
    **first** message after boot deliberately does *not* count as a change — see the trap below.
@@ -163,7 +165,51 @@ Flow, all inside one process:
 | 8 | Calidad | `calidad` |
 
 Most processors emit two publications per frame: `.../alarms` and `.../production`. Calidad emits
-only `.../production`.
+only `.../production`. The segment comes from `stationSegment()` ([inc/DeviceTypes.hpp](inc/DeviceTypes.hpp))
+via `isa95_topic()`, the single source shared with `/diagnostico` — renaming one cuts the series
+downstream.
+
+### Arranque y diagnóstico (firmware v6)
+
+The v6 codec on the UG65 (`celima-firmware/decoders/`, branch `v6-robustez`) splits by fPort and
+tags the new ports with `msgType`; the fPort itself is not in the JSON. All three land on
+`celima/data`:
+
+- fPort 1, no `msgType` → production frame, path unchanged.
+- fPort 2, `msgType:"arranque"` → `{lineID, deviceType, causaReinicioCodigo, causaReinicio, joinsFallidos}`.
+- fPort 3, `msgType:"diag"` → `{lineID, deviceType, tipoDiag ("latido"|"periodico"), glitches,
+  rechazosConteo, rechazosIntegridad, descartadas}` — uint16 accumulators since the **device**
+  booted, back to 0 on every reboot.
+- If the UG65 does not pass fPort to the codec, ports 2/3 arrive as a short port 1 with `_error`
+  and `is_decoder_error()` drops them.
+
+[src/Diagnostico.cpp](src/Diagnostico.cpp) handles them in `MqttApp::handle_celima_data` right after
+`is_decoder_error`, **before** `detect_global_shift_change()`, and never through `createProcessor()`:
+they touch no production state, no shift and no persistence. A test interleaves them in the replay
+and checks the golden and every persisted row are unchanged. An unknown `msgType`, `deviceType` or
+`lineID` publishes nothing and logs `[STATE] frame_ignored reason=msgType_desconocido|deviceType_desconocido|lineID_invalido`
+once per distinct value.
+
+Published on `${ISA95_PREFIX}<lineID>/<estación>/diagnostico` (QoS 1, same `[PUB QoS1]` log):
+
+- arranque: `{tipo:"arranque", causaReinicio, causaReinicioCodigo, joinsFallidos, devEUI,
+  deviceName, timestamp_device}`, plus `[STATE] arranque` with cause, joins, devEUI, deviceName.
+  It also clears that `(line, deviceType)`'s diag baseline.
+- diag: `{tipo:<tipoDiag>, <4 counters>, <4 counters>_delta, devEUI, deviceName, timestamp_device}`.
+  `_delta` is against the previous diag of the same `(line, deviceType)` and is `null` with no
+  baseline (first diag after the service starts or after an arranque) or when any counter went
+  **down** without an arranque — a reboot whose arranque report was lost; it re-anchors. A drop is
+  never a rollover: these count anomalies and do not reach 65535 between reboots in practice. The
+  baseline is in memory only, on purpose. `tipoDiag:"latido"` also logs
+  `[STATE] alarma_sin_datos_validos` with the four counters.
+- `devEUI`/`deviceName` are copied as they come and omitted if absent; `timestamp_device` is
+  `device_timestamp(msg)`.
+
+The `boxer-patrol-edge-processor` does not read `/diagnostico` yet; it will once Patrol adapts it.
+**Deploy order: this service (≥ 1.09.0) before the new codec on the UG65** — an older service routes
+`msgType` frames to the production processor of their `deviceType`, which reads every missing
+counter as 0: it publishes zeros as `*_instantaneo`/`*_raw` and feeds the accumulators a jump the
+bound has to reject.
 
 ### The processor pattern
 
@@ -297,7 +343,8 @@ New `.cpp` files are picked up automatically (`SRC := $(wildcard src/*.cpp)`), a
 No los cambies sin entender la consecuencia aguas abajo — el edge processor y AWS asumen todo esto.
 
 - Todo publish es QoS 1. Sin excepción.
-- Tópicos ISA-95: `${ISA95_PREFIX}<lineID>/<maquina>/production` y `.../alarms`. El prefijo por defecto
+- Tópicos ISA-95: `${ISA95_PREFIX}<lineID>/<maquina>/production`, `.../alarms` y, desde 1.09.0,
+  `.../diagnostico` (firmware v6). El prefijo por defecto
   es `celima/punta_hermosa/planta/linea/`.
 - Turnos: producción corre en `SHIFT_MODE=2` — dos de 12 h, 06:00–18:00 y 18:00–06:00, hora local
   America/Lima. El binario admite además `SHIFT_MODE=3` (tres de 8 h, 06/14/22) y ese es su valor por
@@ -405,8 +452,8 @@ Léelas antes de tocar [src/MessageProcessor.cpp](src/MessageProcessor.cpp).
   `delta_rejected` (con `reason`, `max_plausible`, `elapsed_s`, `family` y, en los
   latcheados, `acc`/`turno_s`), `paro_latched` (un paro de línea con su duración
   medida, el subproducto útil de la familia latcheada), `reanchor`, `restored`, `gap`,
-  `shift_first_observed`, `shift_change_global`, `frame_ignored`, `stored_state_ignored` y
-  `store_error`. Si añades lógica de descarte o de re-siembra,
+  `shift_first_observed`, `shift_change_global`, `frame_ignored`, `arranque`,
+  `alarma_sin_datos_validos`, `stored_state_ignored` y `store_error`. Si añades lógica de descarte o de re-siembra,
   emítela por ahí — en silencio no es reconstruible: tras el incidente del 1 de septiembre identificar
   la re-siembra exigió comparar `timer1Hz_turno` entre tópicos del journal. Dos reglas al hacerlo:
   nada de logging en la rama de acumulación normal (~36.000 mensajes/día, el journal ya crece
