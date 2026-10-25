@@ -20,7 +20,7 @@ Cadena completa: Arduinos → LoRaWAN → gateway Milesight → MQTT 1883 → es
 ## Build & run
 
 ```bash
-sudo apt-get install -y g++ make libpaho-mqttpp-dev nlohmann-json3-dev libsqlite3-dev
+sudo apt-get install -y g++ make libpaho-mqttpp-dev libpaho-mqtt-dev nlohmann-json3-dev libsqlite3-dev
 
 make                      # release → bin/Release/iot-celima-mqtt
 make debug                # → bin/Debug/iot-celima-mqtt (-O0 -g3 -DDEBUG)
@@ -31,6 +31,10 @@ make clean
 
 ./scripts/build_deb.sh 1.09.0   # .deb into ./_pkg (needs bin/Release built first)
 ```
+
+`libpaho-mqtt-dev` is listed explicitly: on Debian Trixie (RPi, aarch64) `libpaho-mqttpp-dev` does
+not pull it in and the build fails with `MQTTAsync.h: No such file or directory`. With it, `make` and
+`make test` pass on ARM (verified on a Raspberry Pi 4, 2026-10-25).
 
 ```bash
 make test          # compila tests/ + los .cpp de dominio y ejecuta la suite

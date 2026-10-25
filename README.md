@@ -6,8 +6,11 @@ Application for communication from Lorawan NS to Edge Server
 
 ``` bash
 sudo apt-get update
-sudo apt-get install -y g++ make libpaho-mqttpp-dev nlohmann-json3-dev libsqlite3-dev
+sudo apt-get install -y g++ make libpaho-mqttpp-dev libpaho-mqtt-dev nlohmann-json3-dev libsqlite3-dev
 ```
+
+`libpaho-mqtt-dev` va explícito: en Debian Trixie (RPi, aarch64) `libpaho-mqttpp-dev` no la arrastra
+como dependencia y la compilación falla con «MQTTAsync.h: No such file or directory».
 
 ## Tópicos publicados
 
