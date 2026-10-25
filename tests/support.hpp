@@ -249,6 +249,12 @@ inline std::string replay_file(const std::string& path, int shift_mode)
 
         if (is_decoder_error(j)) continue;
 
+        if (auto typed = process_typed_message(j, "celima/punta_hermosa/planta/linea/")) {
+            for (const auto& p : *typed)
+                dump << p.topic << '\t' << p.payload << '\n';
+            continue;
+        }
+
         const int devTypeInt = j.value("deviceType", 0);
         auto dt = deviceTypeFromInt(devTypeInt);
         auto proc = dt ? createProcessor(*dt) : createDefaultProcessor();
