@@ -681,26 +681,6 @@ static uint16_t diff_counter_safe(uint16_t curr, uint16_t &prev_ref,
 }
 
 
-// Updates an EMA used for corrupt-frame detection.
-// Ignores delta==0 (legitimate stall) so stops don't pull the average down.
-static void spike_ema_update(float &ema, uint16_t delta) {
-    if (delta == 0) return;
-    constexpr float alpha = 0.2f;
-    ema = (ema < 0.0f) ? static_cast<float>(delta)
-                       : alpha * static_cast<float>(delta) + (1.0f - alpha) * ema;
-}
-
-// Returns true when raw_delta looks like a corruption spike.
-// raw_delta == 0 is never a spike (stall). Above zero the threshold is
-// max(floor_thresh, ema * factor); if ema is uninitialized (<0) only floor applies.
-static bool spike_detected(uint16_t raw_delta, float ema,
-                           uint16_t floor_thresh, float factor) {
-    if (raw_delta == 0) return false;
-    float thresh = (ema < 0.0f) ? static_cast<float>(floor_thresh)
-                                : std::max(static_cast<float>(floor_thresh), ema * factor);
-    return static_cast<float>(raw_delta) > thresh;
-}
-
 static Publication make_pub(const std::string &topic, const json &j)
 {
     return Publication{topic, j.dump()};
@@ -3288,14 +3268,6 @@ private:
         uint8_t  rc_barreira1_tiempo = 0;
         uint32_t acc_barreira1_tiempo = 0;
 
-        // EMA of per-field deltas for corrupt-frame detection.
-        // Only counter fields are used as anchors: their normal delta (~28/interval)
-        // is well below the floor (300), so false positives from data gaps are impossible.
-        // Time fields (~1869/interval) exceed any useful floor and cannot be used.
-        // -1.0f = not yet initialized (uses floor threshold until first valid sample).
-        float ema_metrica_ciclos     = -1.0f;
-        float ema_barreira1_cantidad = -1.0f;
-
         // Segundos del turno en curso que nadie observó (huecos por reinicio).
         int64_t acc_unobserved_s = 0;
         // Traza de re-siembra ya emitida por la restauración. No se serializa.
@@ -3361,8 +3333,6 @@ private:
             j["last_barreira1_tiempo"] = last_barreira1_tiempo;
             j["rc_barreira1_tiempo"] = rc_barreira1_tiempo;
             j["acc_barreira1_tiempo"] = acc_barreira1_tiempo;
-            j["ema_metrica_ciclos"] = ema_metrica_ciclos;
-            j["ema_barreira1_cantidad"] = ema_barreira1_cantidad;
             return j;
         }
 
@@ -3421,8 +3391,6 @@ private:
             last_barreira1_tiempo = j.value("last_barreira1_tiempo", last_barreira1_tiempo);
             rc_barreira1_tiempo = j.value("rc_barreira1_tiempo", rc_barreira1_tiempo);
             acc_barreira1_tiempo = j.value("acc_barreira1_tiempo", acc_barreira1_tiempo);
-            ema_metrica_ciclos = j.value("ema_metrica_ciclos", ema_metrica_ciclos);
-            ema_barreira1_cantidad = j.value("ema_barreira1_cantidad", ema_barreira1_cantidad);
         }
     };
 
@@ -3598,63 +3566,49 @@ public:
                 st.last_accepted_timer1Hz = timer1Hz;
                 if (dev_epoch) st.last_accepted_epoch_s = *dev_epoch;
 
-                // Corrupt-frame detection using counter fields only.
-                // Time fields (~1869/interval) exceed any useful detection floor and
-                // cannot distinguish corruption from legitimate data gaps — excluded.
-                // Counter fields (metrica_ciclos, barreira1_cantidad): normal delta ~28/interval,
-                // well below floor=300. Corruption creates deltas of 10000-50000: unambiguous.
-                uint16_t rd_mc  = static_cast<uint16_t>(metrica_ciclos    - st.last_metrica_ciclos);
-                uint16_t rd_b1c = static_cast<uint16_t>(barreira1_cantidad - st.last_barreira1_cantidad);
+                // Acumulación de deltas: uint16 completo, y la familia del contador decide la cota
+                uint16_t delta_timer = diff_counter_safe(timer1Hz, st.last_timer1Hz, st.rc_timer1Hz, ctx.with("timer1Hz"));
+                st.acc_timer1Hz += delta_timer;
+                st.acc_tiempo_operacion_s += delta_timer;
 
-                int n_spikes = 0;
-                if (spike_detected(rd_mc,  st.ema_metrica_ciclos,     300, 10.0f)) n_spikes++;
-                if (spike_detected(rd_b1c, st.ema_barreira1_cantidad, 300, 10.0f)) n_spikes++;
+                st.acc_paradas_cantidad += diff_counter_safe(paradas_cantidad, st.last_paradas_cantidad, st.rc_paradas_cantidad, ctx.with("paradas_cantidad"));
 
-                if (n_spikes >= 2) {
-                    std::cout << "[SalidaHorno] Frame corrupto descartado (lineID=" << line
-                              << " n_spikes=" << n_spikes
-                              << " rd_mc=" << rd_mc << " rd_b1c=" << rd_b1c << ")\n";
-                    // Fall through to output copy — publish last known good state unchanged.
-                } else {
-                    // Update EMA only on clean frames (corrupt deltas must not poison the average).
-                    spike_ema_update(st.ema_metrica_ciclos,     rd_mc);
-                    spike_ema_update(st.ema_barreira1_cantidad, rd_b1c);
+                st.acc_paradas_tempo += diff_counter_safe(paradas_tempo, st.last_paradas_tempo, st.rc_paradas_tempo, ctx.with("paradas_tempo"));
 
-                    // Acumulación de deltas: uint16 completo, y la familia del contador decide la cota
-                    uint16_t delta_timer = diff_counter_safe(timer1Hz, st.last_timer1Hz, st.rc_timer1Hz, ctx.with("timer1Hz"));
-                    st.acc_timer1Hz += delta_timer;
-                    st.acc_tiempo_operacion_s += delta_timer;
+                // metrica_ciclos y barreira1_cantidad llevan max_valid = 300 en lugar
+                // de 5000: son los dos que vigilaba el detector de picos retirado en
+                // 1.09.1, y 300 era su suelo. En un intervalo normal (~186 s) la cota
+                // es 300, igual de estricta que el detector; a partir de ~13 min de
+                // hueco crece con la tasa, que es lo que el detector no hacía. Un
+                // rechazo deja [STATE] delta_rejected y re-ancla tras max_rejects,
+                // en vez de congelar el turno. El resto sigue con 5000: no se ha
+                // medido, y no se le cambia el comportamiento.
+                constexpr uint16_t kMaxValidVigilados = 300;
+                st.acc_metrica_ciclos += diff_counter_safe(metrica_ciclos, st.last_metrica_ciclos, st.rc_metrica_ciclos, ctx.with("metrica_ciclos", kMaxValidVigilados));
 
-                    st.acc_paradas_cantidad += diff_counter_safe(paradas_cantidad, st.last_paradas_cantidad, st.rc_paradas_cantidad, ctx.with("paradas_cantidad"));
+                st.acc_metrica_tiempo += diff_counter_safe(metrica_tiempo, st.last_metrica_tiempo, st.rc_metrica_tiempo, ctx.with_acc("metrica_tiempo", st.acc_metrica_tiempo));
 
-                    st.acc_paradas_tempo += diff_counter_safe(paradas_tempo, st.last_paradas_tempo, st.rc_paradas_tempo, ctx.with("paradas_tempo"));
+                st.acc_bancalinos_q301 += diff_counter_safe(bancalinos_q301, st.last_bancalinos_q301, st.rc_bancalinos_q301, ctx.with("bancalinos_q301"));
 
-                    st.acc_metrica_ciclos += diff_counter_safe(metrica_ciclos, st.last_metrica_ciclos, st.rc_metrica_ciclos, ctx.with("metrica_ciclos"));
+                st.acc_bancalinos_q300 += diff_counter_safe(bancalinos_q300, st.last_bancalinos_q300, st.rc_bancalinos_q300, ctx.with("bancalinos_q300"));
 
-                    st.acc_metrica_tiempo += diff_counter_safe(metrica_tiempo, st.last_metrica_tiempo, st.rc_metrica_tiempo, ctx.with_acc("metrica_tiempo", st.acc_metrica_tiempo));
+                st.acc_bancalinos_comb1 += diff_counter_safe(bancalinos_comb1, st.last_bancalinos_comb1, st.rc_bancalinos_comb1, ctx.with("bancalinos_comb1"));
 
-                    st.acc_bancalinos_q301 += diff_counter_safe(bancalinos_q301, st.last_bancalinos_q301, st.rc_bancalinos_q301, ctx.with("bancalinos_q301"));
+                st.acc_bancalinos_comb2 += diff_counter_safe(bancalinos_comb2, st.last_bancalinos_comb2, st.rc_bancalinos_comb2, ctx.with("bancalinos_comb2"));
 
-                    st.acc_bancalinos_q300 += diff_counter_safe(bancalinos_q300, st.last_bancalinos_q300, st.rc_bancalinos_q300, ctx.with("bancalinos_q300"));
+                st.acc_bancalinos_total += diff_counter_safe(bancalinos_total, st.last_bancalinos_total, st.rc_bancalinos_total, ctx.with("bancalinos_total"));
 
-                    st.acc_bancalinos_comb1 += diff_counter_safe(bancalinos_comb1, st.last_bancalinos_comb1, st.rc_bancalinos_comb1, ctx.with("bancalinos_comb1"));
+                st.acc_parada_escolha_cantidad += diff_counter_safe(parada_escolha_cantidad, st.last_parada_escolha_cantidad, st.rc_parada_escolha_cantidad, ctx.with("parada_escolha_cantidad"));
 
-                    st.acc_bancalinos_comb2 += diff_counter_safe(bancalinos_comb2, st.last_bancalinos_comb2, st.rc_bancalinos_comb2, ctx.with("bancalinos_comb2"));
+                st.acc_parada_escolha_tempo += diff_counter_safe(parada_escolha_tempo, st.last_parada_escolha_tempo, st.rc_parada_escolha_tempo, ctx.with("parada_escolha_tempo"));
 
-                    st.acc_bancalinos_total += diff_counter_safe(bancalinos_total, st.last_bancalinos_total, st.rc_bancalinos_total, ctx.with("bancalinos_total"));
+                st.acc_sentido_escolha_cantidad += diff_counter_safe(sentido_escolha_cantidad, st.last_sentido_escolha_cantidad, st.rc_sentido_escolha_cantidad, ctx.with("sentido_escolha_cantidad"));
 
-                    st.acc_parada_escolha_cantidad += diff_counter_safe(parada_escolha_cantidad, st.last_parada_escolha_cantidad, st.rc_parada_escolha_cantidad, ctx.with("parada_escolha_cantidad"));
+                st.acc_sentido_escolha_tiempo += diff_counter_safe(sentido_escolha_tiempo, st.last_sentido_escolha_tiempo, st.rc_sentido_escolha_tiempo, ctx.with("sentido_escolha_tiempo"));
 
-                    st.acc_parada_escolha_tempo += diff_counter_safe(parada_escolha_tempo, st.last_parada_escolha_tempo, st.rc_parada_escolha_tempo, ctx.with("parada_escolha_tempo"));
+                st.acc_barreira1_cantidad += diff_counter_safe(barreira1_cantidad, st.last_barreira1_cantidad, st.rc_barreira1_cantidad, ctx.with("barreira1_cantidad", kMaxValidVigilados));
 
-                    st.acc_sentido_escolha_cantidad += diff_counter_safe(sentido_escolha_cantidad, st.last_sentido_escolha_cantidad, st.rc_sentido_escolha_cantidad, ctx.with("sentido_escolha_cantidad"));
-
-                    st.acc_sentido_escolha_tiempo += diff_counter_safe(sentido_escolha_tiempo, st.last_sentido_escolha_tiempo, st.rc_sentido_escolha_tiempo, ctx.with("sentido_escolha_tiempo"));
-
-                    st.acc_barreira1_cantidad += diff_counter_safe(barreira1_cantidad, st.last_barreira1_cantidad, st.rc_barreira1_cantidad, ctx.with("barreira1_cantidad"));
-
-                    st.acc_barreira1_tiempo += diff_counter_safe(barreira1_tiempo, st.last_barreira1_tiempo, st.rc_barreira1_tiempo, ctx.with_acc("barreira1_tiempo", st.acc_barreira1_tiempo));
-                }
+                st.acc_barreira1_tiempo += diff_counter_safe(barreira1_tiempo, st.last_barreira1_tiempo, st.rc_barreira1_tiempo, ctx.with_acc("barreira1_tiempo", st.acc_barreira1_tiempo));
             }
 
             // Copy accumulated values to output
