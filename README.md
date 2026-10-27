@@ -64,5 +64,5 @@ los contadores que no trae: publicaría ceros como contadores crudos y metería 
 acumuladores. El orden inverso es inocuo: sin codec nuevo no llega ningún `msgType`.
 
 ```bash
-make && ./scripts/build_deb.sh      # 1.09.0 por defecto
+make && ./scripts/build_deb.sh      # 1.09.1 por defecto
 ```

@@ -29,7 +29,7 @@ make run-release          # runs against tcp://localhost:1883
 make format               # clang-format -i inc/*.hpp src/*.cpp
 make clean
 
-./scripts/build_deb.sh 1.09.0   # .deb into ./_pkg (needs bin/Release built first)
+./scripts/build_deb.sh 1.09.1   # .deb into ./_pkg (needs bin/Release built first)
 ```
 
 `libpaho-mqtt-dev` is listed explicitly: on Debian Trixie (RPi, aarch64) `libpaho-mqttpp-dev` does
@@ -46,10 +46,11 @@ make test GOLDEN_OUT=tests/data/celima_data_replay.golden   # regenerar el golde
 ```
 
 The suite is doctest (vendored at [tests/doctest.h](tests/doctest.h), MIT, header-only — no runtime
-dependency, not linked into the release binary): 66 cases across
+dependency, not linked into the release binary): 71 cases across
 [test_replay.cpp](tests/test_replay.cpp) (golden), [test_state_events.cpp](tests/test_state_events.cpp),
 [test_scaled_bound.cpp](tests/test_scaled_bound.cpp), [test_persistence.cpp](tests/test_persistence.cpp),
-[test_shifts.cpp](tests/test_shifts.cpp) and [test_diagnostico.cpp](tests/test_diagnostico.cpp). Its core is a deterministic replay:
+[test_shifts.cpp](tests/test_shifts.cpp), [test_diagnostico.cpp](tests/test_diagnostico.cpp) and
+[test_salida_horno.cpp](tests/test_salida_horno.cpp). Its core is a deterministic replay:
 [tests/data/celima_data_replay.jsonl](tests/data/celima_data_replay.jsonl) is fed through the
 processors and every publication is compared byte-for-byte against a golden file. See
 [tests/data/README.md](tests/data/README.md) — the fixture is synthetic, and the golden was generated
@@ -288,9 +289,20 @@ every published total is a sum of deltas, and every hard-won fix here is about a
   the bound was already discarding the downs — plus two new fields with what used to be thrown away:
   `numero_grades_bajadas_turno` and `buffer_vacio_turno_s`. The latter is sampled per frame, so its
   resolution is the ~127 s publish interval, not a stopwatch.
-- `spike_detected()` / `spike_ema_update()` — EMA-based corruption detection used by
-  SalidaHornoProcessor: a frame is discarded only when ≥2 independent counters spike at once
-  (`floor 300`, `10×` EMA), so a genuine burst on one counter is not thrown away.
+- SalidaHornoProcessor had its own EMA spike detector (`spike_detected()`, threshold
+  `max(300, 10 × EMA)` on `metrica_mdf_ciclos` + `barreira1_cantidad`); **removed in 1.09.1**. It
+  did not scale with the gap, so the production of a ~56 min gap (+375 at a typical EMA of ~36)
+  read as corruption, and since `prev` never advanced on a discard, every later frame looked worse
+  — the line could stop counting for the rest of the shift (L1, 2026-10-27). Its strictness now
+  lives in the bound: those two fields pass `max_valid = 300` to `diff_counter_safe` (the rest keep
+  5000, unmeasured). At ~186 s that is 300, as strict as the detector; from ~13 min of gap (L1,
+  950/h) it grows with the rate — ~1.330 at 56 min — and a rejection logs `delta_rejected` and
+  re-anchors instead of freezing. 300 is a compromise: L4 has deltas up to 344, so a corrupt jump of
+  ~250 passes; lower would reject recoveries after a couple of lost frames (~130 in L1 at ~9 min).
+  Do not reintroduce a fixed-threshold detector on top of the bound.
+  [tests/test_salida_horno.cpp](tests/test_salida_horno.cpp) reproduces the case, the +642 of
+  2026-10-11 and a 30 min gap at L4's 500/h. Rows persisted before 1.09.1 still carry `ema_*` keys;
+  `from_json` ignores them.
 - Products are derived from press strokes: `productos = pisadas × L<n>_PIEZAS_PISADA` (per-line
   constants in the header — L1/L2 ×3, L3 ×2, L4 ×4, L5 ×2).
 
@@ -314,7 +326,7 @@ Per-shift accumulators used to be RAM-only, which cost 9 h 17 min of totals acro
 ([inc/StateStore.hpp](inc/StateStore.hpp)) and restored on the first message per key after boot.
 What to know before touching it:
 
-- **Everything** is serialized, not just `acc_*`: raw tracking, reject counters, spike EMAs and dedup
+- **Everything** is serialized, not just `acc_*`: raw tracking, reject counters and dedup
   state, plus a `"v"` schema version. An unknown or newer `v` is ignored and the key re-seeds.
 - Saves happen after every accepted message, inside the same mutex, with `synchronous = FULL` — a
   power cut gives no chance to close cleanly, so `SIGTERM`-only saving would miss the real scenario.
