@@ -583,3 +583,54 @@ TEST_CASE("LatchedTime tras una restauración: el acumulado viene de la base") {
 
     celima::set_state_store(nullptr);
 }
+
+TEST_CASE("salida horno: una fila guardada con las claves EMA del detector retirado se restaura") {
+    // Hasta 1.09.0 SalidaHornoProcessor serializaba ema_metrica_ciclos y
+    // ema_barreira1_cantidad para su detector de picos. Las filas que ya están en
+    // state.db en planta las siguen trayendo; from_json lee por nombre, así que
+    // las claves sobrantes se ignoran y el turno continúa como si nada.
+    testsup::pin_local_hour(10);
+    testsup::rates_for_tests();
+    const std::string db = std::string(testsup::tmpdir()) + "/celima_state_ema_test.db";
+    std::remove(db.c_str());
+    celima::set_state_store(celima::make_sqlite_state_store(db));
+    REQUIRE(celima::state_store() != nullptr);
+    simulate_restart();
+
+    auto cantidad_turno = [](const std::vector<Publication>& pubs) {
+        REQUIRE(pubs.size() == 2);
+        return json::parse(pubs[1].payload)["cantidad_produccion_turno"].get<int64_t>();
+    };
+
+    {
+        auto proc = createProcessor(DeviceType::Salida_horno);
+        capture_streams([&] {
+            for (int tick = 0; tick <= 2; ++tick)
+                proc->process(testsup::make_frame(7, 1, tick), kPfx, 3);
+        });
+    }
+
+    // La fila tal como la dejaba la versión anterior.
+    celima::StoredState row;
+    REQUIRE(celima::state_store()->load("salida_horno", 1, row));
+    CHECK_FALSE(row.state.contains("ema_metrica_ciclos"));      // ya no se escriben
+    row.state["ema_metrica_ciclos"]     = 36.5;
+    row.state["ema_barreira1_cantidad"] = 35.9;
+    REQUIRE(celima::state_store()->save("salida_horno", 1, row.shift, row.updated_at, row.state));
+
+    simulate_restart();
+
+    auto proc = createProcessor(DeviceType::Salida_horno);
+    int64_t total = 0;
+    const std::string log = capture_streams([&] {
+        proc->process(testsup::make_frame(7, 1, 3), kPfx, 3);
+        total = cantidad_turno(proc->process(testsup::make_frame(7, 1, 4), kPfx, 3));
+    });
+    CHECK(count_lines(log, {"[STATE] restored", "proc=salida_horno", "line=1"}) == 1);
+    CHECK(count_lines(log, {"[STATE] reseed"}) == 0);
+    CHECK(count_lines(log, {"[STATE] stored_state_ignored"}) == 0);
+    CHECK(total == 4 * 64);                 // continúa: 2 intervalos antes, 2 después
+
+    celima::set_state_store(nullptr);
+    std::remove(db.c_str());
+}
