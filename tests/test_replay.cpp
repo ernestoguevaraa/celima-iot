@@ -31,7 +31,11 @@ TEST_CASE("replay: las publicaciones son idénticas al golden") {
     testsup::pin_local_hour(10);
     REQUIRE(testsup::local_hour_now() == 10);
 
+    // Arranque en frío: reset_all_processor_states() ya no borra el tracking del
+    // raw de calidad (sobrevive a los cambios de turno), así que sin esto el
+    // replay heredaría el de los tests anteriores.
     reset_all_processor_states();
+    reset_global_shift_state();
     const std::string dump = testsup::replay_file(kReplay, 3);
     REQUIRE_MESSAGE(!dump.empty(), "fixture vacío o ilegible: " << kReplay);
 
