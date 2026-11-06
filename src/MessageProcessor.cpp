@@ -60,11 +60,18 @@ bool is_decoder_error(const nlohmann::json& msg)
     return true;
 }
 
+static void reset_calidad_raw_tracking();
+
 void reset_global_shift_state()
 {
     g_last_global_shift.store(-1, std::memory_order_relaxed);
-    std::lock_guard<std::mutex> lock(g_restored_mtx);
-    g_restored_keys.clear();
+    {
+        std::lock_guard<std::mutex> lock(g_restored_mtx);
+        g_restored_keys.clear();
+    }
+    // El tracking del raw de calidad sobrevive al reset de turno, pero no a un
+    // arranque: un proceso nuevo no lo tiene hasta que la restauración lo trae.
+    reset_calidad_raw_tracking();
 }
 
 bool detect_global_shift_change(int currentShift)
@@ -764,10 +771,17 @@ class CalidadProcessor final : public IMessageProcessor {
     //
     //  Separacion clave de estado:
     //   - RawTrack: tracking del raw monotonico. PERSISTE a traves de cambios de
-    //     turno. Solo se re-ancla en freshBoot (reinicio del equipo) o primer pkt.
-    //   - ShiftAcc: acumulador del turno. SE RESETEA en cambio de turno. El delta
-    //     que cruza el limite de turno se asigna integro al turno nuevo (status
-    //     quo: error <=1 intervalo) pero NUNCA se pierde.
+    //     turno, incluido el reset global (reset_states() no lo toca). Solo se
+    //     re-ancla en freshBoot (reinicio del equipo) o primer pkt.
+    //   - ShiftAcc: acumulador del turno. SE RESETEA en cambio de turno.
+    //
+    //  Delta de frontera (el primero del turno nuevo, contra la ultima trama del
+    //  anterior): se acredita integro al turno nuevo si el hueco es
+    //  <= CELIMA_GAP_SHORT_S (error <= 1 intervalo). Si el hueco es mayor, o no
+    //  es medible (sin gatewayTime), se descarta con [STATE] reanchor
+    //  reason=shift_boundary_gap: no se sabe cuanto de ese delta es de cada
+    //  turno, y ante la duda se subcuenta. A diferencia de los procesadores de
+    //  PLC, que descartan siempre el delta que cruza la frontera.
     //
     //  Dedup: por gatewayTime + raw identico (duplicado republicado por el NS),
     //  reemplaza la antigua ventana de 120s (que borraba produccion estable).
@@ -861,6 +875,9 @@ class CalidadProcessor final : public IMessageProcessor {
 
 public:
     static void reset_states();
+    // Solo para simular un arranque (reset_global_shift_state): un reinicio del
+    // proceso sí pierde el raw en memoria.
+    static void reset_raw_tracking();
 
     std::vector<Publication> process(const json& msg,
                                      const std::string& isa95_prefix,
@@ -926,16 +943,27 @@ public:
                 }
 
                 // ---- 2) Reset del acumulador SOLO en cambio de turno ----
+                // Si el acumulador se siembra aqui con el raw ya anclado, el delta
+                // de esta trama es el que cruza la frontera de turno (paso 4).
+                bool boundary_delta = false;
                 if (!sa.initialized || sa.shift != shift_now) {
                     // reseed: una vez por procesador y línea, antes de pisar el estado.
                     // suppress_reseed_log lo pone la restauración cuando ya emitió la
                     // traza del cambio de turno a través del reinicio.
+                    //
+                    // Tras el reset global sa no está inicializado pero el raw sí:
+                    // es un cambio de turno, no un primer mensaje. El turno previo
+                    // se perdió con el reset, de ahí shift_prev=?.
                     if (!sa.suppress_reseed_log)
                         celima::log::state_event("reseed", line_id, "calidad",
                             sa.initialized
                                 ? ("reason=shift_change shift_prev=" + std::to_string(sa.shift) +
                                    " shift_new=" + std::to_string(shift_now))
+                            : rt.baseline_set
+                                ? ("reason=shift_change shift_prev=? shift_new=" +
+                                   std::to_string(shift_now))
                                 : ("reason=first_message shift=" + std::to_string(shift_now)));
+                    boundary_delta = rt.baseline_set;
                     sa = ShiftAcc();
                     sa.acc_unobserved_s = restart_gap_s;
                     sa.initialized = true;
@@ -985,11 +1013,30 @@ public:
                 if (dev_epoch && rt.last_accepted_epoch_s > 0)
                     ctx.elapsed_s = static_cast<double>(*dev_epoch - rt.last_accepted_epoch_s);
 
-                uint32_t d_q1 = safe_delta_u16(rt.last_q1, raw_q1, ctx.with("boxesQ1", MAXR_BOXES));
-                uint32_t d_q2 = safe_delta_u16(rt.last_q2, raw_q2, ctx.with("boxesQ2", MAXR_BOXES));
-                uint32_t d_q6 = safe_delta_u16(rt.last_q6, raw_q6, ctx.with("boxesQ6", MAXR_BOXES));
-                uint32_t d_br = safe_delta_u16(rt.last_broken, raw_broken,
-                                               ctx.with("totalBroken", MAXR_BROKEN));
+                uint32_t d_q1 = 0, d_q2 = 0, d_q6 = 0, d_br = 0;
+                if (boundary_delta &&
+                    !(ctx.elapsed_s > 0 && ctx.elapsed_s <= celima::gap_short_seconds())) {
+                    // Delta de frontera tras un hueco largo o no medible: no se
+                    // sabe qué parte es del turno anterior. Se descarta (suma 0),
+                    // el raw avanza igual en el paso 5 y queda rastro.
+                    auto raw_delta = [](uint16_t prev, uint16_t curr) {
+                        return std::to_string(static_cast<uint16_t>(curr - prev));
+                    };
+                    celima::log::state_event("reanchor", line_id, "calidad",
+                        "field=boxes_raw reason=shift_boundary_gap elapsed_s=" +
+                        (ctx.elapsed_s > 0 ? std::to_string(static_cast<int64_t>(ctx.elapsed_s))
+                                           : std::string("?")) +
+                        " d_q1=" + raw_delta(rt.last_q1, raw_q1) +
+                        " d_q2=" + raw_delta(rt.last_q2, raw_q2) +
+                        " d_q6=" + raw_delta(rt.last_q6, raw_q6) +
+                        " d_broken=" + raw_delta(rt.last_broken, raw_broken));
+                } else {
+                    d_q1 = safe_delta_u16(rt.last_q1, raw_q1, ctx.with("boxesQ1", MAXR_BOXES));
+                    d_q2 = safe_delta_u16(rt.last_q2, raw_q2, ctx.with("boxesQ2", MAXR_BOXES));
+                    d_q6 = safe_delta_u16(rt.last_q6, raw_q6, ctx.with("boxesQ6", MAXR_BOXES));
+                    d_br = safe_delta_u16(rt.last_broken, raw_broken,
+                                          ctx.with("totalBroken", MAXR_BROKEN));
+                }
 
                 // ---- 5) Actualizar tracking del raw (persiste turnos) ----
                 rt.last_q1 = raw_q1; rt.last_q2 = raw_q2;
@@ -1052,10 +1099,22 @@ std::mutex CalidadProcessor::mtx_;
 std::unordered_map<int, CalidadProcessor::RawTrack> CalidadProcessor::raw_;
 std::unordered_map<int, CalidadProcessor::ShiftAcc> CalidadProcessor::states_;
 
+// Reset de turno: solo el acumulador. El tracking del raw persiste a través de
+// los cambios de turno (es su diseño); borrarlo aquí hacía que la primera trama
+// de cada turno re-anclase y perdiese su delta, también tras huecos cortos.
 void CalidadProcessor::reset_states() {
     std::lock_guard<std::mutex> lock(mtx_);
-    raw_.clear();
     states_.clear();
+}
+
+void CalidadProcessor::reset_raw_tracking() {
+    std::lock_guard<std::mutex> lock(mtx_);
+    raw_.clear();
+}
+
+static void reset_calidad_raw_tracking()
+{
+    CalidadProcessor::reset_raw_tracking();
 }
 
 // ============================================================================
