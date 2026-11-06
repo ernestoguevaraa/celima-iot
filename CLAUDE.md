@@ -29,7 +29,7 @@ make run-release          # runs against tcp://localhost:1883
 make format               # clang-format -i inc/*.hpp src/*.cpp
 make clean
 
-./scripts/build_deb.sh 1.09.1   # .deb into ./_pkg (needs bin/Release built first)
+./scripts/build_deb.sh 1.09.2   # .deb into ./_pkg (needs bin/Release built first)
 ```
 
 `libpaho-mqtt-dev` is listed explicitly: on Debian Trixie (RPi, aarch64) `libpaho-mqttpp-dev` does
@@ -46,11 +46,11 @@ make test GOLDEN_OUT=tests/data/celima_data_replay.golden   # regenerar el golde
 ```
 
 The suite is doctest (vendored at [tests/doctest.h](tests/doctest.h), MIT, header-only — no runtime
-dependency, not linked into the release binary): 71 cases across
+dependency, not linked into the release binary): 77 cases across
 [test_replay.cpp](tests/test_replay.cpp) (golden), [test_state_events.cpp](tests/test_state_events.cpp),
 [test_scaled_bound.cpp](tests/test_scaled_bound.cpp), [test_persistence.cpp](tests/test_persistence.cpp),
-[test_shifts.cpp](tests/test_shifts.cpp), [test_diagnostico.cpp](tests/test_diagnostico.cpp) and
-[test_salida_horno.cpp](tests/test_salida_horno.cpp). Its core is a deterministic replay:
+[test_shifts.cpp](tests/test_shifts.cpp), [test_diagnostico.cpp](tests/test_diagnostico.cpp),
+[test_salida_horno.cpp](tests/test_salida_horno.cpp) and [test_calidad_turno.cpp](tests/test_calidad_turno.cpp). Its core is a deterministic replay:
 [tests/data/celima_data_replay.jsonl](tests/data/celima_data_replay.jsonl) is fed through the
 processors and every publication is compared byte-for-byte against a golden file. See
 [tests/data/README.md](tests/data/README.md) — the fixture is synthetic, and the golden was generated
@@ -228,6 +228,20 @@ Every processor is structurally the same; deviations are almost always deliberat
 - `if (!st.initialized || st.shift != shiftNum)` re-seeds `last_*` from the current frame and zeroes
   `acc_*`; the `else` branch accumulates deltas. A shift change therefore both zeroes accumulators
   and discards the delta spanning the boundary.
+- **Calidad is the exception at the shift boundary.** It keeps two structs: `RawTrack` (raw tracking)
+  survives every shift change, *including* the global reset — `CalidadProcessor::reset_states()`
+  clears only `ShiftAcc`. The boundary delta (first of the new shift, against the old shift's last
+  frame) is credited to the new shift when the gap is `<= CELIMA_GAP_SHORT_S`; with a longer or
+  unmeasurable gap (no `gatewayTime`) it is discarded with `[STATE] reanchor field=boxes_raw
+  reason=shift_boundary_gap elapsed_s=<n|?> d_q1=… d_q2=… d_q6=… d_broken=…`, the raw still
+  advances, and the frame publishes the new shift's 0. Before 1.09.2 `reset_states()` also cleared
+  the raw, so the first calidad frame of **every** shift re-anchored as `first_message` and its delta
+  was lost (L2, 2026-11-05 07:35:51: ~596 boxes after a 05:38–07:35 radio gap). After the global
+  reset, `reseed` reads `reason=shift_change shift_prev=?` — the previous shift went with the reset.
+  Across a restart (restore case 2) nothing changed: the raw is not restored and the frame
+  re-anchors. Since `reset_all_processor_states()` no longer drops that raw, tests simulate a cold
+  start with `reset_global_shift_state()`, which does. Tests:
+  [tests/test_calidad_turno.cpp](tests/test_calidad_turno.cpp).
 - **Order inside the lock matters and is load-bearing:** take the state → `restore_state_if_needed()`
   → build `CounterCtx` (rate, margin, `elapsed_s`) → seed-or-accumulate → `persist_state()`. The
   restore must come *first*: it brings back `last_accepted_epoch_s`, and without it `elapsed_s` is 0
